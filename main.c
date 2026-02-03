@@ -21,23 +21,28 @@ Token * token_list=NULL;
 int token_count=0;
 int token_pos=0;
 
-//Ast Node define
-typedef struct {
-    int value;
-}Exp;
+// c AST Node
+typedef struct {int value;} Exp;
+typedef struct {Exp *exp;} Statement;
+typedef struct {char *name; Statement *body; } Function;
+typedef struct {Function *fn;} Program;
 
-typedef struct{
-    Exp *exp;
-} Statement;
+//Asm AST Node
+typedef enum {ASM_MOV,ASM_RET} AsmInstType;
+typedef struct {
+    AsmInstType type;
+    int imm;
+} AsmInstruction;
 
 typedef struct {
     char *name;
-    Statement *body;
-} Function;
+    AsmInstruction *instructions;
+    int inst_count;
+} AsmFunction;
 
 typedef struct {
-    Function *fn;
-} Program;
+    AsmFunction *fn;
+} AsmProgram;
 
 
 //lexer save Token
@@ -202,6 +207,49 @@ Program *parse_program() {
     return prog;
 }
 
+//assemble generation
+AsmProgram *generate_asm(Program *prog){
+    AsmProgram *asm_prog=malloc(sizeof(AsmProgram));
+    asm_prog->fn=malloc(sizeof(AsmFunction));
+    asm_prog->fn->name=strdup(prog->fn->name);
+
+    //one return statement to mov and ret two instructions
+    asm_prog->fn->inst_count=2;
+    asm_prog->fn->instructions=malloc(sizeof(AsmInstruction)*2);
+
+    asm_prog->fn->instructions[0].type=ASM_MOV;
+    asm_prog->fn->instructions[0].imm=prog->fn->body->exp->value;
+
+    asm_prog->fn->instructions[1].type=ASM_RET;
+
+    return asm_prog;
+}
+
+// code emission
+void emit_asm(AsmProgram *asmp,FILE *out){
+    #ifdef __APPLE__
+        fprintf(out, ".globl _%s\n", asmp->fn->name);
+        fprintf(out, "_%s:\n", asmp->fn->name);
+    #else
+        fprintf(out, ".globl %s\n", asmp->fn->name);
+        fprintf(out, "%s:\n", asmp->fn->name);
+    #endif
+
+    for(int i=0;i<asmp->fn->inst_count;i++){
+        AsmInstruction inst=asmp->fn->instructions[i];
+        if (inst.type==ASM_MOV){
+            fprintf(out, "    movl    $%d, %%eax\n", inst.imm);
+        }else if (inst.type==ASM_RET){
+            fprintf(out, "    ret\n");
+        }
+    }
+
+    // Linux 安全堆棧標記
+    #ifndef __APPLE__
+        fprintf(out, ".section .note.GNU-stack,\"\",@progbits\n");
+    #endif
+}
+
 char *read_file(const char *filename){
     FILE *f=fopen(filename,"rb");
     if (!f){
@@ -225,43 +273,80 @@ char *read_file(const char *filename){
 }
 
 int main(int argc,char *argv[]){
-    char *filename=NULL;
-    int parse_flag=0;
+    char *input_path=NULL;
+    int stage=4;
 
     for(int i=1;i<argc;i++){
         if (strcmp(argv[i],"--lex")==0){
+            stage=1;
             continue;
         }
         else if (strcmp(argv[i],"--parse")==0){
-            parse_flag=1;
+            stage=2;
+            continue;
+        }
+        else if (strcmp(argv[i],"--codegen")==0){
+            stage=3;
             continue;
         }
         else if (argv[i][0]!='-'){
-            filename=argv[i];
+            input_path =argv[i];
         }
     }
 
-    if (!filename){
+    if (!input_path ){
         fprintf(stderr, "Usage: %s <input_file> [--lex]\n", argv[0]);
         return 1;
     }
 
     
-    char *input=read_file(filename);
+    char *input=read_file(input_path);
     if (!input){
-        fprintf(stderr, "Error: Could not read file %s\n", filename);
+        fprintf(stderr, "Error: Could not read file %s\n", input_path);
         return 1;
     }
 
+    //lex
     lex(input);
+    if (stage==1){
+        return 0;
+    }
 
-    free(input);
-
-
+    //parse
     Program *prog = parse_program();
+    if (stage==2){
+        return 0;
+    }
 
-    
+    //codegen
+    AsmProgram *asmp=generate_asm(prog);
+    if (stage==3){
+        return 0;
+    }
 
+    //emit Asm to .s file
+    char asm_path[256];
+    strncpy(asm_path, input_path, sizeof(asm_path) - 1);
+    asm_path[sizeof(asm_path) - 1] = '\0';
+    char *dot = strrchr(asm_path, '.');
+    if (dot) strcpy(dot, ".s"); else strcat(asm_path, ".s");
 
-    return 0;
+    FILE *out=fopen(asm_path,"w");
+    emit_asm(asmp,out);
+    fclose(out);
+
+    //use gcc make final execute
+    char cmd[1024];
+    char out_path[256];
+    strncpy(out_path, input_path, sizeof(out_path) - 1);
+    out_path[sizeof(out_path) - 1] = '\0';
+    dot = strrchr(out_path, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+
+    snprintf(cmd, sizeof(cmd), "gcc %s -o %s", asm_path, out_path);
+    int res = system(cmd);
+
+    return res;
 }
