@@ -87,6 +87,38 @@ typedef struct {
     AsmFunction *fn;
 } AsmProgram;
 
+//TACKY IR ddefine
+typedef enum {
+    TACKY_VAL_CONSTANT,
+    TACKY_VAL_VAR
+} TackyValType;
+
+typedef struct {
+    TackyValType type;
+    union {
+        int int_value;
+        char *var_name;
+    };
+} TackyVal;
+
+typedef enum {
+    TACKY_INST_RETURN,
+    TACKY_INST_UNARY
+} TackyInstType;
+
+typedef struct TackyInstruction{
+    TackyInstType type;
+    UnaryOpType unary_op;
+    TackyVal *src;
+    TackyVal *dst;
+    struct TackyInstruction *next;
+} TackyInstruction;
+
+typedef struct {
+    char *function_name;
+    TackyInstruction *instructions;
+} TackyProgram;
+
 
 //lexer save Token
 void add_token(TokenType type,const char *val){
