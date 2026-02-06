@@ -8,7 +8,11 @@ typedef  enum{
     TOK_INT, TOK_VOID, TOK_RETURN,
     TOK_IDENTIFIER, TOK_CONSTANT,
     TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
-    TOK_SEMICOLON, TOK_EOF, TOK_INVALID
+    TOK_SEMICOLON, TOK_EOF, TOK_INVALID,
+
+    TOK_NEGATION, // -
+    TOK_COMPLEMENT, // ~
+    TOK_DECREMENT // --
 }TokenType;
 
 typedef struct {
@@ -143,6 +147,17 @@ void lex(const char *input){
                 break;
             case ';':
                 add_token(TOK_SEMICOLON,NULL);
+                break;
+            case '~':
+                add_token(TOK_COMPLEMENT,NULL);
+                break;
+            case '-':
+                if (*(p+1)=='-'){
+                    add_token(TOK_DECREMENT,NULL);
+                    p++;
+                }else{
+                    add_token(TOK_NEGATION,NULL);
+                }
                 break;
             default:
                 fprintf(stderr,"Lexer Error: Invalid character '%c'\n",*p);
