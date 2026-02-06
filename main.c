@@ -119,6 +119,41 @@ typedef struct {
     TackyInstruction *instructions;
 } TackyProgram;
 
+//temporal variable
+int temp_counter=0;
+
+char *make_temporary(){
+    char *name=malloc(16);
+    sprintf(name,"tmp.%d",temp_counter++);
+    return name;
+}
+
+TackyVal *tacky_val_constant(int val){
+    TackyVal *v=malloc(sizeof(TackyVal));
+    v->type=TACKY_VAL_CONSTANT;
+    v->int_value=val;
+    return v;
+}
+
+TackyVal *tacky_val_var(char *name){
+    TackyVal *v=malloc(sizeof(TackyVal));
+    v->type=TACKY_VAL_VAR;
+    v->var_name=strdup(name);
+    return v;
+}
+
+//add instruction to the end of list
+void append_tacky_inst(TackyInstruction **head,TackyInstruction *new_list){
+    if (*head==NULL){
+        *head=new_list;
+    }else{
+        TackyInstruction *curr=*head;
+        while (curr->next!=NULL){
+            curr=curr->next;
+        }
+        curr->next=new_list;
+    }
+}
 
 //lexer save Token
 void add_token(TokenType type,const char *val){
