@@ -71,21 +71,54 @@ Exp *make_unary_exp(UnaryOpType op,Exp *inner){
 
 
 //Asm AST Node
-typedef enum {ASM_MOV,ASM_RET} AsmInstType;
+typedef enum {
+    AS_MOV,
+    AS_NEG,
+    AS_NOT,
+    AS_RET,
+    AS_ALLOCATE_STACK
+} AsmInstType;
+
+
+
+typedef enum {
+    AS_IMM, //immediate value
+    AS_REG, //  register like %eax,%r10d
+    AS_PSEUDO, //virutal register (tmp.0)
+    AS_STACK // stack address -4(%rbp)
+} AsmOpType;
+
+typedef enum{
+    REG_EAX,
+    REG_R10D
+} AsmReg;
+
+typedef struct {
+    AsmOpType type;
+    union {
+        int imm;
+        AsmReg reg;
+        char *pseudo;
+        int stack_offset;
+    };
+} AsmOperand;
+
 typedef struct {
     AsmInstType type;
-    int imm;
-} AsmInstruction;
+    AsmOperand src;
+    AsmOperand dst;
+    struct AsmInst *next;
+} AsmInst;
 
 typedef struct {
     char *name;
-    AsmInstruction *instructions;
-    int inst_count;
-} AsmFunction;
+    AsmInst *instructions;
+} AsmFunc;
 
 typedef struct {
-    AsmFunction *fn;
-} AsmProgram;
+    AsmFunc *fn;
+} AsmProg;
+
 
 //TACKY IR ddefine
 typedef enum {
@@ -141,7 +174,6 @@ TackyVal *tacky_val_var(char *name){
     v->var_name=strdup(name);
     return v;
 }
-
 //add instruction to the end of list
 void append_tacky_inst(TackyInstruction **head,TackyInstruction *new_list){
     if (*head==NULL){
@@ -346,55 +378,194 @@ Program *parse_program() {
     return prog;
 }
 
-//assemble generation
-AsmProgram *generate_asm(Program *prog){
-    AsmProgram *asm_prog=malloc(sizeof(AsmProgram));
-    asm_prog->fn=malloc(sizeof(AsmFunction));
-    asm_prog->fn->name=strdup(prog->fn->name);
+// //assemble generation
+// AsmProgram *generate_asm(Program *prog){
+//     AsmProgram *asm_prog=malloc(sizeof(AsmProgram));
+//     asm_prog->fn=malloc(sizeof(AsmFunction));
+//     asm_prog->fn->name=strdup(prog->fn->name);
 
-    //one return statement to mov and ret two instructions
-    asm_prog->fn->inst_count=2;
-    asm_prog->fn->instructions=malloc(sizeof(AsmInstruction)*2);
+//     //one return statement to mov and ret two instructions
+//     asm_prog->fn->inst_count=2;
+//     asm_prog->fn->instructions=malloc(sizeof(AsmInstruction)*2);
 
-    asm_prog->fn->instructions[0].type=ASM_MOV;
+//     asm_prog->fn->instructions[0].type=ASM_MOV;
 
-    if (prog->fn->body->exp->type==EXP_CONSTANT){
-        asm_prog->fn->instructions[0].imm=prog->fn->body->exp->int_value;
+//     if (prog->fn->body->exp->type==EXP_CONSTANT){
+//         asm_prog->fn->instructions[0].imm=prog->fn->body->exp->int_value;
 
+//     }else{
+//         asm_prog->fn->instructions[0].imm=0;
+//     }
+
+
+//     asm_prog->fn->instructions[1].type=ASM_RET;
+
+//     return asm_prog;
+// }
+
+//support build operator
+AsmOperand as_imm(int i){
+    return (AsmOperand){
+        AS_IMM,
+        .imm=i
+    };
+}
+
+AsmOperand as_reg(AsmReg r){
+    return (AsmOperand){
+        AS_REG,
+        .reg=r
+    };
+}
+
+AsmOperand as_pseudo(char *s){
+    return (AsmOperand){
+        AS_PSEUDO,
+        .pseudo=strdup(s)
+    };
+}
+
+AsmOperand convert_tacky_val(TackyVal *v){
+    if (v->type==TACKY_VAL_CONSTANT){
+        return as_imm(v->int_value);
+    }
+
+    return as_pseudo(v->var_name);
+}
+
+void append_asm(AsmInst **head,AsmInstType type,AsmOperand src,AsmOperand dst){
+    AsmInst *new_inst=malloc(sizeof(AsmInst));
+    new_inst->type=type;
+    new_inst->src=src;
+    new_inst->dst=dst;
+    new_inst->next=NULL;
+    if (*head==NULL){
+        *head=new_inst;
     }else{
-        asm_prog->fn->instructions[0].imm=0;
-    }
-
-
-    asm_prog->fn->instructions[1].type=ASM_RET;
-
-    return asm_prog;
-}
-
-// code emission
-void emit_asm(AsmProgram *asmp,FILE *out){
-    #ifdef __APPLE__
-        fprintf(out, ".globl _%s\n", asmp->fn->name);
-        fprintf(out, "_%s:\n", asmp->fn->name);
-    #else
-        fprintf(out, ".globl %s\n", asmp->fn->name);
-        fprintf(out, "%s:\n", asmp->fn->name);
-    #endif
-
-    for(int i=0;i<asmp->fn->inst_count;i++){
-        AsmInstruction inst=asmp->fn->instructions[i];
-        if (inst.type==ASM_MOV){
-            fprintf(out, "    movl    $%d, %%eax\n", inst.imm);
-        }else if (inst.type==ASM_RET){
-            fprintf(out, "    ret\n");
+        AsmInst *curr=*head;
+        while (curr->next!=NULL){
+            curr=curr->next;
         }
+        curr->next=new_inst;
+    }
+    
+}
+
+AsmProg *tacky_to_asm(TackyProgram *tacky){
+    AsmProg *asmp=malloc(sizeof(AsmProg));
+    asmp->fn=malloc(sizeof(AsmFunc));
+    asmp->fn->name=strdup(tacky->function_name);
+    asmp->fn->instructions=NULL;
+
+    TackyInstruction *curr=tacky->instructions;
+    while (curr!=NULL){
+        if (curr->type==TACKY_INST_RETURN){
+            append_asm(&asmp->fn->instructions,AS_MOV,convert_tacky_val(curr->src),as_reg(REG_EAX));
+            append_asm(&asmp->fn->instructions,AS_RET,(AsmOperand){0},(AsmOperand){0});
+        }
+        else if (curr->type==TACKY_INST_UNARY){
+            append_asm(&asmp->fn->instructions,AS_MOV,convert_tacky_val(curr->src),convert_tacky_val(curr->dst));
+            AsmInstType type=(curr->unary_op==UNARY_NEGATION)?AS_NEG:AS_NOT;
+            append_asm(&asmp->fn->instructions,type,(AsmOperand){0},convert_tacky_val(curr->dst));
+        }
+        curr=curr->next;
     }
 
-    // Linux 安全堆棧標記
-    #ifndef __APPLE__
-        fprintf(out, ".section .note.GNU-stack,\"\",@progbits\n");
-    #endif
+    return asmp;
 }
+
+//stack allocation and instruction fix
+typedef struct {
+    char *name;
+    int offset
+} MapEntry;
+
+void fix_and_allocate(AsmProg *asmp){
+    MapEntry map[100];
+    int map_size=0;
+    int current_stack=-4;
+    
+    AsmInst *curr=asmp->fn->instructions;
+    while (curr){
+        AsmOperand *ops[2]={
+            &curr->src,
+            &curr->dst
+        };
+
+        for(int i=0;i<2;i++){
+            if (ops[i]->type==AS_PSEUDO){
+                int found=-1;
+                for(int j=0;j<map_size;j++){
+                    if (strcmp(map[j].name,ops[i]->pseudo)==0){
+                        found=map[j].offset;
+                        if (found==-1){
+                            map[map_size].name=ops[i]->pseudo;
+                            map[map_size].offset=current_stack;
+                            found=current_stack;
+                            current_stack-=4;
+                            map_size++;
+                        }
+                        ops[i]->type=AS_STACK;
+                        ops[i]->stack_offset=found;
+                    }
+                }
+               
+            }
+        }
+        curr=curr->next;
+    }
+
+    //in the begining insert allocate stack instruction
+    AsmInst *allocate=malloc(sizeof(AsmInst));
+    allocate->type=AS_ALLOCATE_STACK;
+    allocate->src=as_imm(-current_stack-4);
+    allocate->next=asmp->fn->instructions;
+    asmp->fn->instructions=allocate;
+
+    //fix up
+    curr=asmp->fn->instructions;
+    while (curr){
+        if (curr->type==AS_MOV && curr->src.type==AS_STACK && curr->dst.type==AS_STACK){
+            //convert mov src,%r10d to mov %r10d,dst
+            AsmInst *new_mov=malloc(sizeof(AsmInst));
+            new_mov->type=AS_MOV;
+            new_mov->src=as_reg(REG_R10D);
+            new_mov->dst=curr->dst;
+            new_mov->next=curr->next;
+
+            curr->dst=as_reg(REG_R10D);
+            curr->next=new_mov;
+            
+        }
+        curr=curr->next;
+    }
+}
+
+
+// // code emission
+// void emit_asm(AsmProgram *asmp,FILE *out){
+//     #ifdef __APPLE__
+//         fprintf(out, ".globl _%s\n", asmp->fn->name);
+//         fprintf(out, "_%s:\n", asmp->fn->name);
+//     #else
+//         fprintf(out, ".globl %s\n", asmp->fn->name);
+//         fprintf(out, "%s:\n", asmp->fn->name);
+//     #endif
+
+//     for(int i=0;i<asmp->fn->inst_count;i++){
+//         AsmInstruction inst=asmp->fn->instructions[i];
+//         if (inst.type==ASM_MOV){
+//             fprintf(out, "    movl    $%d, %%eax\n", inst.imm);
+//         }else if (inst.type==ASM_RET){
+//             fprintf(out, "    ret\n");
+//         }
+//     }
+
+//     // Linux 安全堆棧標記
+//     #ifndef __APPLE__
+//         fprintf(out, ".section .note.GNU-stack,\"\",@progbits\n");
+//     #endif
+// }
 
 //Tacky generation
 TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
@@ -442,6 +613,44 @@ TackyProgram *generate_tacky(Program *prog){
 
     return t_prog;
     
+}
+
+void emit_op(AsmOperand op,FILE *out){
+    if (op.type==AS_IMM){
+        fprintf(out,"$%d",op.imm);
+    }
+    else if (op.type==AS_REG){
+        fprintf(out,"%s",op.reg==REG_EAX ? "%eax": "%r10d");
+    }
+    else if (op.type==AS_STACK){
+        fprintf(out, "%d(%%rbp)", op.stack_offset);
+    }
+}
+
+void emit_asm_new(AsmProg * asmp,FILE *out){
+    fprintf(out, ".globl %s\n%s:\n", asmp->fn->name, asmp->fn->name);
+    // Prologue
+    fprintf(out, "    pushq   %%rbp\n");
+    fprintf(out, "    movq    %%rsp, %%rbp\n");
+
+    AsmInst *curr = asmp->fn->instructions;
+    while (curr) {
+        switch (curr->type) {
+            case AS_ALLOCATE_STACK: fprintf(out, "    subq    $%d, %%rsp\n", curr->src.imm); break;
+            case AS_MOV: 
+                fprintf(out, "    movl    ");
+                emit_op(curr->src, out); fprintf(out, ", "); emit_op(curr->dst, out);
+                fprintf(out, "\n"); break;
+            case AS_NEG: fprintf(out, "    negl    "); emit_op(curr->dst, out); fprintf(out, "\n"); break;
+            case AS_NOT: fprintf(out, "    notl    "); emit_op(curr->dst, out); fprintf(out, "\n"); break;
+            case AS_RET:
+                // Epilogue
+                fprintf(out, "    movq    %%rbp, %%rsp\n");
+                fprintf(out, "    popq    %%rbp\n");
+                fprintf(out, "    ret\n"); break;
+        }
+        curr = curr->next;
+    }
 }
 
 char *read_file(const char *filename){
@@ -523,7 +732,8 @@ int main(int argc,char *argv[]){
     }
 
     //codegen
-    AsmProgram *asmp=generate_asm(prog);
+    AsmProg *asmp=tacky_to_asm(tacky_prog);
+    fix_and_allocate(asmp);
     if (stage==3){
         return 0;
     }
@@ -536,7 +746,7 @@ int main(int argc,char *argv[]){
     if (dot) strcpy(dot, ".s"); else strcat(asm_path, ".s");
 
     FILE *out=fopen(asm_path,"w");
-    emit_asm(asmp,out);
+    emit_asm_new(asmp,out);
     fclose(out);
 
     //use gcc make final execute
