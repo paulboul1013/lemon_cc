@@ -396,6 +396,54 @@ void emit_asm(AsmProgram *asmp,FILE *out){
     #endif
 }
 
+//Tacky generation
+TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
+    if (e->type==EXP_CONSTANT){
+        return tacky_val_constant(e->int_value);
+    }
+    else if (e->type==EXP_UNARY){
+        //deal with inner expression first,get sorce operator
+        TackyVal *src=gen_tacky_exp(e->unary.exp,inst_list);
+        
+        //build a temporal variable for dest
+        char *t_name=make_temporary();
+        TackyVal *dst=tacky_val_var(t_name);
+
+        //emit unary instruction and add list
+        TackyInstruction *inst=malloc(sizeof(TackyInstruction));
+        inst->type=TACKY_INST_UNARY;
+        inst->unary_op=e->unary.op;
+        inst->src=src;
+        inst->dst=dst;
+        inst->next=NULL;
+        append_tacky_inst(inst_list,inst);
+        
+        //return temporal variable，let outter layer function can use it
+        return dst;
+    }
+
+    return NULL;
+}
+
+TackyProgram *generate_tacky(Program *prog){
+    TackyProgram *t_prog=malloc(sizeof(TackyProgram));
+    t_prog->function_name=strdup(prog->fn->name);
+    t_prog->instructions=NULL;
+
+    //deal with return sentence expression
+    TackyVal *final_val=gen_tacky_exp(prog->fn->body->exp,&t_prog->instructions);
+
+    //emit RETURN instruction
+    TackyInstruction *ret_inst=malloc(sizeof(TackyInstruction));
+    ret_inst->type=TACKY_INST_RETURN;
+    ret_inst->src=final_val;
+    ret_inst->next=NULL;
+    append_tacky_inst(&t_prog->instructions,ret_inst);
+
+    return t_prog;
+    
+}
+
 char *read_file(const char *filename){
     FILE *f=fopen(filename,"rb");
     if (!f){
@@ -435,6 +483,10 @@ int main(int argc,char *argv[]){
             stage=3;
             continue;
         }
+        else if (strcmp(argv[i],"--tacky")==0){
+            stage=4;
+            continue;
+        }
         else if (argv[i][0]!='-'){
             input_path =argv[i];
         }
@@ -461,6 +513,12 @@ int main(int argc,char *argv[]){
     //parse
     Program *prog = parse_program();
     if (stage==2){
+        return 0;
+    }
+
+    //TACKY Generation
+    TackyProgram *tacky_prog=generate_tacky(prog);
+    if (stage==4){
         return 0;
     }
 
