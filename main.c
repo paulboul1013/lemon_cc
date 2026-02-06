@@ -20,16 +20,55 @@ typedef struct {
     char *value;
 }Token;
 
+typedef enum {
+    EXP_CONSTANT,
+    EXP_UNARY
+}ExpType;
+
+typedef enum {
+    UNARY_NEGATION, // -
+    UNARY_COMPLEMENT, // ~
+}UnaryOpType;
+
+typedef struct Exp {
+    ExpType type;
+    union {
+        int int_value; //for EXP_CONSTANT
+        struct { //for EXP_UNARY
+            UnaryOpType op;
+            struct Exp *exp;
+        }unary;
+    };
+} Exp;
+
 // for save lexer make all tokens
 Token * token_list=NULL;
 int token_count=0;
 int token_pos=0;
 
 // c AST Node
-typedef struct {int value;} Exp;
 typedef struct {Exp *exp;} Statement;
 typedef struct {char *name; Statement *body; } Function;
 typedef struct {Function *fn;} Program;
+
+//Exp helper function
+//build constant node
+Exp *make_int_exp(int i){
+    Exp *e=malloc(sizeof(Exp));
+    e->type=EXP_CONSTANT;
+    e->int_value=i;
+    return e;
+}
+
+//build unary node
+Exp *make_unary_exp(UnaryOpType op,Exp *inner){
+    Exp *e=malloc(sizeof(Exp));
+    e->type=EXP_UNARY;
+    e->unary.op=op;
+    e->unary.exp=inner;
+    return e;
+}
+
 
 //Asm AST Node
 typedef enum {ASM_MOV,ASM_RET} AsmInstType;
@@ -180,13 +219,31 @@ void expect(TokenType type){
     }
 }
 
-//<exp> :: = <int>
+//<exp> :: = <int> | <unop> <exp> | "(" <exp> ")"
 Exp *parse_exp(){
-    Token t=take();
-    if (t.type!=TOK_CONSTANT) exit(1);
-    Exp *e=malloc(sizeof(Exp));
-    e->value=atoi(t.value);
-    return e;
+   Token t=peek();
+
+   if (t.type==TOK_CONSTANT){
+        take();
+        return make_int_exp(atoi(t.value));
+   }
+
+   else if (t.type==TOK_NEGATION || t.type==TOK_COMPLEMENT){
+        take(); //take - or ~ out
+        UnaryOpType op=(t.type==TOK_NEGATION) ? UNARY_NEGATION:UNARY_COMPLEMENT;
+        Exp *inner=parse_exp(); //support -~2
+        return make_unary_exp(op,inner);
+   }
+   else if (t.type==TOK_LPAREN){
+    take(); //take (  out
+    Exp *inner=parse_exp(); //parse ( exp )
+    expect(TOK_RPAREN);
+    return inner;
+   }
+   else{
+        fprintf(stderr, "Parse Error: Unexpected token %d at position %d\n", t.type, token_pos);
+        exit(1);
+   }
 } 
 
 // <statement> ::= "return" <exp> ";"
@@ -233,7 +290,14 @@ AsmProgram *generate_asm(Program *prog){
     asm_prog->fn->instructions=malloc(sizeof(AsmInstruction)*2);
 
     asm_prog->fn->instructions[0].type=ASM_MOV;
-    asm_prog->fn->instructions[0].imm=prog->fn->body->exp->value;
+
+    if (prog->fn->body->exp->type==EXP_CONSTANT){
+        asm_prog->fn->instructions[0].imm=prog->fn->body->exp->int_value;
+
+    }else{
+        asm_prog->fn->instructions[0].imm=0;
+    }
+
 
     asm_prog->fn->instructions[1].type=ASM_RET;
 
