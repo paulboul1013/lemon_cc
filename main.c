@@ -27,8 +27,17 @@ typedef struct {
 
 typedef enum {
     EXP_CONSTANT,
-    EXP_UNARY
+    EXP_UNARY,
+    EXP_BINARY
 }ExpType;
+
+typedef enum {
+    BINARY_ADD,
+    BINARY_SUB,
+    BINARY_MULT,
+    BINARY_DIV,
+    BINARY_REM
+}BinaryOpType;
 
 typedef enum {
     UNARY_NEGATION, // -
@@ -43,6 +52,11 @@ typedef struct Exp {
             UnaryOpType op;
             struct Exp *exp;
         }unary;
+        struct {
+            BinaryOpType op;
+            struct Exp *left;
+            struct Exp *right;
+        }binary;
     };
 } Exp;
 
@@ -74,6 +88,42 @@ Exp *make_unary_exp(UnaryOpType op,Exp *inner){
     return e;
 }
 
+Exp *make_binary_exp(BinaryOpType op,Exp *left,Exp *right){
+    Exp *e=malloc(sizeof(Exp));
+    e->type=EXP_BINARY;
+    e->binary.op=op;
+    e->binary.left=left;
+    e->binary.right=right;
+    return e;
+}
+
+//precedence section
+
+//build precedence table
+int get_precedence(TokenType op){
+    switch (op) {
+        case TOK_MULT:
+        case TOK_DIV:
+        case TOK_REMAINDER:
+            return 50;
+        case TOK_PLUS:
+        case TOK_NEGATION: //it's minus
+            return 45;
+        default: //not binary operator
+            return -1;
+    }
+}
+
+BinaryOpType token_to_binary_op(TokenType type){
+    switch (type){
+        case TOK_PLUS: return BINARY_ADD;
+        case TOK_NEGATION: return BINARY_SUB;
+        case TOK_MULT: return BINARY_MULT;
+        case TOK_DIV: return BINARY_DIV;
+        case TOK_REMAINDER: return BINARY_REM;
+        default: exit(1);
+    }
+}
 
 //Asm AST Node
 typedef enum {
@@ -326,6 +376,8 @@ void lex(const char *input){
 //Parser section
 Token peek() {return token_list[token_pos];}
 Token take() {return token_list[token_pos++];}
+Exp *parse_exp(int min_prec);
+Exp *parse_factor();
 
 void expect(TokenType type){
     Token t=take();
@@ -335,38 +387,60 @@ void expect(TokenType type){
     }
 }
 
-//<exp> :: = <int> | <unop> <exp> | "(" <exp> ")"
-Exp *parse_exp(){
-   Token t=peek();
+//<exp> ::= <factor> | <exp> <binop> <exp>
+Exp *parse_exp(int min_prec){
+   Exp *left=parse_factor();
+   Token next=peek();
 
-   if (t.type==TOK_CONSTANT){
+   while (get_precedence(next.type)>=min_prec){
+        Token op_tok=take();
+        int prec=get_precedence(op_tok.type);
+
+        //because implement is left-associative, pass prec+1
+        Exp *right=parse_exp(prec+1);
+
+        left=make_binary_exp(token_to_binary_op(op_tok.type),left,right);
+        next=peek();
+
+   }
+
+   return left;
+} 
+
+//deal with number and parentheses and unary operator
+//note:unary operator make sure higher precedence than binary operator
+//<factor> ::= <int> | <unop> <factor> | "(" <exp> ")"
+Exp *parse_factor(){
+    Token t=peek();
+    
+    if (t.type==TOK_CONSTANT){
         take();
         return make_int_exp(atoi(t.value));
-   }
-
-   else if (t.type==TOK_NEGATION || t.type==TOK_COMPLEMENT){
-        take(); //take - or ~ out
-        UnaryOpType op=(t.type==TOK_NEGATION) ? UNARY_NEGATION:UNARY_COMPLEMENT;
-        Exp *inner=parse_exp(); //support -~2
+    }
+    else if (t.type==TOK_NEGATION || t.type==TOK_COMPLEMENT){
+        take();
+        UnaryOpType op=(t.type==TOK_NEGATION) ? UNARY_NEGATION :UNARY_COMPLEMENT;
+        Exp *inner=parse_factor(); //unary after factor
         return make_unary_exp(op,inner);
-   }
-   else if (t.type==TOK_LPAREN){
-    take(); //take (  out
-    Exp *inner=parse_exp(); //parse ( exp )
-    expect(TOK_RPAREN);
-    return inner;
-   }
-   else{
-        fprintf(stderr, "Parse Error: Unexpected token %d at position %d\n", t.type, token_pos);
+    }
+    else if (t.type==TOK_LPAREN){
+        take();
+        Exp *inner=parse_exp(0); // PAREN inter predence reset to 0
+        expect(TOK_RPAREN);
+        return inner;
+    }else{
+        fprintf(stderr, "Parse Error: Expected factor but got %d\n", t.type);
         exit(1);
-   }
-} 
+    }
+
+    
+}
 
 // <statement> ::= "return" <exp> ";"
 Statement *parse_statement() {
     expect(TOK_RETURN);
     Statement *s=malloc(sizeof(Statement));
-    s->exp=parse_exp();
+    s->exp=parse_exp(0);
     expect(TOK_SEMICOLON);
     return s;
 }
