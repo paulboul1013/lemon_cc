@@ -12,7 +12,12 @@ typedef  enum{
 
     TOK_NEGATION, // -
     TOK_COMPLEMENT, // ~
-    TOK_DECREMENT // --
+    TOK_DECREMENT, // --
+
+    TOK_PLUS, //+
+    TOK_MULT, //*
+    TOK_DIV, // /
+    TOK_REMAINDER //%
 }TokenType;
 
 typedef struct {
@@ -288,6 +293,18 @@ void lex(const char *input){
                 break;
             case '~':
                 add_token(TOK_COMPLEMENT,NULL);
+                break;
+            case '+':
+                add_token(TOK_PLUS,NULL);
+                break;
+            case '*':
+                add_token(TOK_MULT,NULL);
+                break;
+            case '/':
+                add_token(TOK_DIV,NULL);
+                break;
+            case '%':
+                add_token(TOK_REMAINDER,NULL);
                 break;
             case '-':
                 if (*(p+1)=='-'){ //deal with --
