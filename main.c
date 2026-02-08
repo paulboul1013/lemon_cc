@@ -103,7 +103,7 @@ typedef struct {
     };
 } AsmOperand;
 
-typedef struct {
+typedef struct AsmInst {
     AsmInstType type;
     AsmOperand src;
     AsmOperand dst;
@@ -290,10 +290,10 @@ void lex(const char *input){
                 add_token(TOK_COMPLEMENT,NULL);
                 break;
             case '-':
-                if (*(p+1)=='-'){
+                if (*(p+1)=='-'){ //deal with --
                     add_token(TOK_DECREMENT,NULL);
                     p++;
-                }else{
+                }else{ //deal with -
                     add_token(TOK_NEGATION,NULL);
                 }
                 break;
@@ -477,11 +477,11 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
 //stack allocation and instruction fix
 typedef struct {
     char *name;
-    int offset
+    int offset;
 } MapEntry;
 
 void fix_and_allocate(AsmProg *asmp){
-    MapEntry map[100];
+    MapEntry map[1000];
     int map_size=0;
     int current_stack=-4;
     
@@ -494,39 +494,57 @@ void fix_and_allocate(AsmProg *asmp){
 
         for(int i=0;i<2;i++){
             if (ops[i]->type==AS_PSEUDO){
-                int found=-1;
+                int found_offset=0;
+                int already_exists=0;
+                
+                //check is it in the map
                 for(int j=0;j<map_size;j++){
                     if (strcmp(map[j].name,ops[i]->pseudo)==0){
-                        found=map[j].offset;
-                        if (found==-1){
-                            map[map_size].name=ops[i]->pseudo;
-                            map[map_size].offset=current_stack;
-                            found=current_stack;
-                            current_stack-=4;
-                            map_size++;
-                        }
-                        ops[i]->type=AS_STACK;
-                        ops[i]->stack_offset=found;
+                        found_offset=map[j].offset;
+                        already_exists=1;
+                        break;
                     }
                 }
+
+                //if is new variable, add map
+                if (!already_exists){
+                    map[map_size].name=strdup(ops[i]->pseudo);
+                    map[map_size].offset=current_stack;
+                    found_offset=current_stack;
+                    current_stack-=4;
+                    map_size++;
+                }
+
+                //convert stack operator 
+                ops[i]->type=AS_STACK;
+                ops[i]->stack_offset=found_offset;
                
             }
         }
         curr=curr->next;
     }
 
+    //cal total needed stack space
+    int total_stack_size=-(current_stack+4);
+
     //in the begining insert allocate stack instruction
-    AsmInst *allocate=malloc(sizeof(AsmInst));
-    allocate->type=AS_ALLOCATE_STACK;
-    allocate->src=as_imm(-current_stack-4);
-    allocate->next=asmp->fn->instructions;
-    asmp->fn->instructions=allocate;
+    if (total_stack_size>0){
+        AsmInst *allocate=malloc(sizeof(AsmInst));
+        allocate->type=AS_ALLOCATE_STACK;
+        allocate->src=as_imm(total_stack_size);
+        allocate->next=asmp->fn->instructions;
+        asmp->fn->instructions=allocate;
+    }
+
 
     //fix up
     curr=asmp->fn->instructions;
     while (curr){
+        //x64 limit: mov instruction source and destination can't be memory address
         if (curr->type==AS_MOV && curr->src.type==AS_STACK && curr->dst.type==AS_STACK){
-            //convert mov src,%r10d to mov %r10d,dst
+            //convert to 
+            //movl src,%r10d
+            //movl %r10d,dst
             AsmInst *new_mov=malloc(sizeof(AsmInst));
             new_mov->type=AS_MOV;
             new_mov->src=as_reg(REG_R10D);
@@ -535,6 +553,9 @@ void fix_and_allocate(AsmProg *asmp){
 
             curr->dst=as_reg(REG_R10D);
             curr->next=new_mov;
+            
+            //skip this new mov instruction，avoid infinite loop
+            curr=new_mov;
             
         }
         curr=curr->next;
@@ -628,11 +649,18 @@ void emit_op(AsmOperand op,FILE *out){
 }
 
 void emit_asm_new(AsmProg * asmp,FILE *out){
-    fprintf(out, ".globl %s\n%s:\n", asmp->fn->name, asmp->fn->name);
-    // Prologue
+    char *name = asmp->fn->name;
+#ifdef __APPLE__
+    fprintf(out, ".globl _%s\n_%s:\n", name, name);
+#else
+    fprintf(out, ".globl %s\n%s:\n", name, name);
+#endif
+
+
+    // Function Prologue
     fprintf(out, "    pushq   %%rbp\n");
     fprintf(out, "    movq    %%rsp, %%rbp\n");
-
+    
     AsmInst *curr = asmp->fn->instructions;
     while (curr) {
         switch (curr->type) {
@@ -644,13 +672,17 @@ void emit_asm_new(AsmProg * asmp,FILE *out){
             case AS_NEG: fprintf(out, "    negl    "); emit_op(curr->dst, out); fprintf(out, "\n"); break;
             case AS_NOT: fprintf(out, "    notl    "); emit_op(curr->dst, out); fprintf(out, "\n"); break;
             case AS_RET:
-                // Epilogue
+                //Function Epilogue
                 fprintf(out, "    movq    %%rbp, %%rsp\n");
                 fprintf(out, "    popq    %%rbp\n");
                 fprintf(out, "    ret\n"); break;
         }
         curr = curr->next;
     }
+    // Linux safe stack marking
+#ifndef __APPLE__
+    fprintf(out, ".section .note.GNU-stack,\"\",@progbits\n");
+#endif
 }
 
 char *read_file(const char *filename){
@@ -677,7 +709,7 @@ char *read_file(const char *filename){
 
 int main(int argc,char *argv[]){
     char *input_path=NULL;
-    int stage=4;
+    int stage=5;
 
     for(int i=1;i<argc;i++){
         if (strcmp(argv[i],"--lex")==0){
