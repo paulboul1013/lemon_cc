@@ -1,5 +1,7 @@
 # lemon_cc
 
+# 第一章: A Minial Compiler
+
 ##  編譯器架構
 
 編譯器並非直接進行翻譯，而是透過一系列的「階段 (Passes)」將程式碼逐步降級：
@@ -118,3 +120,116 @@ writing-a-c-compiler-tests的測資
 
 *   **[Executable Stack](https://www.airs.com/blog/archives/518)** — *Ian Lance Taylor*
     *   討論哪些程式需要可執行堆疊，並描述 Linux 系統如何判斷程式的堆疊是否應該具備可執行權限。
+
+
+# 第二章：一元運算子 (Unary Operators)
+
+在第一章中，我們實作了一個只能回傳常數的編譯器。本章將帶領你跨出重要的一步：處理 **一元運算子**，包含 **負號 (`-`)** 與 **位元反轉 (`~`)**。更重要的是，本章引入了編譯器設計中極其關鍵的概念：**中間表示層 (Intermediate Representation, IR)**。
+
+## 1. 詞法分析 (Lexer) 的擴充
+本章需要識別三個新 Token：
+*   `~` (Tilde)：位元反轉運算子。
+*   `-` (Hyphen)：負號運算子。
+*   `--` (Decrement)：遞減運算子（**注意**：雖然本章不實作功能，但 Lexer 必須能識別它，否則 `--2` 會被錯誤地解析為兩個負號 `-` `-` 2，而後者在 C 語言中是合法的，前者則不是）。
+
+> **注意**：在實作 Lexer 時，應遵循「最長匹配原則」(Longest Match Rule)。當遇到 `-` 時，要先檢查下一個字元是否也是 `-`。
+
+---
+
+## 2. 語法分析 (Parser) 與 AST
+我們需要擴充抽象語法樹 (AST) 的定義，使其具有遞迴結構，以支援嵌套表達式（例如：`-~-2`）。
+
+### AST 定義 (ASDL)
+```haskell
+exp = Constant(int) | Unary(unary_operator, exp)  -- 遞迴定義
+
+unary_operator = Complement | Negate
+```
+
+### 遞迴下降解析 (Recursive Descent)
+解析表達式時，`parse_exp` 會檢查當前 Token：
+1. 如果是 `-` 或 `~`，則呼叫 `parse_unop` 並**遞迴**呼叫 `parse_exp`。
+2. 如果是 `(`，則解析內部的表達式並檢查 `)`。
+3. 如果是常數，則回傳 `Constant` 節點。
+
+---
+
+## 3. 中間表示層：TACKY IR
+這是本章的精華。直接從 AST 生成組語非常困難，因為組語指令通常是平坦的（Flat），而表達式是嵌套的。因此，我們引入了 **TACKY**（一種三位址碼 IR）。
+
+### 為什麼需要 TACKY？
+*   **拆解複雜運算**：將 `-~2` 拆解為多個簡單步驟。
+*   **引入臨時變數**：用來儲存中間計算結果。
+*   **優化基礎**：之後的常數摺疊或死碼刪除都會在這一層進行。
+
+### TACKY 的結構
+在 TACKY 中，一項運算由 `來源 (src)` 和 `目的 (dst)` 組成。
+*   **例子**：`return ~(-2);`
+    ```text
+    tmp.0 = Negate(2)
+    tmp.1 = Complement(tmp.0)
+    Return(tmp.1)
+    ```
+
+---
+
+## 4. 彙編語言中的堆疊 (The Stack)
+在真正的 x64 彙編中，臨時變數不能無限量存在。目前的策略是將所有變數存放在 **堆疊 (Stack)** 上。
+
+### 關鍵暫存器
+*   **RSP (Stack Pointer)**：指向堆疊頂部（目前使用的最低位址）。
+*   **RBP (Base/Frame Pointer)**：指向當前函數幀 (Stack Frame) 的底部。
+
+### 函數序言與結尾 (Prologue & Epilogue)
+每個函數開始時，必須設定它的 Stack Frame：
+```nasm
+pushq %rbp          ; 保存呼叫者的 RBP
+movq %rsp, %rbp     ; 設定新的 RBP
+subq $16, %rsp      ; 替局部變數分配空間 (16  bytes)
+```
+結束時需還原：
+```nasm
+movq %rbp, %rsp     ; 釋放空間
+popq %rbp           ; 還原呼叫者的 RBP
+ret
+```
+
+---
+
+## 5. 組語生成流程 (Assembly Generation)
+將 TACKY 轉換為組語分為三個子階段：
+
+### A. 轉換為虛擬組語
+將 TACKY 指令一對一對應到組語指令，但此時仍使用「虛擬暫存器」（如 `tmp.0`）。
+*   `tmp.0 = Negate(2)` 變換為：
+    ```text
+    movl $2, %tmp.0
+    negl %tmp.0
+    ```
+
+### B. 虛擬暫存器替換 (Register Allocation - Spilling)
+將每個虛擬暫存器對應到堆疊上的位址。例如 `tmp.0` 對應到 `-4(%rbp)`。
+
+### C. 指令修復 (Instruction Fix-up)
+**這非常重要！** x86-64 有一個限制：**一條指令不能同時有兩個記憶體運算元**。
+*   **錯誤的組語**：`movl -4(%rbp), -8(%rbp)` (會編譯失敗)
+*   **修復方法**：使用一個中間暫存器（如 `%r10d`）進行中轉：
+    ```nasm
+    movl -4(%rbp), %r10d
+    movl %r10d, -8(%rbp)
+    ```
+
+---
+
+## 6. 平台差異：Code Emission
+*   **macOS**：函數名稱前需要底線（如 `_main`），且位元反轉指令可能略有不同。
+*   **Linux**：需要 `.section .note.GNU-stack,"",@progbits` 以確保堆疊不可執行（安全性標記）
+
+---
+
+## 總結 (Summary)
+
+1.  **解析遞迴表達式**：利用遞迴下降法處理嵌套的一元運算。
+2.  **引入 TACKY IR**：理解了為什麼三位址碼是編譯器中的橋樑。
+3.  **管理堆疊空間**：學會了 RBP/RSP 的操作以及如何建立 Stack Frame。
+4.  **解決硬體限制**：處理 x86 指令不能同時存取兩個記憶體位址的問題。
