@@ -664,29 +664,21 @@ void fix_and_allocate(AsmProg *asmp){
         //x64 limit: mov instruction source and destination can't be memory address
         if ((curr->type == AS_MOV || (curr->type == AS_BINARY && curr->binary_op != BINARY_MULT)) 
             && curr->src.type == AS_STACK && curr->dst.type == AS_STACK){
-            
-            //backup origin instruction type and operator
-            AsmInstType origin_type=curr->type;
-            BinaryOpType origin_op=curr->binary_op;
 
             
-            //build second instruction: execute origin operation (like addl %r10d, -8(%rbp))
-            AsmInst *new_inst=malloc(sizeof(AsmInst));
-            new_inst->type=origin_type;
-            new_inst->binary_op=origin_op;
-            new_inst->src=as_reg(REG_R10D);
-            new_inst->dst=curr->dst;
-            new_inst->next=curr->next;
+            AsmInst *new_op=malloc(sizeof(AsmInst));
+            new_op->type=curr->type;
+            new_op->binary_op=curr->binary_op;
+            new_op->src=as_reg(REG_R10D);
+            new_op->dst=curr->dst;
+            new_op->next=curr->next;
 
 
-            // revise first instruction : read source to register(movl -4(rbp) , %r10d)
             curr->type=AS_MOV;
-            curr->binary_op=0;
             curr->dst=as_reg(REG_R10D);
-            curr->next=new_inst;
+            curr->next=new_op;
+            curr=new_op;
             
-            //skip this new  instruction，avoid infinite loop
-            curr=new_inst;
             
         }
         // idiv can't use immediate value 
@@ -702,12 +694,20 @@ void fix_and_allocate(AsmProg *asmp){
             curr=new_idiv;
         }
         else if (curr->type==AS_BINARY && curr->binary_op==BINARY_MULT && curr->dst.type==AS_STACK){
+            //imull $3, -4(%rbp) mult constant with memory address content
+           
+            //movl -4(%rbp), %r11d
+            //imull $3, %r11d
+            //movl %r11d, -4(%rbp)
+
+            //movl -4(%rbp), %r11d
             AsmInst *mov_back=malloc(sizeof(AsmInst));
             mov_back->type=AS_MOV;
             mov_back->src=as_reg(REG_R11D);
-            mov_back->dst=curr->dst;
+            mov_back->dst=curr->dst; //store back origin stack space
             mov_back->next=curr->next;
 
+            //imull $3, %r11d
             AsmInst *imul_op=malloc(sizeof(AsmInst));
             imul_op->type=AS_BINARY;
             imul_op->binary_op=BINARY_MULT;
@@ -715,9 +715,14 @@ void fix_and_allocate(AsmProg *asmp){
             imul_op->dst=as_reg(REG_R11D);
             imul_op->next=mov_back;
 
+            //movl %r11d, -4(%rbp)
+            AsmOperand original_dst=curr->dst;
             curr->type=AS_MOV;
+            curr->src=original_dst;
             curr->dst=as_reg(REG_R11D);
             curr->next=imul_op;
+
+
             curr=mov_back;
         }
         curr=curr->next;
