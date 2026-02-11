@@ -233,3 +233,135 @@ ret
 2.  **引入 TACKY IR**：理解了為什麼三位址碼是編譯器中的橋樑。
 3.  **管理堆疊空間**：學會了 RBP/RSP 的操作以及如何建立 Stack Frame。
 4.  **解決硬體限制**：處理 x86 指令不能同時存取兩個記憶體位址的問題。
+
+
+這是一份針對《Writing a C Compiler》第三章（第 87-108 頁）「二元運算子 (Binary Operators)」的詳細重點整理。我將其格式化為適合 HackMD/Markdown 閱讀的文章結構。
+
+---
+
+# 第三章 二元運算子與優先級爬升
+
+##  概述 (Overview)
+將為編譯器增加五種基礎的二元運算子支持：
+- **算術運算**：加法 (`+`)、減法 (`-`)、乘法 (`*`)、除法 (`/`)、取餘數 (`%`)。
+- **核心技術引進**：**優先級爬升算法 (Precedence Climbing)**。這是解析表達式最有效的方法之一，能解決遞迴下降算法在處理二元運算時遇到的「左遞迴」與「歧義性」問題。
+
+---
+
+##  詞法分析 (The Lexer)
+需要新增四個 Token 類型：
+1. `+` (加法)
+2. `*` (乘法)
+3. `/` (除法)
+4. `%` (取餘數)
+
+*注意：`-` 符號在第二章已添加。Lexer 階段不需要區分它是「一元負號」還是「二元減號」，這部分交由 Parser 處理。*
+
+---
+
+##  語法分析 (The Parser)
+
+### 3.1 抽象語法樹 (AST) 的更新
+表達式 (`exp`) 現在新增了一個 `Binary` 節點：
+```rust
+exp = Constant(int)
+    | Unary(unary_operator, exp)
+    | Binary(binary_operator, exp, exp) // 新增
+
+binary_operator = Add | Subtract | Multiply | Divide | Remainder
+```
+
+###  遞迴下降法的困境
+如果直接使用標準的 EBNF 語法（例如：`<exp> ::= <exp> <binop> <exp>`）：
+1.  **左遞迴 (Left Recursion)**：解析器會陷入無限循環。
+2.  **歧義性 (Ambiguity)**：無法確定 `1 + 2 * 3` 應該解析成 `(1 + 2) * 3` 還是 `1 + (2 * 3)`。
+
+###  解決方案：優先級爬升 (Precedence Climbing)
+這是本章的精華。每個運算子被賦予一個數值優先級：
+- `*`, `/`, `%`：優先級 **50**
+- `+`, `-`：優先級 **45**
+
+**算法核心偽代碼：**
+```python
+parse_exp(tokens, min_prec):
+    left = parse_factor(tokens) # 解析數字、一元運算或括號
+    while next_token 是二元運算子且其優先級 >= min_prec:
+        op = next_token
+        # 如果是左結合，下一個遞迴的 min_prec = 當前優先級 + 1
+        right = parse_exp(tokens, op.precedence + 1)
+        left = Binary(op, left, right)
+    return left
+```
+
+###  語法規則重構
+為了配合算法，語法被拆分為：
+- `<exp>`：處理二元運算。
+- `<factor>`：處理最高優先級的項目（整數常數、一元運算子、括號表達式）。
+
+---
+
+##  TACKY 中介碼生成 (TACKY Generation)
+TACKY 指令集更新，以支持二元運算：
+- `Binary(binary_operator, val src1, val src2, val dst)`
+
+**運算順序 (Evaluation Order)**：
+根據 C 語言標準，二元運算子的操作數計算順序通常是**未定義的 (Unsequenced)**。在實作中，我們統一先計算左側，再計算右側。
+
+---
+
+##  組合語言生成 (Assembly Generation)
+
+###  x64 算術指令
+| 指令 | 用途 | 限制 / 備註 |
+| --- | --- | --- |
+| `addl src, dst` | `dst += src` | 不能同時兩個操作數都在內存 |
+| `subl src, dst` | `dst -= src` | 注意順序：`subl a, b` 是 `b = b - a` |
+| `imull src, dst` | `dst *= src` | **目標 (dst) 必須是寄存器**，不能是內存 |
+| `idivl src` | 有符號除法 | 詳見下述 |
+
+###  處理除法與取餘數 (`idivl`)
+這是 x64 最機車的指令之一，需要特殊設置：
+1.  **被除數準備**：必須佔用 64 位，由 `EDX:EAX` 聯合組成。
+2.  **符號擴展 (Sign Extension)**：使用 `cdq` 指令將 `EAX` 的符號位擴展到 `EDX`。
+3.  **執行指令**：`idivl <divisor>`。
+4.  **結果獲取**：
+    *   商 (Quotient) 存放在 `EAX`。
+    *   餘數 (Remainder) 存放在 `EDX`。
+
+---
+
+##  指令修復與程式碼發射 (Fix-up & Emission)
+
+###  無效指令修復 (Instruction Fix-up)
+由於 x64 的硬體限制，我們必須在輸出組合語言前修正無效指令：
+- **`addl` / `subl`**：如果源和目標都在內存，需先搬移至臨時寄存器 `R10D`。
+- **`imull`**：如果目標在內存，必須先搬移至寄存器 `R11D` 計算，再搬回內存。
+- **`idivl`**：操作數不能是立即值 (Immediate)。如果遇到 `idivl $3`，必須先搬到寄存器。
+
+###  程式碼發射 (Code Emission)
+更新後的發射格式：
+- `movl <src>, <dst>`
+- `addl <src>, <dst>`
+- `subl <src>, <dst>`
+- `imull <src>, <dst>`
+- `cdq` (無操作數)
+- `idivl <src>`
+
+---
+
+##  補充資源 (Additional Resources)
+
+### 連結器 (Linkers)
+- [Beginner’s Guide to Linkers](https://www.lurklurk.org/linkers/linkers.html) - David Drysdale
+- [Ian Lance Taylor 的 20 篇連結器專題文章](https://www.airs.com/blog/archives/38)
+- [Position Independent Code (PIC) in Shared Libraries](https://eli.thegreenplace.net/2011/11/03/position-independent-code-pic-in-shared-libraries) - Eli Bendersky (包含 x86 與 x64 版本)
+
+### 抽象語法樹 (AST) 實作
+- [Abstract Syntax Tree Implementation Idioms](https://hillside.net/plop/plop2003/Papers/Jones-ImplementingASTs.pdf) - Joel Jones
+- [The Zephyr Abstract Syntax Description Language (ASDL)](https://www.cs.princeton.edu/~appel/papers/asdl97.pdf) - ASDL 原始論文
+
+### 表達式解析與優先級爬升
+- [Parsing Expressions by Precedence Climbing](https://eli.thegreenplace.net/2012/08/02/parsing-expressions-by-precedence-climbing) - Eli Bendersky (本書算法的主要參考)
+- [Some Problems of Recursive Descent Parsers](https://eli.thegreenplace.net/2009/03/14/some-problems-of-recursive-descent-parsers) - Eli Bendersky
+- [Pratt Parsing and Precedence Climbing Are the Same Algorithm](https://www.oilshell.org/blog/2016/11/01.html) - Andy Chu
+- [Precedence Climbing Is Widely Used](https://www.oilshell.org/blog/2017/03/30.html) - Andy Chu
