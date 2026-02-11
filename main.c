@@ -131,7 +131,10 @@ typedef enum {
     AS_NEG,
     AS_NOT,
     AS_RET,
-    AS_ALLOCATE_STACK
+    AS_ALLOCATE_STACK,
+    AS_BINARY, //for add,sub,mult
+    AS_IDIV, //div and get remainder
+    AS_CDQ //sign extend EAX to EDX
 } AsmInstType;
 
 
@@ -145,7 +148,9 @@ typedef enum {
 
 typedef enum{
     REG_EAX,
-    REG_R10D
+    REG_R10D, //for mem to mem source fix
+    REG_EDX, //for idiv
+    REG_R11D //for imul fix
 } AsmReg;
 
 typedef struct {
@@ -160,6 +165,7 @@ typedef struct {
 
 typedef struct AsmInst {
     AsmInstType type;
+    BinaryOpType binary_op;
     AsmOperand src;
     AsmOperand dst;
     struct AsmInst *next;
@@ -527,9 +533,10 @@ AsmOperand convert_tacky_val(TackyVal *v){
     return as_pseudo(v->var_name);
 }
 
-void append_asm(AsmInst **head,AsmInstType type,AsmOperand src,AsmOperand dst){
+void append_asm(AsmInst **head,AsmInstType type,BinaryOpType op,AsmOperand src,AsmOperand dst){
     AsmInst *new_inst=malloc(sizeof(AsmInst));
     new_inst->type=type;
+    new_inst->binary_op=op;
     new_inst->src=src;
     new_inst->dst=dst;
     new_inst->next=NULL;
@@ -554,13 +561,33 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
     TackyInstruction *curr=tacky->instructions;
     while (curr!=NULL){
         if (curr->type==TACKY_INST_RETURN){
-            append_asm(&asmp->fn->instructions,AS_MOV,convert_tacky_val(curr->src),as_reg(REG_EAX));
-            append_asm(&asmp->fn->instructions,AS_RET,(AsmOperand){0},(AsmOperand){0});
+            append_asm(&asmp->fn->instructions,AS_MOV,0,convert_tacky_val(curr->src),as_reg(REG_EAX));
+            append_asm(&asmp->fn->instructions,AS_RET,0,(AsmOperand){0},(AsmOperand){0});
         }
         else if (curr->type==TACKY_INST_UNARY){
-            append_asm(&asmp->fn->instructions,AS_MOV,convert_tacky_val(curr->src),convert_tacky_val(curr->dst));
+            append_asm(&asmp->fn->instructions,AS_MOV,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst));
             AsmInstType type=(curr->unary_op==UNARY_NEGATION)?AS_NEG:AS_NOT;
-            append_asm(&asmp->fn->instructions,type,(AsmOperand){0},convert_tacky_val(curr->dst));
+            append_asm(&asmp->fn->instructions,type,0,(AsmOperand){0},convert_tacky_val(curr->dst));
+        }
+        else if (curr->type==TACKY_INST_BINARY){
+            if (curr->binary_op==BINARY_DIV || curr->binary_op==BINARY_REM) {
+                //1. move src1,eax
+                //2. cdq
+                //3. idiv src2
+                //4. mov eax/edx ,dst
+                append_asm(&asmp->fn->instructions,AS_MOV,0,convert_tacky_val(curr->src),as_reg(REG_EAX));
+                append_asm(&asmp->fn->instructions,AS_CDQ,0,(AsmOperand){0},(AsmOperand){0});
+                append_asm(&asmp->fn->instructions,AS_IDIV,0,convert_tacky_val(curr->src2),(AsmOperand){0});
+
+                AsmReg res_reg=(curr->binary_op==BINARY_DIV) ? REG_EAX: REG_EDX;
+                append_asm(&asmp->fn->instructions,AS_MOV,0,as_reg(res_reg),convert_tacky_val(curr->dst));
+            }else{
+                // op: add , sub , mult
+                // mov src1 ,dst
+                // op src2, dst
+                append_asm(&asmp->fn->instructions,AS_MOV,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst));
+                append_asm(&asmp->fn->instructions,AS_BINARY,curr->binary_op,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst));
+            }
         }
         curr=curr->next;
     }
@@ -652,35 +679,40 @@ void fix_and_allocate(AsmProg *asmp){
             curr=new_mov;
             
         }
+        // idiv can't use immediate value 
+        else if (curr->type==AS_IDIV && curr->src.type==AS_IMM){
+            AsmInst *new_idiv=malloc(sizeof(AsmInst));
+            new_idiv->type=AS_IDIV;
+            new_idiv->src=as_reg(REG_R10D);
+            new_idiv->next=curr->next;
+            
+            curr->type=AS_MOV;
+            curr->dst=as_reg(REG_R10D);
+            curr->next=new_idiv;
+            curr=new_idiv;
+        }
+        else if (curr->type==AS_BINARY && curr->binary_op==BINARY_MULT && curr->dst.type==AS_STACK){
+            AsmInst *mov_back=malloc(sizeof(AsmInst));
+            mov_back->type=AS_MOV;
+            mov_back->src=as_reg(REG_R11D);
+            mov_back->dst=curr->dst;
+            mov_back->next=curr->next;
+
+            AsmInst *imul_op=malloc(sizeof(AsmInst));
+            imul_op->type=AS_BINARY;
+            imul_op->binary_op=BINARY_MULT;
+            imul_op->src=curr->src;
+            imul_op->dst=as_reg(REG_R11D);
+            imul_op->next=mov_back;
+
+            curr->type=AS_MOV;
+            curr->dst=as_reg(REG_R11D);
+            curr->next=imul_op;
+            curr=mov_back;
+        }
         curr=curr->next;
     }
 }
-
-
-// // code emission
-// void emit_asm(AsmProgram *asmp,FILE *out){
-//     #ifdef __APPLE__
-//         fprintf(out, ".globl _%s\n", asmp->fn->name);
-//         fprintf(out, "_%s:\n", asmp->fn->name);
-//     #else
-//         fprintf(out, ".globl %s\n", asmp->fn->name);
-//         fprintf(out, "%s:\n", asmp->fn->name);
-//     #endif
-
-//     for(int i=0;i<asmp->fn->inst_count;i++){
-//         AsmInstruction inst=asmp->fn->instructions[i];
-//         if (inst.type==ASM_MOV){
-//             fprintf(out, "    movl    $%d, %%eax\n", inst.imm);
-//         }else if (inst.type==ASM_RET){
-//             fprintf(out, "    ret\n");
-//         }
-//     }
-
-//     // Linux 安全堆棧標記
-//     #ifndef __APPLE__
-//         fprintf(out, ".section .note.GNU-stack,\"\",@progbits\n");
-//     #endif
-// }
 
 //Tacky generation
 TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
@@ -757,7 +789,8 @@ void emit_op(AsmOperand op,FILE *out){
         fprintf(out,"$%d",op.imm);
     }
     else if (op.type==AS_REG){
-        fprintf(out,"%s",op.reg==REG_EAX ? "%eax": "%r10d");
+        const char *reg_names[]={"%eax","%r10d","%edx","%r11d"};
+        fprintf(out,"%s",reg_names[op.reg]);
     }
     else if (op.type==AS_STACK){
         fprintf(out, "%d(%%rbp)", op.stack_offset);
@@ -792,6 +825,27 @@ void emit_asm_new(AsmProg * asmp,FILE *out){
                 fprintf(out, "    movq    %%rbp, %%rsp\n");
                 fprintf(out, "    popq    %%rbp\n");
                 fprintf(out, "    ret\n"); break;
+            case AS_BINARY:
+                {
+                    const char *ops[]={"addl","subl","imull"};
+                    fprintf(out, "    %s    ", ops[curr->binary_op]);
+                    emit_op(curr->src,out);
+                    fprintf(out,", ");
+                    emit_op(curr->dst,out);
+                    fprintf(out,"\n");
+
+                }
+                break;
+            
+            case AS_IDIV:
+                fprintf(out, "    idivl   ");
+                emit_op(curr->src, out); 
+                fprintf(out, "\n");
+                break;
+            
+            case AS_CDQ:
+                fprintf(out, "    cdq\n");
+                break;
         }
         curr = curr->next;
     }
