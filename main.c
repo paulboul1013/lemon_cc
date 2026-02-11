@@ -191,13 +191,16 @@ typedef struct {
 
 typedef enum {
     TACKY_INST_RETURN,
-    TACKY_INST_UNARY
+    TACKY_INST_UNARY,
+    TACKY_INST_BINARY
 } TackyInstType;
 
 typedef struct TackyInstruction{
     TackyInstType type;
     UnaryOpType unary_op;
+    BinaryOpType binary_op;
     TackyVal *src;
+    TackyVal *src2;
     TackyVal *dst;
     struct TackyInstruction *next;
 } TackyInstruction;
@@ -702,6 +705,28 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         append_tacky_inst(inst_list,inst);
         
         //return temporal variable，let outter layer function can use it
+        return dst;
+    }
+    else if (e->type==EXP_BINARY){
+        //deal with left side expression，get result position v1
+        TackyVal *v1=gen_tacky_exp(e->binary.left,inst_list);
+
+        TackyVal *v2=gen_tacky_exp(e->binary.right,inst_list);
+
+        //build temporal variable to save result
+        char *t_name=make_temporary();
+        TackyVal *dst=tacky_val_var(t_name);
+
+        //build and emit binary instruction
+        TackyInstruction *inst=malloc(sizeof(TackyInstruction));
+        inst->type=TACKY_INST_BINARY;
+        inst->binary_op=e->binary.op;
+        inst->src=v1;
+        inst->src2=v2;
+        inst->dst=dst;
+        inst->next=NULL;
+        append_tacky_inst(inst_list,inst);
+
         return dst;
     }
 
