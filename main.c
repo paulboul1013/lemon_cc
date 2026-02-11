@@ -662,21 +662,31 @@ void fix_and_allocate(AsmProg *asmp){
     curr=asmp->fn->instructions;
     while (curr){
         //x64 limit: mov instruction source and destination can't be memory address
-        if (curr->type==AS_MOV && curr->src.type==AS_STACK && curr->dst.type==AS_STACK){
-            //convert to 
-            //movl src,%r10d
-            //movl %r10d,dst
-            AsmInst *new_mov=malloc(sizeof(AsmInst));
-            new_mov->type=AS_MOV;
-            new_mov->src=as_reg(REG_R10D);
-            new_mov->dst=curr->dst;
-            new_mov->next=curr->next;
-
-            curr->dst=as_reg(REG_R10D);
-            curr->next=new_mov;
+        if ((curr->type == AS_MOV || (curr->type == AS_BINARY && curr->binary_op != BINARY_MULT)) 
+            && curr->src.type == AS_STACK && curr->dst.type == AS_STACK){
             
-            //skip this new mov instruction，avoid infinite loop
-            curr=new_mov;
+            //backup origin instruction type and operator
+            AsmInstType origin_type=curr->type;
+            BinaryOpType origin_op=curr->binary_op;
+
+            
+            //build second instruction: execute origin operation (like addl %r10d, -8(%rbp))
+            AsmInst *new_inst=malloc(sizeof(AsmInst));
+            new_inst->type=origin_type;
+            new_inst->binary_op=origin_op;
+            new_inst->src=as_reg(REG_R10D);
+            new_inst->dst=curr->dst;
+            new_inst->next=curr->next;
+
+
+            // revise first instruction : read source to register(movl -4(rbp) , %r10d)
+            curr->type=AS_MOV;
+            curr->binary_op=0;
+            curr->dst=as_reg(REG_R10D);
+            curr->next=new_inst;
+            
+            //skip this new  instruction，avoid infinite loop
+            curr=new_inst;
             
         }
         // idiv can't use immediate value 
