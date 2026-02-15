@@ -17,7 +17,18 @@ typedef  enum{
     TOK_PLUS, //+
     TOK_MULT, //*
     TOK_DIV, // /
-    TOK_REMAINDER //%
+    TOK_REMAINDER, //%
+
+    TOK_LOGICAL_NOT, //!
+    TOK_AND, // &&
+    TOK_OR, // ||
+    TOK_EQ, // ==
+    TOK_NEQ, // !=
+    TOK_LT, // <
+    TOK_GT, // >
+    TOK_LTE, // <=
+    TOK_GTE, // >=
+    TOK_ASSIGN // =
 }TokenType;
 
 typedef struct {
@@ -373,6 +384,58 @@ void lex(const char *input){
                     add_token(TOK_NEGATION,NULL);
                 }
                 break;
+            case '!':
+                if (*(p+1)=='='){
+                    add_token(TOK_NEQ,NULL);
+                    p++;
+                }else{
+                    add_token(TOK_LOGICAL_NOT,NULL);
+                }
+                break;
+            
+            case '=':
+                if (*(p+1)=='='){
+                    add_token(TOK_EQ,NULL);
+                    p++;
+                }else{
+                    add_token(TOK_ASSIGN,NULL);
+                }
+                break;
+            case '<':
+                if (*(p+1)=='='){
+                    add_token(TOK_LTE,NULL);
+                    p++;
+                }else{
+                    add_token(TOK_LT,NULL);
+                }
+                break;
+            case '>':
+                if (*(p+1)=='='){
+                    add_token(TOK_GTE,NULL);
+                    p++;
+                }else{
+                    add_token(TOK_GT,NULL);
+                }
+                break;
+            case '&':
+                if (*(p+1)=='&'){
+                    add_token(TOK_AND,NULL);
+                    p++;
+                }else{
+                    fprintf(stderr, "Lexer Error: Single '&' is not supported (need &&)\n");
+                    exit(1);
+                }
+                break;
+            case '|':
+                if (*(p+1)=='|'){
+                    add_token(TOK_OR,NULL);
+                    p++;
+                }else{
+                    fprintf(stderr, "Lexer Error: Single '|' is not supported (need ||)\n");
+                    exit(1);
+                }
+                break;
+
             default:
                 fprintf(stderr,"Lexer Error: Invalid character '%c'\n",*p);
                 exit(1);
