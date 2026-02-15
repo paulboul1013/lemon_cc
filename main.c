@@ -47,12 +47,21 @@ typedef enum {
     BINARY_SUB,
     BINARY_MULT,
     BINARY_DIV,
-    BINARY_REM
+    BINARY_REM,
+    BINARY_AND,
+    BINARY_OR,
+    BINARY_EQ,
+    BINARY_NEQ,
+    BINARY_LT,
+    BINARY_LTE,
+    BINARY_GT,
+    BINARY_GTE
 }BinaryOpType;
 
 typedef enum {
     UNARY_NEGATION, // -
     UNARY_COMPLEMENT, // ~
+    UNARY_NOT // !
 }UnaryOpType;
 
 typedef struct Exp {
@@ -120,6 +129,18 @@ int get_precedence(TokenType op){
         case TOK_PLUS:
         case TOK_NEGATION: //it's minus
             return 45;
+        case TOK_LT:
+        case TOK_LTE:
+        case TOK_GT:
+        case TOK_GTE:
+            return 35;
+        case TOK_EQ:
+        case TOK_NEQ:
+            return 30;
+        case TOK_AND:
+            return 10;
+        case TOK_OR:
+            return 5;
         default: //not binary operator
             return -1;
     }
@@ -132,6 +153,14 @@ BinaryOpType token_to_binary_op(TokenType type){
         case TOK_MULT: return BINARY_MULT;
         case TOK_DIV: return BINARY_DIV;
         case TOK_REMAINDER: return BINARY_REM;
+        case TOK_AND: return BINARY_AND;
+        case TOK_OR: return BINARY_OR;
+        case TOK_EQ: return BINARY_EQ;
+        case TOK_NEQ: return BINARY_NEQ;
+        case TOK_LT: return BINARY_LT;
+        case TOK_LTE: return BINARY_LTE;
+        case TOK_GT: return BINARY_GT;
+        case TOK_GTE: return BINARY_GTE;
         default: exit(1);
     }
 }
@@ -489,9 +518,19 @@ Exp *parse_factor(){
         take();
         return make_int_exp(atoi(t.value));
     }
-    else if (t.type==TOK_NEGATION || t.type==TOK_COMPLEMENT){
+    else if (t.type==TOK_NEGATION || t.type==TOK_COMPLEMENT || t.type==TOK_LOGICAL_NOT){
         take();
-        UnaryOpType op=(t.type==TOK_NEGATION) ? UNARY_NEGATION :UNARY_COMPLEMENT;
+        UnaryOpType op;
+        if (t.type==TOK_NEGATION) {
+            op=UNARY_NEGATION;
+        }
+        else if (t.type==TOK_COMPLEMENT) {
+            op=UNARY_COMPLEMENT;
+        }
+        else{
+            op=TOK_LOGICAL_NOT;
+        }
+
         Exp *inner=parse_factor(); //unary after factor
         return make_unary_exp(op,inner);
     }
