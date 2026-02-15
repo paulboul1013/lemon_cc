@@ -238,7 +238,12 @@ typedef struct {
 typedef enum {
     TACKY_INST_RETURN,
     TACKY_INST_UNARY,
-    TACKY_INST_BINARY
+    TACKY_INST_BINARY,
+    TACKY_INST_COPY,
+    TACKY_INST_JUMP,
+    TACKY_INST_JZ,
+    TACKY_INST_JNZ,
+    TACKY_INST_LABEL
 } TackyInstType;
 
 typedef struct TackyInstruction{
@@ -248,6 +253,7 @@ typedef struct TackyInstruction{
     TackyVal *src;
     TackyVal *src2;
     TackyVal *dst;
+    char *label_name;
     struct TackyInstruction *next;
 } TackyInstruction;
 
@@ -255,6 +261,14 @@ typedef struct {
     char *function_name;
     TackyInstruction *instructions;
 } TackyProgram;
+
+int label_counter=0;
+
+char *make_label(const char *prefix){
+    char *name=malloc(32);
+    sprintf(name,"%s.%d",prefix,label_counter++);
+    return name;
+}
 
 //temporal variable
 int temp_counter=0;
@@ -857,14 +871,128 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         return dst;
     }
     else if (e->type==EXP_BINARY){
+
+        //deal with && Short-circuiting  logic
+        if (e->binary.op==BINARY_AND){
+            char *false_label=make_label("and_false");
+            char *end_label=make_label("and_end");
+            TackyVal *dst=tacky_val_var(make_temporary());
+
+            // calculate left exp
+            TackyVal *v1=gen_tacky_exp(e->binary.left,inst_list);
+            // if v1  is zero， jump to false label
+            TackyInstruction *jz=calloc(1,sizeof(TackyInstruction));
+            jz->type=TACKY_INST_JZ;
+            jz->src=v1;
+            jz->label_name=strdup(false_label);
+            append_tacky_inst(inst_list,jz);
+
+            //calculate right exp
+            TackyVal *v2=gen_tacky_exp(e->binary.right,inst_list);
+            // if v2 is zero，jump fase label
+            TackyInstruction *jz2=calloc(1,sizeof(TackyInstruction));
+            jz2->type=TACKY_INST_JZ;
+            jz2->src=v2;
+            jz2->label_name=strdup(false_label);
+            append_tacky_inst(inst_list,jz2);
+
+            // if execute here，it's mean v1,v2 result is non-zero
+            TackyInstruction *cp1=calloc(1,sizeof(TackyInstruction));
+            cp1->type=TACKY_INST_COPY;
+            cp1->src=tacky_val_constant(1);
+            cp1->dst=dst;
+            append_tacky_inst(inst_list,cp1);
+            
+            TackyInstruction *jmp=calloc(1,sizeof(TackyInstruction));
+            jmp->type=TACKY_INST_JUMP;
+            jmp->label_name=strdup(end_label);
+            append_tacky_inst(inst_list,jmp);
+
+            // false label : result setting 0
+            TackyInstruction *l_false=calloc(1,sizeof(TackyInstruction));
+            l_false->type=TACKY_INST_LABEL;
+            l_false->label_name=strdup(false_label);
+            append_tacky_inst(inst_list,l_false);
+
+            TackyInstruction *cp0=calloc(1,sizeof(TackyInstruction));
+            cp0->type=TACKY_INST_COPY;
+            cp0->src=tacky_val_constant(0);
+            cp0->dst=dst;
+            append_tacky_inst(inst_list,cp0);
+
+            //end label
+            TackyInstruction *l_end=calloc(1,sizeof(TackyInstruction));
+            l_end->type=TACKY_INST_LABEL;
+            l_end->label_name=strdup(end_label);
+            append_tacky_inst(inst_list,l_end);
+
+            return dst;
+        }
+
+        // deal with ||  Short-circuiting  logic
+        if (e->binary.op==BINARY_OR){
+            char *true_label=make_label("or_true");
+            char *end_label=make_label("or_end");
+            TackyVal *dst=tacky_val_var(make_temporary());
+            
+            TackyVal *v1=gen_tacky_exp(e->binary.left,inst_list);
+            // if v1 not zero ，jump true label
+            TackyInstruction *jnz=calloc(1,sizeof(TackyInstruction));
+            jnz->type=TACKY_INST_JNZ;
+            jnz->src=v1;
+            jnz->label_name=strdup(true_label);
+            append_tacky_inst(inst_list,jnz);
+
+            TackyVal *v2=gen_tacky_exp(e->binary.right,inst_list);
+            // if v2 not zero ，jump true label
+            TackyInstruction *jnz2=calloc(1,sizeof(TackyInstruction));
+            jnz2->type=TACKY_INST_JNZ;
+            jnz2->src=v2;
+            jnz2->label_name=strdup(true_label);
+            append_tacky_inst(inst_list,jnz2);
+
+            // both result all 0
+            TackyInstruction *cp0=calloc(1,sizeof(TackyInstruction));
+            cp0->type=TACKY_INST_COPY;
+            cp0->src=tacky_val_constant(0);
+            cp0->dst=dst;
+            append_tacky_inst(inst_list,cp0);
+
+            TackyInstruction *jmp=calloc(1,sizeof(TackyInstruction));
+            jmp->type=TACKY_INST_JUMP;
+            jmp->label_name=strdup(end_label);
+            append_tacky_inst(inst_list,jmp);
+
+            //true label
+            TackyInstruction *l_true=calloc(1,sizeof(TackyInstruction));
+            l_true->type=TACKY_INST_LABEL;
+            l_true->label_name=strdup(true_label);
+            append_tacky_inst(inst_list,l_true);
+
+            TackyInstruction *cp1=calloc(1,sizeof(TackyInstruction));
+            cp1->type=TACKY_INST_COPY;
+            cp1->src=tacky_val_constant(1);
+            cp1->dst=dst;
+            append_tacky_inst(inst_list,cp1);
+
+            //end label
+            TackyInstruction *l_end=calloc(1,sizeof(TackyInstruction));
+            l_end->type=TACKY_INST_LABEL;
+            l_end->label_name=strdup(end_label);
+            append_tacky_inst(inst_list,l_end);
+
+            return dst;
+        }
+
+        //deal with normal binary or logic operator(EQ,NEQ,LT,GT,etc)
+
         //deal with left side expression，get result position v1
         TackyVal *v1=gen_tacky_exp(e->binary.left,inst_list);
 
         TackyVal *v2=gen_tacky_exp(e->binary.right,inst_list);
 
         //build temporal variable to save result
-        char *t_name=make_temporary();
-        TackyVal *dst=tacky_val_var(t_name);
+        TackyVal *dst=tacky_val_var(make_temporary());
 
         //build and emit binary instruction
         TackyInstruction *inst=malloc(sizeof(TackyInstruction));
