@@ -365,3 +365,118 @@ TACKY 指令集更新，以支持二元運算：
 - [Some Problems of Recursive Descent Parsers](https://eli.thegreenplace.net/2009/03/14/some-problems-of-recursive-descent-parsers) - Eli Bendersky
 - [Pratt Parsing and Precedence Climbing Are the Same Algorithm](https://www.oilshell.org/blog/2016/11/01.html) - Andy Chu
 - [Precedence Climbing Is Widely Used](https://www.oilshell.org/blog/2017/03/30.html) - Andy Chu
+
+# 第四章 邏輯與關係運算符 (Logical and Relational Operators)
+
+加入邏輯運算符（`!`, `&&`, `||`）與關係運算符（`<`, `>`, `<=`, `>=`, `==`, `!=`），並引入了編譯器設計中至關重要的概念：**短路邏輯 (Short-circuiting)**、**控制流 (Control Flow)** 以及 **彙編中的狀態標誌 (Flags)**。
+
+## 1. 語言特性與詞法分析 (Lexing)
+### 新增運算符
+*   **邏輯運算符**：`!` (NOT), `&&` (AND), `||` (OR)。
+*   **關係運算符**：`==`, `!=`, `<`, `>`, `<=`, `>=`。
+*   **結果**：所有運算在真時返回 `1`，假時返回 `0`。
+
+### 詞法分析細節
+*   Lexer 必須處理多字元 Token，且遵循 **「最長匹配原則」**。
+    *   例如：輸入 `<=` 應被解析為 `TOK_LTE`，而非 `<` 緊跟 `=`。
+*   `&&` 和 `||` 必須完整匹配，單個 `&` 或 `|` 在目前的 C 子集中應視為非法（除非後續實作位運算）。
+
+---
+
+## 2. 語法分析 (Parsing)
+### 算符優先級與結合性
+本章引入了多個優先級層級，由高到低排列如下：
+1.  **一元運算符**：`!`, `-`, `~` (右結合)
+2.  **關係運算符**：`<`, `<=`, `>`, `>=` (左結合)
+3.  **相等運算符**：`==`, `!=` (左結合)
+4.  **邏輯與**：`&&` (左結合)
+5.  **邏輯或**：`||` (左結合)
+
+### Precedence Climbing 的應用
+*   為了處理這些層級，`parse_exp(min_prec)` 函數需要根據上述層級設定對應的優先級數值（例如：`||` 為 5, `&&` 為 10...）。
+*   **括號處理**：括號會遞歸調用 `parse_exp(0)`，重置優先級計算。
+
+---
+
+## 3. TACKY 中間表示 (TACKY Generation)
+### 控制流指令
+為了支持 `&&` 和 `||` 的短路特性，TACKY 必須引入**標籤 (Labels)** 和 **跳轉 (Jumps)**：
+*   `Jump(identifier target)`：無條件跳轉。
+*   `JumpIfZero(val condition, identifier target)`：若條件為 0 則跳轉。
+*   `JumpIfNotZero(val condition, identifier target)`：若條件非 0 則跳轉。
+*   `Label(identifier)`：定義跳轉目標點。
+
+### 短路邏輯實作 (Short-circuiting)
+*   **`a && b`**：
+    1.  計算 `a`。
+    2.  `JumpIfZero(a, false_label)`。
+    3.  計算 `b`。
+    4.  `JumpIfZero(b, false_label)`。
+    5.  設置結果為 1，`Jump(end_label)`。
+    6.  `false_label`: 設置結果為 0。
+    7.  `end_label`: 結束。
+*   **標籤唯一性**：必須使用全局計數器生成唯一標籤（如 `and_false_1`）。
+
+---
+
+## 4. 彙編生成 (Assembly Generation)
+### 狀態標誌位 (RFLAGS)
+x64 指令如 `cmp` 或 `sub` 會更新 `RFLAGS` 暫存器中的標誌位：
+*   **ZF (Zero Flag)**：結果為 0 時設置。
+*   **SF (Sign Flag)**：結果為負時設置。
+*   **OF (Overflow Flag)**：發生有符號溢出時設置。
+
+### 比較指令 `cmp`
+*   `cmpl b, a`：計算 `a - b` 並更新標誌位，但不儲存結果。
+*   **重要限制**：
+    1.  不能同時讓兩個運算元都是記憶體地址。
+    2.  **第二個運算元不能是立即值**（Immediate）。
+
+### 條件設置指令 `setCC` 與跳轉 `jCC`
+根據標誌位狀態，使用對應的後綴：
+*   `e` (Equal): `ZF`
+*   `ne` (Not Equal): `!ZF`
+*   `l` (Less): `SF != OF`
+*   `le` (Less or Equal): `ZF | (SF != OF)`
+*   `g` (Greater): `!ZF & (SF == OF)`
+*   `ge` (Greater or Equal): `SF == OF`
+
+---
+
+## 5. 指令修正與代碼發射 (Fix-up & Emission)
+### 修正 `cmp` 指令
+*   若遇到 `cmpl mem, mem`，需搬移至 `R10`。
+*   若遇到 `cmpl val, imm`，需將立即值搬移至 `R11`。
+
+### 1 位元組寄存器處理
+`setCC` 指令（如 `sete`, `setl`）**只能操作 1 位元組的目標**。
+*   **正確做法**：
+    1.  `movl $0, %eax` (先清空整個暫存器)。
+    2.  `cmp ...`
+    3.  `setl %al` (只設置最低 8 位)。
+*   **寄存器別名對照表**：
+    *   `EAX` -> `%al`
+    *   `EDX` -> `%dl`
+    *   `R10` -> `%r10b`
+    *   `R11` -> `%r11b`
+
+### 局部標籤 (Local Labels)
+*   為了避免符號衝突並友善調試器：
+    *   **Linux**: 使用 `.L` 前綴（例如 `.L_false_0`）。
+    *   **macOS**: 使用 `L` 前綴。
+
+---
+
+## 6. 補充知識：未定義行為 (Undefined Behavior)
+*   **整數溢出**：C 語言中，有符號整數溢出是「未定義行為」。編譯器可能會假設溢出永遠不會發生而進行激進優化（例如刪除檢查代碼）。
+*   **短路副作用**：若 `&&` 的左側為假，右側的任何表達式（如函數調用、賦值）都不會執行，這在編譯時必須嚴格遵守。
+
+---
+
+## 7. 延伸閱讀資源 (Additional Resources)
+
+### 關於未定義行為 (Undefined Behavior)
+*   **John Regehr 的部落格**: [“A Guide to Undefined Behavior in C and C++, Part 1”](https://blog.regehr.org/archives/213)
+    *   這篇文章深入淺出地解釋了未定義行為在 C 標準中的含義，以及它對編譯器優化的影響。
+*   **Raph Levien 的部落格**: [“With Undefined Behavior, Anything Is Possible”](https://raphlinus.github.io/programming/rust/2018/08/17/undefined-behavior.html)
+    *   這篇文章探討了未定義行為的來源及其對軟體安全性與可靠性的衝擊，並解釋了
