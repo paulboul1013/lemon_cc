@@ -39,7 +39,9 @@ typedef struct {
 typedef enum {
     EXP_CONSTANT,
     EXP_UNARY,
-    EXP_BINARY
+    EXP_BINARY,
+    EXP_VAR,
+    EXP_ASSIGN
 }ExpType;
 
 typedef enum {
@@ -68,6 +70,7 @@ typedef struct Exp {
     ExpType type;
     union {
         int int_value; //for EXP_CONSTANT
+        char *var_name; //for EXP_VAR
         struct { //for EXP_UNARY
             UnaryOpType op;
             struct Exp *exp;
@@ -77,6 +80,10 @@ typedef struct Exp {
             struct Exp *left;
             struct Exp *right;
         }binary;
+        struct { //for EXP_ASSIGN
+            struct Exp *lvalue;
+            struct Exp *rvalue;
+        } assign;
     };
 } Exp;
 
@@ -86,8 +93,42 @@ int token_count=0;
 int token_pos=0;
 
 // c AST Node
-typedef struct {Exp *exp;} Statement;
-typedef struct {char *name; Statement *body; } Function;
+typedef enum {
+    STMT_RETURN,
+    STMT_EXPRESSION,
+    STMT_NULL,
+}StmtType;
+
+typedef struct {
+    StmtType type;
+    Exp *exp;
+} Statement;
+
+typedef struct {
+    char *name;
+    Exp *init; //optional
+} Declaration;
+
+typedef enum {
+    BI_STMT,
+    BI_DECL
+} BlockItemType;
+
+typedef struct {
+    BlockItemType type;
+    union {
+        Statement *stmt;
+        Declaration *decl;
+    };
+} BlockItem;
+
+typedef struct {
+    char *name; 
+    BlockItem **body; 
+    int body_count;
+} Function;
+
+
 typedef struct {Function *fn;} Program;
 
 //Exp helper function
@@ -117,6 +158,22 @@ Exp *make_binary_exp(BinaryOpType op,Exp *left,Exp *right){
     return e;
 }
 
+//var AST node
+Exp *make_var_exp(char *name){
+    Exp *e=malloc(sizeof(Exp));
+    e->type=EXP_VAR;
+    e->var_name=strdup(name);
+    return e;
+}
+
+Exp *make_assign_exp(Exp *left,Exp *right){
+    Exp *e=malloc(sizeof(Exp));
+    e->type=EXP_ASSIGN;
+    e->assign.lvalue=left;
+    e->assign.rvalue=right;
+    return e;
+}
+
 //precedence section
 
 //build precedence table
@@ -141,6 +198,8 @@ int get_precedence(TokenType op){
             return 10;
         case TOK_OR:
             return 5;
+        case TOK_ASSIGN:
+            return 1;
         default: //not binary operator
             return -1;
     }
@@ -521,15 +580,22 @@ Exp *parse_exp(int min_prec){
    Token next=peek();
 
    while (get_precedence(next.type)>=min_prec){
-        Token op_tok=take();
-        int prec=get_precedence(op_tok.type);
+        TokenType op_type=next.type;
+        int prec=get_precedence(op_type);
 
-        //because implement is left-associative, pass prec+1
-        Exp *right=parse_exp(prec+1);
+        if (op_type==TOK_ASSIGN){
+            //right-associative: a=b=c -> a=(b=c)
+            take();
+            Exp *right=parse_exp(prec);
+            left=make_assign_exp(left,right);
+        }else{
+            //left-associative, pass prec+1
+            take();
+            Exp *right=parse_exp(prec+1);
+            left=make_binary_exp(token_to_binary_op(op_type),left,right);
+        }
 
-        left=make_binary_exp(token_to_binary_op(op_tok.type),left,right);
         next=peek();
-
    }
 
    return left;
@@ -537,13 +603,17 @@ Exp *parse_exp(int min_prec){
 
 //deal with number and parentheses and unary operator
 //note:unary operator make sure higher precedence than binary operator
-//<factor> ::= <int> | <unop> <factor> | "(" <exp> ")"
+//<factor> ::= <int> | <unop> <factor> | "(" <exp> ")" | <identifier>
 Exp *parse_factor(){
     Token t=peek();
     
     if (t.type==TOK_CONSTANT){
         take();
         return make_int_exp(atoi(t.value));
+    }
+    else if (t.type==TOK_IDENTIFIER){
+        take();
+        return make_var_exp(t.value);
     }
     else if (t.type==TOK_NEGATION || t.type==TOK_COMPLEMENT || t.type==TOK_LOGICAL_NOT){
         take();
@@ -574,27 +644,78 @@ Exp *parse_factor(){
     
 }
 
-// <statement> ::= "return" <exp> ";"
+// <statement> ::= "return" <exp> ";" | <exp> ";" | ";"
 Statement *parse_statement() {
-    expect(TOK_RETURN);
     Statement *s=malloc(sizeof(Statement));
-    s->exp=parse_exp(0);
-    expect(TOK_SEMICOLON);
+    if (peek().type==TOK_RETURN){
+        take();
+        s->type=STMT_RETURN;
+        s->exp=parse_exp(0);
+        expect(TOK_SEMICOLON);
+    }else if (peek().type==TOK_SEMICOLON){
+        take();
+        s->type=STMT_NULL;
+        s->exp=NULL;
+    }else{
+        s->type=STMT_EXPRESSION;
+        s->exp=parse_exp(0);
+        expect(TOK_SEMICOLON);
+    }
     return s;
 }
 
-// <function> ::= "int" <identifier> "(" "void" ")" "{" <statement> "}"
+//<declaration> ::= "int" <identifier> [ "=" <exp> ] ";"
+Declaration *parse_declaration(){
+    expect(TOK_INT);
+    Token id=take(); //get variable name
+
+    if (id.type!=TOK_IDENTIFIER){
+        fprintf(stderr, "Parse Error: Expected identifier as variable name, but got token type %d\n", id.type);
+        exit(1); // 必須退出，這樣測試腳本才能捕捉到失敗
+    }
+
+    Declaration *d=malloc(sizeof(Declaration));
+    d->name=strdup(id.value);
+
+    if (peek().type==TOK_ASSIGN){
+        take();
+        d->init=parse_exp(0);
+    }else{
+        d->init=NULL;
+    }
+    expect(TOK_SEMICOLON);
+    return d;
+}
+
+// <function> ::= "int" <identifier> "(" "void" ")" "{" { <block_item> } "}" 
 Function *parse_function() {
     expect(TOK_INT);
     Token id=take();
-    if (id.type!=TOK_IDENTIFIER) exit(1);
+    if (id.type!=TOK_IDENTIFIER) {
+        fprintf(stderr, "Parse Error: Expected function name\n");
+        exit(1); 
+    }
     expect(TOK_LPAREN);
     expect(TOK_VOID);
     expect(TOK_RPAREN);
     expect(TOK_LBRACE);
     Function *f=malloc(sizeof(Function));
     f->name=strdup(id.value);
-    f->body=parse_statement();
+    f->body=malloc(sizeof(BlockItem*)*100);
+    f->body_count=0;
+
+    while(peek().type!=TOK_RBRACE){
+        BlockItem *bi=malloc(sizeof(BlockItem));
+        if (peek().type==TOK_INT){
+            bi->type=BI_DECL;
+            bi->decl=parse_declaration();
+        }else{
+            bi->type=BI_STMT;
+            bi->stmt=parse_statement();
+        }
+        f->body[f->body_count++]=bi;
+    }
+    
     expect(TOK_RBRACE);
     return f;
 }
@@ -1124,20 +1245,53 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     return NULL;
 }
 
+//let Statement turn to TACKY
+void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
+    if (stmt->type==STMT_RETURN){
+        TackyVal *val=gen_tacky_exp(stmt->exp,inst_list);
+        TackyInstruction *ret=calloc(1,sizeof(TackyInstruction));
+        ret->type=TACKY_INST_RETURN;
+        ret->src=val;
+        append_tacky_inst(inst_list,ret);
+    }else if (stmt->type==STMT_EXPRESSION){
+        if (stmt->exp){
+            gen_tacky_exp(stmt->exp,inst_list);
+        } 
+    }
+}
+
+// let Declaration turn to TACKY (only have init value need to generate)
+void gen_tacky_decl(Declaration *decl,TackyInstruction **inst_list){
+    if (decl->init){
+        TackyVal *src=gen_tacky_exp(decl->init,inst_list);
+        TackyInstruction *copy=calloc(1,sizeof(TackyInstruction));
+        copy->type=TACKY_INST_COPY;
+        copy->src=src;
+        copy->dst=tacky_val_var(decl->name); // let init value copy to variable name
+        append_tacky_inst(inst_list,copy);
+    }
+}
+
 TackyProgram *generate_tacky(Program *prog){
     TackyProgram *t_prog=malloc(sizeof(TackyProgram));
     t_prog->function_name=strdup(prog->fn->name);
     t_prog->instructions=NULL;
 
-    //deal with return sentence expression
-    TackyVal *final_val=gen_tacky_exp(prog->fn->body->exp,&t_prog->instructions);
+    //travseral all BlockItem
+    for(int i=0;i<prog->fn->body_count;i++){
+        BlockItem *bi=prog->fn->body[i];
+        if (bi->type==BI_STMT){
+            gen_tacky_statement(bi->stmt,&t_prog->instructions);
+        }else {
+            gen_tacky_decl(bi->decl,&t_prog->instructions);
+        }
+    }
 
-    //emit RETURN instruction
-    TackyInstruction *ret_inst=malloc(sizeof(TackyInstruction));
-    ret_inst->type=TACKY_INST_RETURN;
-    ret_inst->src=final_val;
-    ret_inst->next=NULL;
-    append_tacky_inst(&t_prog->instructions,ret_inst);
+    //if functio have no return，add return 0
+    TackyInstruction *final_inst=calloc(1,sizeof(TackyInstruction));
+    final_inst->type=TACKY_INST_RETURN;
+    final_inst->src=tacky_val_constant(0);
+    append_tacky_inst(&t_prog->instructions,final_inst);
 
     return t_prog;
     
