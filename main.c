@@ -810,10 +810,14 @@ void resolve_declaration(Declaration *decl,IdentifierMap **map){
     decl->name=strdup(unique);
 }
 
-void resolve_statment(Statement *stmt,IdentifierMap *map){
-    if (stmt->type!=STMT_NULL){
-        resolve_expression(stmt->exp,map);
+void resolve_statement(Statement *stmt,IdentifierMap *map){
+    if (stmt->type==STMT_RETURN || stmt->type==STMT_EXPRESSION){
+        if (stmt->exp){
+            resolve_expression(stmt->exp,map);
+        }
     }
+
+    //don't need deal with STMT_NULL
 }
 
 void resolve_program(Program *prog){
@@ -824,7 +828,7 @@ void resolve_program(Program *prog){
         if (bi->type==BI_DECL){
             resolve_declaration(bi->decl,&map);
         }else{
-            resolve_statment(bi->stmt,map);
+            resolve_statement(bi->stmt,map);
         }
     }
 
@@ -1188,6 +1192,24 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     if (e->type==EXP_CONSTANT){
         return tacky_val_constant(e->int_value);
     }
+    else if (e->type==EXP_VAR){
+        return tacky_val_var(e->var_name);
+    }
+    else if (e->type==EXP_ASSIGN){
+        //calculate right side value
+        TackyVal *rhs_val=gen_tacky_exp(e->assign.rvalue,inst_list);
+        //left side must be variable (already pass semantic anaylsis)
+        TackyVal *lhs_val=tacky_val_var(e->assign.lvalue->var_name);
+
+        TackyInstruction *inst=calloc(1,sizeof(TackyInstruction));
+        inst->type=TACKY_INST_COPY;
+        inst->src=rhs_val;
+        inst->dst=lhs_val;
+        inst->next=NULL;
+        append_tacky_inst(inst_list,inst);
+        
+        return lhs_val;
+    }
     else if (e->type==EXP_UNARY){
         //deal with inner expression first,get sorce operator
         TackyVal *src=gen_tacky_exp(e->unary.exp,inst_list);
@@ -1533,7 +1555,7 @@ char *read_file(const char *filename){
 
 int main(int argc,char *argv[]){
     char *input_path=NULL;
-    int stage=5;
+    int stage=6;
     int s_flag=0;
 
     for(int i=1;i<argc;i++){
@@ -1592,7 +1614,7 @@ int main(int argc,char *argv[]){
 
     //semantic analysis
     resolve_program(prog);
-    if (stage==3){
+    if (stage==3){ //--validate
         return 0;
     }
 
