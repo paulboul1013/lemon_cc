@@ -728,6 +728,109 @@ Program *parse_program() {
     return prog;
 }
 
+//Semantic analysis
+
+typedef struct IdentifierMap{
+    char *user_name;
+    char *unique_name;
+    struct IdentifierMap *next;
+} IdentifierMap;
+
+//find vairable in  the mapping table 
+char *map_get(IdentifierMap *map,const char *name){
+    while(map){
+        if (strcmp(map->user_name,name)==0){
+            return map->unique_name;
+        }
+        map=map->next;
+    }
+    return NULL;
+}
+
+void resolve_expression(Exp *e,IdentifierMap *map){
+    if (!e) return;
+    switch (e->type){
+        case EXP_CONSTANT:
+            break;
+        case EXP_VAR: {
+            char *unique=map_get(map,e->var_name);
+            if (!unique) {
+                fprintf(stderr, "Semantic Error: Undeclared variable '%s'\n", e->var_name);
+                exit(1);
+            }
+            free(e->var_name);
+            e->var_name=strdup(unique);
+            break;
+        }
+
+        case EXP_ASSIGN:
+            //lvalue check
+            if (e->assign.lvalue->type!=EXP_VAR){
+                fprintf(stderr, "Semantic Error: Invalid lvalue in assignment\n");
+                exit(1);
+            }
+            resolve_expression(e->assign.lvalue,map);
+            resolve_expression(e->assign.rvalue,map);
+            break;
+        
+        case EXP_UNARY:
+            resolve_expression(e->unary.exp,map);
+            break;
+        
+        case EXP_BINARY:
+            resolve_expression(e->binary.left,map);
+            resolve_expression(e->binary.right,map);
+            break;
+    }
+}
+
+void resolve_declaration(Declaration *decl,IdentifierMap **map){
+    //check current scope exist repeat declare
+    if (map_get(*map,decl->name)){
+        fprintf(stderr, "Semantic Error: Duplicate declaration of variable '%s'\n", decl->name);
+        exit(1);
+    }
+
+
+    char *unique=make_temporary(); // make only name
+
+    //let new mapping adding link list
+    IdentifierMap *new_entry=malloc(sizeof(IdentifierMap));
+    new_entry->user_name=strdup(decl->name);
+    new_entry->unique_name=strdup(unique);
+    new_entry->next=*map;
+    *map=new_entry;
+
+    if (decl->init){
+        resolve_expression(decl->init,*map);
+    }
+
+    //make AST node name to unique name
+    free(decl->name);
+    decl->name=strdup(unique);
+}
+
+void resolve_statment(Statement *stmt,IdentifierMap *map){
+    if (stmt->type!=STMT_NULL){
+        resolve_expression(stmt->exp,map);
+    }
+}
+
+void resolve_program(Program *prog){
+    IdentifierMap *map=NULL;
+
+    for(int i=0;i<prog->fn->body_count;i++){
+        BlockItem *bi=prog->fn->body[i];
+        if (bi->type==BI_DECL){
+            resolve_declaration(bi->decl,&map);
+        }else{
+            resolve_statment(bi->stmt,map);
+        }
+    }
+
+    
+}
+
 // //assemble generation
 // AsmProgram *generate_asm(Program *prog){
 //     AsmProgram *asm_prog=malloc(sizeof(AsmProgram));
@@ -1442,12 +1545,16 @@ int main(int argc,char *argv[]){
             stage=2;
             continue;
         }
-        else if (strcmp(argv[i],"--codegen")==0){
-            stage=3;
+        else if (strcmp(argv[i], "--validate") == 0) {
+            stage = 3;
             continue;
         }
         else if (strcmp(argv[i],"--tacky")==0){
             stage=4;
+            continue;
+        }
+        else if (strcmp(argv[i],"--codegen")==0){
+            stage=5;
             continue;
         }
         else if (strcmp(argv[i],"-S")==0){
@@ -1483,6 +1590,12 @@ int main(int argc,char *argv[]){
         return 0;
     }
 
+    //semantic analysis
+    resolve_program(prog);
+    if (stage==3){
+        return 0;
+    }
+
     //TACKY Generation
     TackyProgram *tacky_prog=generate_tacky(prog);
     if (stage==4){
@@ -1492,6 +1605,9 @@ int main(int argc,char *argv[]){
     //codegen
     AsmProg *asmp=tacky_to_asm(tacky_prog);
     fix_and_allocate(asmp);
+    if (stage==5){
+        return 0;
+    }
 
 
     //emit Asm to .s file
