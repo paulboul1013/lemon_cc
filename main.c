@@ -28,7 +28,26 @@ typedef  enum{
     TOK_GT, // >
     TOK_LTE, // <=
     TOK_GTE, // >=
-    TOK_ASSIGN // =
+    TOK_ASSIGN, // =
+
+    TOK_INCREMENT, // ++
+    TOK_XOR,// ^
+
+    TOK_PLUS_ASSIGN, // +=
+    TOK_MINUS_ASSIGN, // -=
+    TOK_MULT_ASSIGN, // *=
+    TOK_DIV_ASSIGN, // /=
+    TOK_REM_ASSIGN, // %=
+    TOK_AND_ASSIGN, // &=
+    TOK_OR_ASSIGN, // |=
+    
+    TOK_XOR_ASSIGN, // ^=
+
+    TOK_LSHIFT, // <<
+    TOK_RSHIFT, // >>
+    TOK_LSHIFT_ASSIGN, // <<=
+    TOK_RSHIFT_ASSIGN, // >>=
+
 }TokenType;
 
 typedef struct {
@@ -41,7 +60,10 @@ typedef enum {
     EXP_UNARY,
     EXP_BINARY,
     EXP_VAR,
-    EXP_ASSIGN
+    EXP_ASSIGN,
+    EXP_COMPOUND_ASSIGN, // += -= *= /= %=
+    EXP_PREFIX_OP, //++a,--a
+    EXP_POSTFIX_OP, //a++,a--
 }ExpType;
 
 typedef enum {
@@ -57,7 +79,10 @@ typedef enum {
     BINARY_LT,
     BINARY_LTE,
     BINARY_GT,
-    BINARY_GTE
+    BINARY_GTE,
+    BINARY_XOR,
+    BINARY_LSHIFT,
+    BINARY_RSHIFT
 }BinaryOpType;
 
 typedef enum {
@@ -75,15 +100,29 @@ typedef struct Exp {
             UnaryOpType op;
             struct Exp *exp;
         }unary;
+
         struct {
             BinaryOpType op;
             struct Exp *left;
             struct Exp *right;
         }binary;
+
         struct { //for EXP_ASSIGN
             struct Exp *lvalue;
             struct Exp *rvalue;
         } assign;
+
+        struct {
+            BinaryOpType op; //record += or -= ...
+            struct Exp *lvalue;
+            struct Exp *rvalue;
+        } compound;
+
+        struct {
+           struct Exp *lvalue; //use Exp node replace pure string
+           int is_increment; // 1 for ++ ,0 for --
+        } inc_dec;
+      
     };
 } Exp;
 
@@ -174,6 +213,23 @@ Exp *make_assign_exp(Exp *left,Exp *right){
     return e;
 }
 
+Exp *make_compound_assign_exp(BinaryOpType op,Exp *left,Exp *right){
+    Exp *e=malloc(sizeof(Exp));
+    e->type=EXP_COMPOUND_ASSIGN;
+    e->compound.op=op;
+    e->compound.lvalue=left;
+    e->compound.rvalue=right;
+    return e;
+}
+
+Exp *make_inc_dec_exp(ExpType type,int is_increment,Exp *lvalue){
+    Exp *e=malloc(sizeof(Exp));
+    e->type=type;
+    e->inc_dec.lvalue=lvalue;
+    e->inc_dec.is_increment=is_increment;
+    return e;
+}
+
 //precedence section
 
 //build precedence table
@@ -199,6 +255,16 @@ int get_precedence(TokenType op){
         case TOK_OR:
             return 5;
         case TOK_ASSIGN:
+        case TOK_PLUS_ASSIGN:
+        case TOK_MINUS_ASSIGN:
+        case TOK_MULT_ASSIGN:
+        case TOK_DIV_ASSIGN:
+        case TOK_REM_ASSIGN:
+        case TOK_AND_ASSIGN:
+        case TOK_OR_ASSIGN:
+        case TOK_XOR_ASSIGN:
+        case TOK_LSHIFT_ASSIGN:
+        case TOK_RSHIFT_ASSIGN:
             return 1;
         default: //not binary operator
             return -1;
@@ -220,6 +286,23 @@ BinaryOpType token_to_binary_op(TokenType type){
         case TOK_LTE: return BINARY_LTE;
         case TOK_GT: return BINARY_GT;
         case TOK_GTE: return BINARY_GTE;
+        default: exit(1);
+    }
+}
+
+
+BinaryOpType compound_token_to_binary_op(TokenType type){
+    switch (type){
+        case TOK_PLUS_ASSIGN: return BINARY_ADD;
+        case TOK_MINUS_ASSIGN: return BINARY_SUB;
+        case TOK_MULT_ASSIGN: return BINARY_MULT;
+        case TOK_DIV_ASSIGN: return BINARY_DIV;
+        case TOK_REM_ASSIGN: return BINARY_REM;
+        case TOK_AND_ASSIGN: return BINARY_AND;
+        case TOK_OR_ASSIGN: return BINARY_OR;
+        case TOK_XOR_ASSIGN: return BINARY_XOR;
+        case TOK_LSHIFT_ASSIGN: return BINARY_LSHIFT;
+        case TOK_RSHIFT_ASSIGN: return BINARY_RSHIFT;
         default: exit(1);
     }
 }
@@ -480,22 +563,31 @@ void lex(const char *input){
                 add_token(TOK_COMPLEMENT,NULL);
                 break;
             case '+':
-                add_token(TOK_PLUS,NULL);
+                if (*(p+1)=='+') {add_token(TOK_INCREMENT,NULL);p++;}
+                else if (*(p+1)=='=') {add_token(TOK_PLUS_ASSIGN,NULL),p++;}
+                else{add_token(TOK_PLUS,NULL);}
                 break;
             case '*':
-                add_token(TOK_MULT,NULL);
+                if (*(p+1)=='=') {add_token(TOK_MULT_ASSIGN,NULL),p++;}
+                else{add_token(TOK_MULT,NULL);}
                 break;
             case '/':
-                add_token(TOK_DIV,NULL);
+                if (*(p+1)=='=') {add_token(TOK_DIV_ASSIGN,NULL),p++;}
+                else{add_token(TOK_DIV,NULL);}
                 break;
             case '%':
-                add_token(TOK_REMAINDER,NULL);
+                if (*(p+1)=='=') {add_token(TOK_REM_ASSIGN,NULL),p++;}
+                else{add_token(TOK_REMAINDER,NULL);}
                 break;
             case '-':
                 if (*(p+1)=='-'){ //deal with --
                     add_token(TOK_DECREMENT,NULL);
                     p++;
-                }else{ //deal with -
+                }else if (*(p+1)=='='){
+                    add_token(TOK_MINUS_ASSIGN,NULL);
+                    p++;
+                }
+                else{ //deal with -
                     add_token(TOK_NEGATION,NULL);
                 }
                 break;
@@ -588,7 +680,12 @@ Exp *parse_exp(int min_prec){
             take();
             Exp *right=parse_exp(prec);
             left=make_assign_exp(left,right);
-        }else{
+        }else if (op_type>=TOK_PLUS_ASSIGN && op_type <=TOK_RSHIFT_ASSIGN){
+            take();
+            Exp *right=parse_exp(prec); //right-associative(like =)
+            left=make_compound_assign_exp(compound_token_to_binary_op(op_type),left,right);
+        }
+        else{
             //left-associative, pass prec+1
             take();
             Exp *right=parse_exp(prec+1);
@@ -611,9 +708,25 @@ Exp *parse_factor(){
         take();
         return make_int_exp(atoi(t.value));
     }
+    // prefix ++ / --
+    else if (t.type==TOK_INCREMENT || t.type==TOK_DECREMENT){
+        take();
+        int is_inc=(t.type==TOK_INCREMENT);
+        Exp *inner=parse_factor(); //right-associative
+        return make_inc_dec_exp(EXP_PREFIX_OP,is_inc,inner);
+    }
     else if (t.type==TOK_IDENTIFIER){
         take();
-        return make_var_exp(t.value);
+        Exp *exp=make_var_exp(t.value);
+
+        //postfix ++ / --
+        Token next=peek();
+        if (next.type==TOK_INCREMENT || next.type==TOK_DECREMENT){
+            take();
+            int is_inc=(next.type==TOK_INCREMENT);
+            return make_inc_dec_exp(EXP_POSTFIX_OP,is_inc,exp);
+        }
+        return exp;
     }
     else if (t.type==TOK_NEGATION || t.type==TOK_COMPLEMENT || t.type==TOK_LOGICAL_NOT){
         take();
@@ -751,6 +864,23 @@ void resolve_expression(Exp *e,IdentifierMap *map){
     if (!e) return;
     switch (e->type){
         case EXP_CONSTANT:
+            break;
+
+        case EXP_COMPOUND_ASSIGN:
+            if (e->compound.lvalue->type!=EXP_VAR){
+                fprintf(stderr, "Semantic Error: Invalid lvalue in compound assignment\n");
+                exit(1);
+            }
+            resolve_expression(e->compound.lvalue,map);
+            resolve_expression(e->compound.rvalue,map);
+            break;
+        case EXP_PREFIX_OP:
+        case EXP_POSTFIX_OP:
+            if (e->inc_dec.lvalue->type!=EXP_VAR){
+                fprintf(stderr, "Semantic Error: Invalid lvalue in increment/decrement\n");
+                exit(1);
+            }
+            resolve_expression(e->inc_dec.lvalue, map);
             break;
         case EXP_VAR: {
             char *unique=map_get(map,e->var_name);
@@ -1191,6 +1321,66 @@ void fix_and_allocate(AsmProg *asmp){
 TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     if (e->type==EXP_CONSTANT){
         return tacky_val_constant(e->int_value);
+    }
+    else if (e->type==EXP_COMPOUND_ASSIGN){
+        TackyVal *rhs_val=gen_tacky_exp(e->compound.rvalue,inst_list);
+        TackyVal *lhs_val=tacky_val_var(e->compound.lvalue->var_name);
+
+        //calculate a+b
+        TackyVal *tmp=tacky_val_var(make_temporary());
+        TackyInstruction *bin=calloc(1,sizeof(TackyInstruction));
+        bin->type=TACKY_INST_BINARY;
+        bin->binary_op=e->compound.op;
+        bin->src=lhs_val;
+        bin->src2=rhs_val;
+        bin->dst=tmp;
+        append_tacky_inst(inst_list,bin);
+
+        //store resultd into a
+        TackyInstruction *cp=calloc(1,sizeof(TackyInstruction));
+        cp->type=TACKY_INST_COPY;
+        cp->src=tmp;
+        cp->dst=lhs_val;
+        append_tacky_inst(inst_list,cp);
+        
+        return lhs_val;
+    }
+    //  ++ / --
+    else if (e->type==EXP_PREFIX_OP || e->type==EXP_POSTFIX_OP){
+        TackyVal *lhs_val=tacky_val_var(e->inc_dec.lvalue->var_name);
+        TackyVal *one_val=tacky_val_constant(1);
+        BinaryOpType op=e->inc_dec.is_increment ? BINARY_ADD :BINARY_SUB;
+
+        TackyVal *old_val=NULL;
+        
+        //if is a++ (postfix)，need to backup old value，because the expression want old value
+        if (e->type==EXP_POSTFIX_OP){
+            old_val=tacky_val_var(make_temporary());
+            TackyInstruction *save_old=calloc(1,sizeof(TackyInstruction));
+            save_old->type=TACKY_INST_COPY;
+            save_old->src=lhs_val;
+            save_old->dst=old_val;
+            append_tacky_inst(inst_list,save_old);
+        }
+
+        // calculate a+1 or a-1
+        TackyVal *tmp=tacky_val_var(make_temporary());
+        TackyInstruction *bin=calloc(1,sizeof(TackyInstruction));
+        bin->type=TACKY_INST_BINARY;
+        bin->binary_op=op;
+        bin->src=lhs_val;
+        bin->src2=one_val;
+        bin->dst=tmp;
+        append_tacky_inst(inst_list,bin);
+
+        //soter new value to a
+        TackyInstruction *cp=calloc(1,sizeof(TackyInstruction));
+        cp->type=TACKY_INST_COPY;
+        cp->src=tmp;
+        cp->dst=lhs_val;
+        append_tacky_inst(inst_list,cp);
+
+        return (e->type==EXP_POSTFIX_OP) ? old_val : tmp;
     }
     else if (e->type==EXP_VAR){
         return tacky_val_var(e->var_name);
