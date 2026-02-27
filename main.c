@@ -33,6 +33,12 @@ typedef  enum{
     TOK_INCREMENT, // ++
     TOK_XOR,// ^
 
+     TOK_BITWISE_AND, // &
+    TOK_BITWISE_OR,  // |
+
+    TOK_LSHIFT, // <<
+    TOK_RSHIFT, // >>
+
     TOK_PLUS_ASSIGN, // +=
     TOK_MINUS_ASSIGN, // -=
     TOK_MULT_ASSIGN, // *=
@@ -42,9 +48,6 @@ typedef  enum{
     TOK_OR_ASSIGN, // |=
     
     TOK_XOR_ASSIGN, // ^=
-
-    TOK_LSHIFT, // <<
-    TOK_RSHIFT, // >>
     TOK_LSHIFT_ASSIGN, // <<=
     TOK_RSHIFT_ASSIGN, // >>=
 
@@ -67,22 +70,12 @@ typedef enum {
 }ExpType;
 
 typedef enum {
-    BINARY_ADD,
-    BINARY_SUB,
-    BINARY_MULT,
-    BINARY_DIV,
-    BINARY_REM,
-    BINARY_AND,
-    BINARY_OR,
-    BINARY_EQ,
-    BINARY_NEQ,
-    BINARY_LT,
-    BINARY_LTE,
-    BINARY_GT,
-    BINARY_GTE,
-    BINARY_XOR,
-    BINARY_LSHIFT,
-    BINARY_RSHIFT
+    BINARY_ADD, BINARY_SUB, BINARY_MULT, BINARY_DIV, BINARY_REM,
+    BINARY_LSHIFT, BINARY_RSHIFT,
+    BINARY_BITWISE_AND, BINARY_BITWISE_OR, BINARY_BITWISE_XOR, // bit operation
+    BINARY_LOGICAL_AND, BINARY_LOGICAL_OR, // logical operation
+    BINARY_EQ, BINARY_NEQ, BINARY_LT, BINARY_LTE, BINARY_GT, BINARY_GTE,
+
 }BinaryOpType;
 
 typedef enum {
@@ -242,6 +235,9 @@ int get_precedence(TokenType op){
         case TOK_PLUS:
         case TOK_NEGATION: //it's minus
             return 45;
+        case TOK_LSHIFT:
+        case TOK_RSHIFT:
+            return 40;
         case TOK_LT:
         case TOK_LTE:
         case TOK_GT:
@@ -250,6 +246,12 @@ int get_precedence(TokenType op){
         case TOK_EQ:
         case TOK_NEQ:
             return 30;
+        case TOK_BITWISE_AND:
+            return 25;
+        case TOK_XOR:
+            return 20;
+        case TOK_BITWISE_OR:
+            return 15;
         case TOK_AND:
             return 10;
         case TOK_OR:
@@ -278,10 +280,22 @@ BinaryOpType token_to_binary_op(TokenType type){
         case TOK_MULT: return BINARY_MULT;
         case TOK_DIV: return BINARY_DIV;
         case TOK_REMAINDER: return BINARY_REM;
-        case TOK_AND: return BINARY_AND;
-        case TOK_OR: return BINARY_OR;
+
+
+        case TOK_AND: return BINARY_LOGICAL_AND;
+        case TOK_OR: return BINARY_LOGICAL_OR;
+
+        case TOK_XOR: return BINARY_BITWISE_XOR;
+        case TOK_BITWISE_AND: return BINARY_BITWISE_AND;
+        case TOK_BITWISE_OR: return BINARY_BITWISE_OR;
+
+        case TOK_LSHIFT: return BINARY_LSHIFT;
+        case TOK_RSHIFT: return BINARY_RSHIFT;
+
+
         case TOK_EQ: return BINARY_EQ;
         case TOK_NEQ: return BINARY_NEQ;
+
         case TOK_LT: return BINARY_LT;
         case TOK_LTE: return BINARY_LTE;
         case TOK_GT: return BINARY_GT;
@@ -298,9 +312,9 @@ BinaryOpType compound_token_to_binary_op(TokenType type){
         case TOK_MULT_ASSIGN: return BINARY_MULT;
         case TOK_DIV_ASSIGN: return BINARY_DIV;
         case TOK_REM_ASSIGN: return BINARY_REM;
-        case TOK_AND_ASSIGN: return BINARY_AND;
-        case TOK_OR_ASSIGN: return BINARY_OR;
-        case TOK_XOR_ASSIGN: return BINARY_XOR;
+        case TOK_AND_ASSIGN: return BINARY_BITWISE_AND;
+        case TOK_OR_ASSIGN: return BINARY_BITWISE_OR;
+        case TOK_XOR_ASSIGN: return BINARY_BITWISE_XOR;
         case TOK_LSHIFT_ASSIGN: return BINARY_LSHIFT;
         case TOK_RSHIFT_ASSIGN: return BINARY_RSHIFT;
         default: exit(1);
@@ -343,7 +357,8 @@ typedef enum{
     REG_EAX,
     REG_R10D, //for mem to mem source fix
     REG_EDX, //for idiv
-    REG_R11D //for imul fix
+    REG_R11D, //for imul fix
+    REG_ECX //for shl,sar
 } AsmReg;
 
 typedef struct {
@@ -609,7 +624,16 @@ void lex(const char *input){
                 }
                 break;
             case '<':
-                if (*(p+1)=='='){
+                if (*(p+1)=='<'){
+                    if (*(p+2)=='='){
+                        add_token(TOK_LSHIFT_ASSIGN,NULL);
+                        p+=2;
+                    }else{
+                        add_token(TOK_LSHIFT,NULL);
+                        p++;
+                    }
+                }
+                else if (*(p+1)=='='){
                     add_token(TOK_LTE,NULL);
                     p++;
                 }else{
@@ -617,7 +641,16 @@ void lex(const char *input){
                 }
                 break;
             case '>':
-                if (*(p+1)=='='){
+                if (*(p+1)=='>'){
+                    if (*(p+2)=='='){
+                        add_token(TOK_RSHIFT_ASSIGN,NULL);
+                        p+=2;
+                    }else{
+                        add_token(TOK_RSHIFT,NULL);
+                        p++;
+                    }
+                }
+                else if (*(p+1)=='='){
                     add_token(TOK_GTE,NULL);
                     p++;
                 }else{
@@ -628,18 +661,31 @@ void lex(const char *input){
                 if (*(p+1)=='&'){
                     add_token(TOK_AND,NULL);
                     p++;
+                }else if (*(p+1)=='='){
+                    add_token(TOK_AND_ASSIGN,NULL);
+                    p++;
                 }else{
-                    fprintf(stderr, "Lexer Error: Single '&' is not supported (need &&)\n");
-                    exit(1);
+                    add_token(TOK_BITWISE_AND,NULL);
                 }
                 break;
             case '|':
                 if (*(p+1)=='|'){
                     add_token(TOK_OR,NULL);
                     p++;
+                }else if (*(p+1)=='='){
+                    add_token(TOK_OR_ASSIGN,NULL);
+                    p++;
                 }else{
-                    fprintf(stderr, "Lexer Error: Single '|' is not supported (need ||)\n");
-                    exit(1);
+                    add_token(TOK_BITWISE_OR,NULL);
+                }
+                break;
+
+            case '^':
+                if (*(p+1)=='='){
+                    add_token(TOK_XOR_ASSIGN,NULL);
+                    p++;
+                }else{
+                    add_token(TOK_XOR,NULL);
                 }
                 break;
 
@@ -703,7 +749,8 @@ Exp *parse_exp(int min_prec){
 //<factor> ::= <int> | <unop> <factor> | "(" <exp> ")" | <identifier>
 Exp *parse_factor(){
     Token t=peek();
-    
+    Exp *inner = NULL;
+
     if (t.type==TOK_CONSTANT){
         take();
         return make_int_exp(atoi(t.value));
@@ -712,21 +759,12 @@ Exp *parse_factor(){
     else if (t.type==TOK_INCREMENT || t.type==TOK_DECREMENT){
         take();
         int is_inc=(t.type==TOK_INCREMENT);
-        Exp *inner=parse_factor(); //right-associative
-        return make_inc_dec_exp(EXP_PREFIX_OP,is_inc,inner);
+        Exp *operand=parse_factor(); //right-associative
+        return make_inc_dec_exp(EXP_PREFIX_OP,is_inc,operand);
     }
     else if (t.type==TOK_IDENTIFIER){
         take();
-        Exp *exp=make_var_exp(t.value);
-
-        //postfix ++ / --
-        Token next=peek();
-        if (next.type==TOK_INCREMENT || next.type==TOK_DECREMENT){
-            take();
-            int is_inc=(next.type==TOK_INCREMENT);
-            return make_inc_dec_exp(EXP_POSTFIX_OP,is_inc,exp);
-        }
-        return exp;
+        inner=make_var_exp(t.value);
     }
     else if (t.type==TOK_NEGATION || t.type==TOK_COMPLEMENT || t.type==TOK_LOGICAL_NOT){
         take();
@@ -746,15 +784,25 @@ Exp *parse_factor(){
     }
     else if (t.type==TOK_LPAREN){
         take();
-        Exp *inner=parse_exp(0); // PAREN inter predence reset to 0
+        inner =parse_exp(0); // PAREN inter predence reset to 0
         expect(TOK_RPAREN);
-        return inner;
+        
     }else{
         fprintf(stderr, "Parse Error: Expected factor but got %d\n", t.type);
         exit(1);
     }
 
-    
+    //handle postfix ++/--
+    // now  IDENTIFIER and LPAREN can continue parse ++ or --
+    Token next=peek();
+    while (next.type==TOK_INCREMENT || next.type==TOK_DECREMENT){
+        take();
+        int is_inc=(next.type==TOK_INCREMENT);
+        inner = make_inc_dec_exp(EXP_POSTFIX_OP, is_inc, inner);
+        next=peek();
+    }
+
+    return inner;
 }
 
 // <statement> ::= "return" <exp> ";" | <exp> ";" | ";"
@@ -1124,6 +1172,23 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
                     AsmReg res_reg=(curr->binary_op==BINARY_DIV) ? REG_EAX: REG_EDX;
                     append_asm(head,AS_MOV,0,0,as_reg(res_reg),convert_tacky_val(curr->dst),NULL);
                 }
+                // deal with shift (<<,>>)
+                //x86 rule: shift offset must in the %cl(it's mean in the %ecx)
+                else if (curr->binary_op==BINARY_LSHIFT || curr->binary_op==BINARY_RSHIFT){
+                    
+                    if (curr->src2->type==TACKY_VAL_CONSTANT){//if offset is constant
+                        append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+                        append_asm(head, AS_BINARY, curr->binary_op, 0, convert_tacky_val(curr->src2), convert_tacky_val(curr->dst), NULL);
+                    }else{//if offset is variable
+                        // mov scr2 to ecx
+                        append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src2),as_reg(REG_ECX),NULL);
+                        // mov src1 to dst
+                        append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+                        //execute shift ，src use REG_ECX marked
+                        append_asm(head,AS_BINARY,curr->binary_op,0,as_reg(REG_ECX),convert_tacky_val(curr->dst),NULL);
+                    }
+                  
+                }
                 else if (curr->binary_op >= BINARY_EQ && curr->binary_op <= BINARY_GTE){
                     // logic operator : cmp src2 ,src1 ,mov $0 ,dst ,setCC dst
                     append_asm(head,AS_CMP,0,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->src),NULL);
@@ -1423,7 +1488,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     else if (e->type==EXP_BINARY){
 
         //deal with && Short-circuiting  logic
-        if (e->binary.op==BINARY_AND){
+        if (e->binary.op==BINARY_LOGICAL_AND){
             char *false_label=make_label("and_false");
             char *end_label=make_label("and_end");
             TackyVal *dst=tacky_val_var(make_temporary());
@@ -1480,7 +1545,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         }
 
         // deal with ||  Short-circuiting  logic
-        if (e->binary.op==BINARY_OR){
+        if (e->binary.op==BINARY_LOGICAL_OR){
             char *true_label=make_label("or_true");
             char *end_label=make_label("or_end");
             TackyVal *dst=tacky_val_var(make_temporary());
@@ -1617,7 +1682,7 @@ void emit_op(AsmOperand op,FILE *out){
         fprintf(out,"$%d",op.imm);
     }
     else if (op.type==AS_REG){
-        const char *reg_names[]={"%eax","%r10d","%edx","%r11d"};
+        const char *reg_names[]={"%eax","%r10d","%edx","%r11d","%ecx"};
         fprintf(out,"%s",reg_names[op.reg]);
     }
     else if (op.type==AS_STACK){
@@ -1627,7 +1692,7 @@ void emit_op(AsmOperand op,FILE *out){
 
 void emit_op_8bit(AsmOperand op,FILE *out){
     if (op.type==AS_REG){
-        const char *reg_name_8[]={"%al","%r10b","%dl","%r11b"};
+        const char *reg_name_8[]={"%al","%r10b","%dl","%r11b","%cl"};
         fprintf(out,"%s",reg_name_8[op.reg]);
     }else if (op.type==AS_STACK){
         fprintf(out,"%d(%%rbp)",op.stack_offset);
@@ -1676,12 +1741,49 @@ void emit_asm_new(AsmProg * asmp,FILE *out){
                 fprintf(out, "    ret\n"); break;
             case AS_BINARY:
                 {
-                    const char *ops[]={"addl","subl","imull"};
-                    fprintf(out, "    %s    ", ops[curr->binary_op]);
-                    emit_op(curr->src,out);
-                    fprintf(out,", ");
-                    emit_op(curr->dst,out);
-                    fprintf(out,"\n");
+                    const char *op_str=NULL;
+                    switch (curr->binary_op){
+                        case BINARY_ADD: op_str="addl"; break;
+                        case BINARY_SUB: op_str = "subl"; break;
+                        case BINARY_MULT: op_str = "imull"; break;
+                         // logical operation (&&, ||) will not reach here, here processing bitwise operation (&, |)
+                        case BINARY_BITWISE_AND: op_str = "andl"; break;
+                        case BINARY_BITWISE_OR:  op_str = "orl"; break;
+                        case BINARY_BITWISE_XOR: op_str = "xorl"; break;
+                        case BINARY_LSHIFT: op_str = "sall"; break; // arithmetic shift left
+                        case BINARY_RSHIFT: op_str = "sarl"; break; // arithmetic shift right
+                        default: break;
+                    }
+
+                    if (op_str){
+                        
+                        //shift speical deal with:if it's shift，and source is ECX ，output %cl
+                        if (curr->binary_op==BINARY_LSHIFT || curr->binary_op==BINARY_RSHIFT){
+                            fprintf(out, "    %s    ", op_str);
+                            //check offset (src)
+                            if (curr->src.type==AS_IMM){
+                                //if is immediate，directly output
+                                emit_op(curr->src,out);
+                            }else{
+                                //if not，msut be %cl
+                                //tacky_to_asm phase make sure src2 move into ECX
+                                //only output %cl
+                                fprintf(out, "%%cl");
+                            }
+
+                            fprintf(out, ", ");
+                            emit_op(curr->dst, out);
+                            fprintf(out, "\n");
+                        }else{ //other binary operators
+                            fprintf(out, "    %s    ", op_str);
+                            emit_op(curr->src,out);
+                            fprintf(out,", ");
+                            emit_op(curr->dst,out);
+                            fprintf(out,"\n");
+                        }
+
+
+                    }
 
                 }
                 break;
