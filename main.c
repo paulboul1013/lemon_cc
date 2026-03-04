@@ -77,6 +77,7 @@ typedef enum {
     EXP_COMPOUND_ASSIGN, // += -= *= /= %=
     EXP_PREFIX_OP, //++a,--a
     EXP_POSTFIX_OP, //a++,a--
+    EXP_CONDITIONAL,
 }ExpType;
 
 typedef enum {
@@ -124,8 +125,13 @@ typedef struct Exp {
         struct {
            struct Exp *lvalue; //use Exp node replace pure string
            int is_increment; // 1 for ++ ,0 for --
-        } inc_dec;
-      
+        } inc_dec;      
+
+        struct {
+            struct Exp *condition;
+            struct Exp *true_expr;
+            struct Exp *false_expr;
+        } conditional;
     };
 } Exp;
 
@@ -138,12 +144,20 @@ int token_pos=0;
 typedef enum {
     STMT_RETURN,
     STMT_EXPRESSION,
+    STMT_IF,
     STMT_NULL,
 }StmtType;
 
-typedef struct {
+typedef struct Statement{
     StmtType type;
-    Exp *exp;
+    Exp *exp;// return / expression
+
+    struct {
+        Exp *condition;
+        struct Statement *then_branch;
+        struct Statement *else_branch;
+    } if_stmt;
+
 } Statement;
 
 typedef struct {
@@ -266,6 +280,8 @@ int get_precedence(TokenType op){
             return 10;
         case TOK_OR:
             return 5;
+        case TOK_QUESTION:
+            return 3;
         case TOK_ASSIGN:
         case TOK_PLUS_ASSIGN:
         case TOK_MINUS_ASSIGN:
@@ -746,7 +762,24 @@ Exp *parse_exp(int min_prec){
             take();
             Exp *right=parse_exp(prec);
             left=make_assign_exp(left,right);
-        }else if (op_type>=TOK_PLUS_ASSIGN && op_type <=TOK_RSHIFT_ASSIGN){
+        }else if (op_type==TOK_QUESTION){
+            take(); //consume ?
+
+            Exp *middle=parse_exp(0);
+
+            expect(TOK_COLON);
+
+            Exp *right=parse_exp(prec);
+
+            Exp *node=malloc(sizeof(Exp));
+            node->type=EXP_CONDITIONAL;
+            node->conditional.condition=left;
+            node->conditional.true_expr=middle;
+            node->conditional.false_expr=right;
+
+            left=node;
+        }
+        else if (op_type>=TOK_PLUS_ASSIGN && op_type <=TOK_RSHIFT_ASSIGN){
             take();
             Exp *right=parse_exp(prec); //right-associative(like =)
             left=make_compound_assign_exp(compound_token_to_binary_op(op_type),left,right);
@@ -825,9 +858,19 @@ Exp *parse_factor(){
     return inner;
 }
 
+Statement *parse_if_statment();
+Statement *parse_statement();
+
+
 // <statement> ::= "return" <exp> ";" | <exp> ";" | ";"
 Statement *parse_statement() {
+
+    if (peek().type==TOK_IF){
+        return parse_if_statment();
+    }
+
     Statement *s=malloc(sizeof(Statement));
+
     if (peek().type==TOK_RETURN){
         take();
         s->type=STMT_RETURN;
@@ -842,6 +885,33 @@ Statement *parse_statement() {
         s->exp=parse_exp(0);
         expect(TOK_SEMICOLON);
     }
+    return s;
+}
+
+Statement *parse_if_statment(){
+    expect(TOK_IF);
+    expect(TOK_LPAREN);
+
+    Exp *cond=parse_exp(0);
+
+    expect(TOK_RPAREN);
+
+    Statement *then_stmt=parse_statement();
+
+    Statement *else_stmt=NULL;
+
+    if (peek().type==TOK_ELSE){
+        take();
+        else_stmt=parse_statement();
+    }
+
+    Statement *s=malloc(sizeof(Statement));
+    s->type=STMT_IF;
+
+    s->if_stmt.condition=cond;
+    s->if_stmt.then_branch=then_stmt;
+    s->if_stmt.else_branch=else_stmt;
+
     return s;
 }
 
