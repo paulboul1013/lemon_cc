@@ -6,9 +6,19 @@
 //define Token type
 typedef  enum{
     TOK_INT, TOK_VOID, TOK_RETURN,
+
+    TOK_IF,
+    TOK_ELSE,
+
     TOK_IDENTIFIER, TOK_CONSTANT,
     TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
-    TOK_SEMICOLON, TOK_EOF, TOK_INVALID,
+    TOK_SEMICOLON, 
+    
+    TOK_QUESTION, //?
+    TOK_COLON, //:
+    
+    TOK_EOF, 
+    TOK_INVALID,
 
     TOK_NEGATION, // -
     TOK_COMPLEMENT, // ~
@@ -487,6 +497,10 @@ TokenType check_keyword(const char *s){
     if (strcmp(s,"int")==0) return TOK_INT;
     if (strcmp(s,"void")==0) return TOK_VOID;
     if (strcmp(s,"return")==0) return TOK_RETURN;
+
+    if (strcmp(s,"if")==0) return TOK_IF;
+    if (strcmp(s,"else")==0) return TOK_ELSE;
+
     return TOK_IDENTIFIER;
 }
 
@@ -573,6 +587,12 @@ void lex(const char *input){
                 break;
             case ';':
                 add_token(TOK_SEMICOLON,NULL);
+                break;
+            case '?':
+                add_token(TOK_QUESTION,NULL);
+                break;
+            case ':':
+                add_token(TOK_COLON,NULL);
                 break;
             case '~':
                 add_token(TOK_COMPLEMENT,NULL);
