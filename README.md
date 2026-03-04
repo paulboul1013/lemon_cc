@@ -480,3 +480,217 @@ x64 指令如 `cmp` 或 `sub` 會更新 `RFLAGS` 暫存器中的標誌位：
     *   這篇文章深入淺出地解釋了未定義行為在 C 標準中的含義，以及它對編譯器優化的影響。
 *   **Raph Levien 的部落格**: [“With Undefined Behavior, Anything Is Possible”](https://raphlinus.github.io/programming/rust/2018/08/17/undefined-behavior.html)
     *   這篇文章探討了未定義行為的來源及其對軟體安全性與可靠性的衝擊，並解釋了
+
+---
+
+# 第五章：區域變數 (Local Variables)
+
+##  核心目標
+本章的核心是讓編譯器支援**區域變數 (Local Variables)**。為了達成這個目標，我們需要引入以下新概念：
+1. **變數宣告與初始化 (Declarations & Initializations)**。
+2. **賦值運算式 (Assignment Expressions)** 及其**副作用 (Side Effects)**。
+3. **區塊項目 (Block Items)**：讓函式主體可以包含多個陳述式 (Statements) 與宣告 (Declarations)。
+4. **語意分析 (Semantic Analysis)**：新增編譯器階段來處理「變數解析 (Variable Resolution)」與「左值檢查 (Lvalue Validation)」。
+
+---
+
+## 1. 詞法分析 (Lexer)
+只需要新增一個 Token，也就是賦值運算子 `= (Equal Sign)`。
+注意：變數名稱屬於 `Identifier`（識別字），與函式名稱共用相同的 Token 類型，在 Lexer 階段不需要區分它們。
+
+```regex
+=   // 賦值運算子 (Assignment operator)
+```
+
+---
+
+## 2. 語法分析 (Parser)
+
+### 2.1 抽象語法樹 (AST) 擴充
+為了支援變數宣告、賦值及空陳述式，AST (以 ASDL 表示) 的定義更新如下 (粗體/註解為新增部分)：
+
+```python
+program = Program(function_definition)
+function_definition = Function(identifier name, block_item* body)
+
+// 新增：區塊項目可以是陳述式或宣告
+block_item = S(statement) | D(declaration)
+
+// 新增：宣告節點 (包含變數名稱與可選的初始化表達式)
+declaration = Declaration(identifier name, exp? init)
+
+statement = Return(exp) 
+          | Expression(exp)  // 新增：表達式陳述式 (例如 `a = 3;`)
+          | Null             // 新增：空陳述式 (例如單獨的 `;`)
+
+exp = Constant(int) 
+    | Var(identifier)                  // 新增：讀取變數
+    | Unary(unary_operator, exp) 
+    | Binary(binary_operator, exp, exp) 
+    | Assignment(exp, exp)             // 新增：賦值操作
+
+unary_operator = Complement | Negate | Not
+binary_operator = Add | Subtract | Multiply | Divide | Remainder | And | Or
+                | Equal | NotEqual | LessThan | LessOrEqual
+                | GreaterThan | GreaterOrEqual
+```
+
+### 2.2 具體語法 (Formal Grammar - EBNF)
+相對應的 EBNF 語法規則更新如下。注意 `{ }` 代表重複零次或多次，`[ ]` 代表可選 (Optional)。
+
+```ebnf
+<program> ::= <function>
+<function> ::= "int" <identifier> "(" "void" ")" "{" { <block-item> } "}"
+<block-item> ::= <statement> | <declaration>
+
+<declaration> ::= "int" <identifier> [ "=" <exp> ] ";"
+<statement> ::= "return" <exp> ";" | <exp> ";" | ";"
+
+<exp> ::= <factor> | <exp> <binop> <exp>
+<factor> ::= <int> | <identifier> | <unop> <factor> | "(" <exp> ")"
+
+<unop> ::= "-" | "~" | "!"
+<binop> ::= "-" | "+" | "*" | "/" | "%" | "&&" | "||"
+          | "==" | "!=" | "<" | "<=" | ">" | ">=" 
+          | "="   // 新增賦值運算子
+
+<identifier> ::= ? An identifier token ?
+<int> ::= ? A constant token ?
+```
+
+### 2.3 優先級爬升演算法 (Precedence Climbing) 的改良
+賦值運算子 `=` 與其他二元運算子最大的不同在於：它是**右結合 (Right-associative)**。
+* 左結合 (`-`)：`a - b - c` 解析為 `(a - b) - c`
+* 右結合 (`=`)：`a = b = c` 解析為 `a = (b = c)`
+
+為了支援右結合，在遇到 `=` 時，遞迴呼叫 `parse_exp` 的 `min_prec` 參數**不需要 +1**。
+
+**運算子優先級表 (Table 5-1)**:
+| Operator | Precedence | Associativity |
+| -------- | ---------- | ------------- |
+| `*`, `/`, `%` | 50 | Left |
+| `+`, `-` | 45 | Left |
+| `<`, `<=`, `>`, `>=`| 35 | Left |
+| `==`, `!=`| 30 | Left |
+| `&&` | 10 | Left |
+| `\|\|` | 5 | Left |
+| **`=`** | **1** | **Right** |
+
+**改良後的 Precedence Climbing 虛擬碼 (Listing 5-8)**：
+```python
+parse_exp(tokens, min_prec):
+    left = parse_factor(tokens)
+    next_token = peek(tokens)
+    
+    while next_token is a binary operator and precedence(next_token) >= min_prec:
+        if next_token is "=":
+            take_token(tokens) // 移除 "="
+            # 注意這裡：右結合，所以傳遞 precedence(next_token) 而非 +1
+            right = parse_exp(tokens, precedence(next_token))
+            left = Assignment(left, right)
+        else:
+            operator = parse_binop(tokens)
+            # 左結合，傳遞 precedence(next_token) + 1
+            right = parse_exp(tokens, precedence(next_token) + 1)
+            left = Binary(operator, left, right)
+            
+        next_token = peek(tokens)
+        
+    return left
+```
+
+---
+
+## 3. 語意分析 (Semantic Analysis)
+從本章開始引入「語意分析」階段。在這個階段，AST 結構完全合法，但我們需要檢查程式是否「有意義」。
+
+### 3.1 變數解析 (Variable Resolution)
+變數解析的目標是：
+1. 為每個區域變數生成**全域唯一的名稱** (例如將 `x` 重命名為 `x.1`)，以利於後續作用域 (Scope) 的處理。
+2. 攔截**重複宣告 (Duplicate declaration)** 錯誤。
+3. 攔截**使用未宣告變數 (Undeclared variable)** 錯誤。
+
+**處理變數宣告 (Listing 5-9)**：
+```python
+resolve_declaration(Declaration(name, init), variable_map):
+    if name is in variable_map:
+        fail("Duplicate variable declaration!")
+        
+    unique_name = make_temporary() # 產生如 name.1 的唯一 ID
+    variable_map.add(name, unique_name)
+    
+    if init is not null:
+        init = resolve_exp(init, variable_map)
+        
+    return Declaration(unique_name, init)
+```
+
+**處理變數讀取與賦值 (Listing 5-11)**：
+同時必須檢查「左值 (Lvalue)」。賦值的左邊目前**必須是變數**，不能是常數或運算式。
+```python
+resolve_exp(e, variable_map):
+    match e with
+    | Assignment(left, right) ->
+        if left is not a Var node:
+            fail("Invalid lvalue!")  // 左值檢查： 3 = x 是錯誤的
+        return Assignment(resolve_exp(left, variable_map), 
+                          resolve_exp(right, variable_map))
+                          
+    | Var(v) ->
+        if v is in variable_map:
+            return Var(variable_map.get(v)) // 替換成唯一名稱
+        else:
+            fail("Undeclared variable!")    // 變數未宣告錯誤
+    | --snip--
+```
+
+---
+
+## 4. 中介碼生成 (TACKY Generation)
+幸運的是，我們在前面的章節已經為了暫存運算結果發明了 TACKY 的 `Var` (虛擬暫存器) 和 `Copy` 指令。因此，TACKY IR **不需要新增任何結構**，我們只需要將 AST 的新節點轉換成現有的 TACKY 指令即可。
+
+### 4.1 轉換規則
+* **變數 (Var)**：直接轉換為 TACKY 的 `Var`。
+* **宣告 (Declaration)**：
+  * 若沒有初始化 (e.g., `int a;`)：在 TACKY 階段直接**丟棄** (TACKY 不需要宣告變數)。
+  * 若有初始化 (e.g., `int a = 5;`)：視為賦值處理，產生對應的 `Copy` 或算術運算。
+* **賦值 (Assignment)**：計算右半邊 (RHS) 的結果，然後 `Copy` 到左半邊 (LHS) 的變數中。
+* **空陳述 (Null Statement)**：不產生任何 TACKY 指令。
+* **表達式陳述 (Expression Statement)**：計算表達式，但丟棄結果的變數。
+
+**賦值與變數的 TACKY 轉換虛擬碼 (Listing 5-12)**：
+```python
+emit_tacky(e, instructions):
+    match e with
+    | --snip--
+    | Var(v) -> return Var(v)
+    | Assignment(Var(v), rhs) ->
+        result = emit_tacky(rhs, instructions)
+        instructions.append(Copy(result, Var(v))) # 把計算結果 Copy 給變數 v
+        return Var(v)  # 賦值表達式本身的回傳值是該變數的值
+```
+
+### 4.2 沒有 Return 的函式處理 (Edge Case)
+C 語言規定，如果 `main` 函式執行到結尾沒有遇到 `return`，應隱式回傳 `0`。對於其他函式，如果 caller 沒有使用回傳值，則行為合法，但若 caller 試圖讀取，則是未定義行為 (Undefined Behavior)。
+
+**解法**：
+在 TACKY Generation 的最後，無條件在每個函式的指令串尾端加上 `Return(Constant(0))`。
+* 若原程式已有 `return`，這個隱式 `return 0` 變成不可達代碼 (Dead code)，未來優化階段可消除。
+* 若原程式沒有 `return`，這確保了程式能正常退出，且對於 `main` 函式正好符合 C 標準規範。
+
+---
+
+## 5. 組合語言生成 (Assembly Generation)
+由於 TACKY IR 沒有改變 (還是 `Copy`, `Var` 等)，我們**完全不需要修改** Assembly Generation 或 Code Emission 階段！
+在此前的實作中，遇到 TACKY 的 `Var` 時，我們就已經透過分配 Stack 的 Offset (例如 `-4(%rbp)`) 來處理了。使用者定義的區域變數現在直接享受了這套機制的紅利。
+
+---
+
+## 進階知識與細節 (Undefined Behavior)
+
+本章介紹了變數後，C 語言中經典的**未定義行為 (Undefined Behavior, UB)** 也隨之而來：
+1. **讀取未初始化的變數**：編譯器會配置 Stack 空間，但裡面的值是記憶體中殘留的垃圾值 (Garbage value)。(此實作不主動攔截)
+2. **無順序副作用 (Unsequenced Side Effects)**：
+   C 標準未規定二元運算子 (如 `+`, `*`) 左右兩邊的求值順序。如果在一行內對同一個變數賦值多次，或者同時讀取與賦值，會觸發 UB。
+   > 範例：`(a = 4) + (a = 5);` 或 `return (a = 1) + a;`
+   > 結果取決於編譯器實作，在標準中是不可預測的。
