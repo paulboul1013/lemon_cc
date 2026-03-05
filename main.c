@@ -1001,6 +1001,13 @@ char *map_get(IdentifierMap *map,const char *name){
 void resolve_expression(Exp *e,IdentifierMap *map){
     if (!e) return;
     switch (e->type){
+        
+        case EXP_CONDITIONAL:
+            resolve_expression(e->conditional.condition,map);
+            resolve_expression(e->conditional.true_expr,map);
+            resolve_expression(e->conditional.false_expr,map);
+            break;
+
         case EXP_CONSTANT:
             break;
 
@@ -1082,6 +1089,20 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
     if (stmt->type==STMT_RETURN || stmt->type==STMT_EXPRESSION){
         if (stmt->exp){
             resolve_expression(stmt->exp,map);
+        }
+    }
+    
+
+    else if (stmt->type==STMT_IF){
+        // resolve if condition statement
+        resolve_expression(stmt->if_stmt.condition,map);
+
+        //resolve if true statement
+        resolve_statement(stmt->if_stmt.then_branch,map);
+
+        //if have else statement, resolve it
+        if (stmt->if_stmt.else_branch){
+            resolve_statement(stmt->if_stmt.else_branch,map);
         }
     }
 
