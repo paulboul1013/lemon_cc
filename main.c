@@ -606,9 +606,11 @@ void lex(const char *input){
                 break;
             case '?':
                 add_token(TOK_QUESTION,NULL);
+                p++;
                 break;
             case ':':
                 add_token(TOK_COLON,NULL);
+                p++;
                 break;
             case '~':
                 add_token(TOK_COMPLEMENT,NULL);
@@ -769,7 +771,7 @@ Exp *parse_exp(int min_prec){
 
             expect(TOK_COLON);
 
-            Exp *right=parse_exp(prec);
+            Exp *right=parse_exp(prec+1);
 
             Exp *node=malloc(sizeof(Exp));
             node->type=EXP_CONDITIONAL;
@@ -1498,6 +1500,59 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     if (e->type==EXP_CONSTANT){
         return tacky_val_constant(e->int_value);
     }
+    else if (e->type==EXP_CONDITIONAL){
+        char *false_label=make_label("cond_false");  
+        char *end_label=make_label("cond_end");
+        TackyVal *dst=tacky_val_var(make_temporary());
+
+        //1. calculate condition
+        TackyVal *cond=gen_tacky_exp(e->conditional.condition,inst_list);
+
+        //2. JumpIfZero(cond,false_label)
+        TackyInstruction *jz=calloc(1,sizeof(TackyInstruction));
+        jz->type=TACKY_INST_JZ;
+        jz->src=cond;
+        jz->label_name=strdup(false_label);
+        append_tacky_inst(inst_list,jz);
+
+        //3. calculate true_expr，and copy to dst
+        TackyVal *v1=gen_tacky_exp(e->conditional.true_expr,inst_list);
+        TackyInstruction *cp1=calloc(1,sizeof(TackyInstruction));
+        cp1->type=TACKY_INST_COPY;
+        cp1->src=v1;
+        cp1->dst=dst;
+        append_tacky_inst(inst_list,cp1);
+
+        //4. jump(end_label) skip false_expr
+        TackyInstruction *jmp=calloc(1,sizeof(TackyInstruction));
+        jmp->type=TACKY_INST_JUMP;
+        jmp->label_name=strdup(end_label);
+        append_tacky_inst(inst_list,jmp);
+
+        //5. label(false_label)
+        TackyInstruction *l_false=calloc(1,sizeof(TackyInstruction));
+        l_false->type=TACKY_INST_LABEL;
+        l_false->label_name=strdup(false_label);
+        append_tacky_inst(inst_list,l_false);
+
+
+        //6. calculate false_expr，and copy to dst
+        TackyVal *v2=gen_tacky_exp(e->conditional.false_expr,inst_list);
+        TackyInstruction *cp2=calloc(1,sizeof(TackyInstruction));
+        cp2->type=TACKY_INST_COPY;
+        cp2->src=v2;
+        cp2->dst=dst;
+        append_tacky_inst(inst_list,cp2);
+
+        //7. label(end_label)
+        TackyInstruction *l_end=calloc(1,sizeof(TackyInstruction));
+        l_end->type=TACKY_INST_LABEL;
+        l_end->label_name=strdup(end_label);
+        append_tacky_inst(inst_list,l_end);
+
+        return dst;
+
+    }
     else if (e->type==EXP_COMPOUND_ASSIGN){
         TackyVal *rhs_val=gen_tacky_exp(e->compound.rvalue,inst_list);
         TackyVal *lhs_val=tacky_val_var(e->compound.lvalue->var_name);
@@ -1718,7 +1773,8 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         TackyVal *v2=gen_tacky_exp(e->binary.right,inst_list);
 
         //build temporal variable to save result
-        TackyVal *dst=tacky_val_var(make_temporary());
+        char *tmp=make_temporary();
+        TackyVal *dst=tacky_val_var(tmp);
 
         //build and emit binary instruction
         TackyInstruction *inst=calloc(1, sizeof(TackyInstruction));
@@ -1748,6 +1804,58 @@ void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
         if (stmt->exp){
             gen_tacky_exp(stmt->exp,inst_list);
         } 
+    }
+    else if (stmt->type==STMT_IF){
+        TackyVal *cond=gen_tacky_exp(stmt->if_stmt.condition,inst_list);
+        char *end_label=make_label("if_end");
+
+        if (stmt->if_stmt.else_branch){
+            //have else branch condition
+            char *else_label=make_label("if_else");
+            
+            //JumpIfZero(cond,else_label)
+            TackyInstruction *jz=calloc(1,sizeof(TackyInstruction));
+            jz->type=TACKY_INST_JZ;
+            jz->src=cond;
+            jz->label_name=strdup(else_label);
+            append_tacky_inst(inst_list,jz);
+
+            // execute then section
+            gen_tacky_statement(stmt->if_stmt.then_branch,inst_list);
+
+            //jump(end_label)(execute then，and skip else section)
+            TackyInstruction *jmp=calloc(1,sizeof(TackyInstruction));
+            jmp->type=TACKY_INST_JUMP;
+            jmp->label_name=strdup(end_label);
+            append_tacky_inst(inst_list,jmp);
+
+            //label(else_label)
+            TackyInstruction *l_else=calloc(1,sizeof(TackyInstruction));
+            l_else->type=TACKY_INST_LABEL;
+            l_else->label_name=strdup(else_label);
+            append_tacky_inst(inst_list,l_else);
+
+            gen_tacky_statement(stmt->if_stmt.else_branch,inst_list);
+        
+        }else{
+            //no else branch situation，condition if it's false just jump to end_label
+            //JumpIfZero(cond,else_label)
+            TackyInstruction *jz=calloc(1,sizeof(TackyInstruction));
+            jz->type=TACKY_INST_JZ;
+            jz->src=cond;
+            jz->label_name=strdup(end_label);
+            append_tacky_inst(inst_list,jz);
+
+            //execute then section
+            gen_tacky_statement(stmt->if_stmt.then_branch,inst_list);
+        }
+
+        //label(end_label)
+        TackyInstruction *l_end=calloc(1,sizeof(TackyInstruction));
+        l_end->type=TACKY_INST_LABEL;
+        l_end->label_name=strdup(end_label);
+        append_tacky_inst(inst_list,l_end);
+        
     }
 }
 
