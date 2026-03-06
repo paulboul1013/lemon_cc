@@ -756,7 +756,25 @@ void expect(TokenType type){
     }
 }
 
-//<exp> ::= <factor> | <exp> <binop> <exp>
+// binary operators (precedence handled by parse_exp)
+//
+// assignment
+//   = += -= *= /= %= &= |= ^= <<= >>=
+//
+// logical
+//   || &&
+//
+// bitwise
+//   | ^ &
+//
+// comparison
+//   == != < <= > >=
+//
+// shift
+//   << >>
+//
+// arithmetic
+//   + - * / %
 Exp *parse_exp(int min_prec){
    Exp *left=parse_factor();
    Token next=peek();
@@ -807,7 +825,14 @@ Exp *parse_exp(int min_prec){
 
 //deal with number and parentheses and unary operator
 //note:unary operator make sure higher precedence than binary operator
-//<factor> ::= <int> | <unop> <factor> | "(" <exp> ")" | <identifier>
+// <factor> ::= <constant>
+//            | <identifier>
+//            | "(" <expression> ")"
+//            | <unary_op> <factor>
+//            | <factor> "++"
+//            | <factor> "--"
+//            | "++" <factor>
+//            | "--" <factor>
 Exp *parse_factor(){
     Token t=peek();
     Exp *inner = NULL;
@@ -870,7 +895,13 @@ Statement *parse_if_statment();
 Statement *parse_statement();
 
 
-// <statement> ::= "return" <exp> ";" | <exp> ";" | ";"
+// <statement> ::= "return" <expression> ";"
+//               | <expression> ";"
+//               | ";"
+//               | "if" "(" <expression> ")" <statement>
+//               | "if" "(" <expression> ")" <statement> "else" <statement>
+//               | "goto" <identifier> ";"
+//               | <identifier> ":" <statement>
 Statement *parse_statement() {
 
     if (peek().type==TOK_IF){
@@ -925,7 +956,8 @@ Statement *parse_statement() {
     }
     return s;
 }
-
+// <if_statement> ::= "if" "(" <expression> ")" <statement>
+//                  | "if" "(" <expression> ")" <statement> "else" <statement>
 Statement *parse_if_statment(){
     expect(TOK_IF);
     expect(TOK_LPAREN);
@@ -953,7 +985,7 @@ Statement *parse_if_statment(){
     return s;
 }
 
-//<declaration> ::= "int" <identifier> [ "=" <exp> ] ";"
+// <declaration> ::= "int" <identifier> [ "=" <expression> ] ";"
 Declaration *parse_declaration(){
     expect(TOK_INT);
     Token id=take(); //get variable name
@@ -976,7 +1008,9 @@ Declaration *parse_declaration(){
     return d;
 }
 
-// <function> ::= "int" <identifier> "(" "void" ")" "{" { <block_item> } "}" 
+// <function> ::= "int" <identifier> "(" "void" ")" "{" { <block_item> } "}"
+//
+// <block_item> ::= <declaration> | <statement>
 Function *parse_function() {
     expect(TOK_INT);
     Token id=take();
@@ -1009,7 +1043,7 @@ Function *parse_function() {
     return f;
 }
 
-// <program> ::= <function>
+// <program> ::= <function> EOF
 Program *parse_program() {
     Program *prog=malloc(sizeof(Program));
     prog->fn=parse_function();
@@ -1608,6 +1642,19 @@ void fix_and_allocate(AsmProg *asmp){
 }
 
 //Tacky generation
+
+// Generate TACKY IR for <expression>
+//
+// Handles:
+//   constants
+//   variables
+//   unary expressions
+//   binary expressions
+//   assignment
+//   compound assignment
+//   ++ / --
+//   conditional (?:)
+//   short-circuit logical operators (&&, ||)
 TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     if (e->type==EXP_CONSTANT){
         return tacky_val_constant(e->int_value);
@@ -1904,7 +1951,14 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     return NULL;
 }
 
-//let Statement turn to TACKY
+// Generate TACKY IR for <statement>
+//
+// Handles:
+//   return
+//   expression
+//   if / else
+//   goto
+//   label
 void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
     if (stmt->type==STMT_RETURN){
         TackyVal *val=gen_tacky_exp(stmt->exp,inst_list);
