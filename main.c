@@ -149,21 +149,8 @@ typedef enum {
     STMT_NULL,
     STMT_GOTO,
     STMT_LABEL,
+    STMT_COMPOUND,
 }StmtType;
-
-typedef struct Statement{
-    StmtType type;
-    Exp *exp;// return / expression
-
-    struct {
-        Exp *condition;
-        struct Statement *then_branch;
-        struct Statement *else_branch;
-    } if_stmt;
-
-    char *label;/*for goto label
-                label:        */
-} Statement;
 
 typedef struct {
     char *name;
@@ -175,7 +162,27 @@ typedef enum {
     BI_DECL
 } BlockItemType;
 
-typedef struct {
+
+typedef struct BlockItem BlockItem;
+typedef struct Statement{
+    StmtType type;
+    Exp *exp;// return / expression
+
+    struct {
+        Exp *condition;
+        struct Statement *then_branch;
+        struct Statement *else_branch;
+    } if_stmt;
+
+    BlockItem **block_items;
+    int block_count;
+
+    char *label;/*for goto label
+                label:        */
+} Statement;
+
+
+typedef struct BlockItem{
     BlockItemType type;
     union {
         Statement *stmt;
@@ -189,8 +196,10 @@ typedef struct {
     int body_count;
 } Function;
 
-
 typedef struct {Function *fn;} Program;
+
+
+
 
 //Exp helper function
 //build constant node
@@ -747,6 +756,8 @@ Token peek() {return token_list[token_pos];}
 Token take() {return token_list[token_pos++];}
 Exp *parse_exp(int min_prec);
 Exp *parse_factor();
+Statement *parse_statement();
+Declaration *parse_declaration();
 
 void expect(TokenType type){
     Token t=take();
@@ -755,6 +766,34 @@ void expect(TokenType type){
         exit(1);//pass invalid_parse test
     }
 }
+
+Statement *parse_block(){
+    expect(TOK_LBRACE);
+    
+    Statement *s=malloc(sizeof(Statement));
+    s->type=STMT_COMPOUND;
+
+    s->block_items=malloc(sizeof(BlockItem*)*100);
+    s->block_count=0;
+
+    while(peek().type!=TOK_RBRACE){
+        BlockItem *bi=malloc(sizeof(BlockItem));
+
+        if (peek().type==TOK_INT){
+            bi->type=BI_DECL;
+            bi->decl=parse_declaration();
+        }else{
+            bi->type=BI_STMT;
+            bi->stmt=parse_statement();
+        }
+
+        s->block_items[s->block_count++]=bi;
+    }
+
+    expect(TOK_RBRACE);
+    return s;
+}
+
 
 // binary operators (precedence handled by parse_exp)
 //
@@ -906,6 +945,10 @@ Statement *parse_statement() {
 
     if (peek().type==TOK_IF){
         return parse_if_statment();
+    }
+
+    if (peek().type==TOK_LBRACE){
+        return parse_block();
     }
 
     Statement *s=malloc(sizeof(Statement));
