@@ -9,6 +9,7 @@ typedef  enum{
 
     TOK_IF,
     TOK_ELSE,
+    TOK_GOTO,
 
     TOK_IDENTIFIER, TOK_CONSTANT,
     TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
@@ -146,6 +147,8 @@ typedef enum {
     STMT_EXPRESSION,
     STMT_IF,
     STMT_NULL,
+    STMT_GOTO,
+    STMT_LABEL,
 }StmtType;
 
 typedef struct Statement{
@@ -158,6 +161,8 @@ typedef struct Statement{
         struct Statement *else_branch;
     } if_stmt;
 
+    char *label;/*for goto label
+                label:        */
 } Statement;
 
 typedef struct {
@@ -516,6 +521,7 @@ TokenType check_keyword(const char *s){
 
     if (strcmp(s,"if")==0) return TOK_IF;
     if (strcmp(s,"else")==0) return TOK_ELSE;
+    if (strcmp(s,"goto")==0) return TOK_GOTO;
 
     return TOK_IDENTIFIER;
 }
@@ -878,7 +884,37 @@ Statement *parse_statement() {
         s->type=STMT_RETURN;
         s->exp=parse_exp(0);
         expect(TOK_SEMICOLON);
-    }else if (peek().type==TOK_SEMICOLON){
+    }else if (peek().type==TOK_GOTO){
+        take();
+        Token id=take();
+
+        if (id.type!=TOK_IDENTIFIER){
+            fprintf(stderr,"Parse Error: expected label after goto\n");
+            exit(1);
+        }
+
+        expect(TOK_SEMICOLON);
+
+        Statement *s=malloc(sizeof(Statement));
+        s->type=STMT_GOTO;
+        s->label=strdup(id.value);
+        return s;
+    }
+    else if (peek().type==TOK_IDENTIFIER && token_list[token_pos+1].type==TOK_COLON){
+        Token id=take();
+        take(); //consume :
+
+        Statement *inner=parse_statement();
+
+        Statement *s=malloc(sizeof(Statement));
+        s->type=STMT_LABEL;
+        s->label=strdup(id.value);
+        s->exp=NULL;
+        s->if_stmt.then_branch=inner;
+
+        return s;
+    }
+    else if (peek().type==TOK_SEMICOLON){
         take();
         s->type=STMT_NULL;
         s->exp=NULL;
@@ -982,6 +1018,45 @@ Program *parse_program() {
 }
 
 //Semantic analysis
+typedef struct LabelMap{
+    char *name;
+    struct LabelMap *next;
+}LabelMap;
+
+int label_exists(LabelMap *map,const char *name){
+    while(map){
+        if (strcmp(map->name,name)==0) {
+            return 1;
+        }
+        map=map->next;
+    }
+    return 0;
+}
+
+void check_labels_statement(Statement *stmt,LabelMap **map){
+    if (stmt->type==STMT_LABEL){
+        if (label_exists(*map,stmt->label)){
+            fprintf(stderr,"Semantic Error: duplicate label '%s'\n",stmt->label);
+            exit(1);
+        }
+
+        LabelMap *entry=malloc(sizeof(LabelMap));
+        entry->name=strdup(stmt->label);
+        entry->next=*map;
+        *map=entry;
+
+        check_labels_statement(stmt->if_stmt.then_branch,map);
+    }
+
+    else if (stmt->type==STMT_IF){
+        check_labels_statement(stmt->if_stmt.then_branch,map);
+
+        if (stmt->if_stmt.else_branch){
+            check_labels_statement(stmt->if_stmt.else_branch,map);
+        }
+    }
+}
+
 
 typedef struct IdentifierMap{
     char *user_name;
@@ -998,6 +1073,29 @@ char *map_get(IdentifierMap *map,const char *name){
         map=map->next;
     }
     return NULL;
+}
+
+void check_goto_statement(Statement *stmt,LabelMap *labels,IdentifierMap *vars){
+    if (stmt->type==STMT_GOTO){
+        //check label exist
+        if (!label_exists(labels,stmt->label)){
+            fprintf(stderr, "Semantic Error: goto to undefined label '%s'\n", stmt->label);
+            exit(1);
+        }
+
+    }
+
+    else if (stmt->type==STMT_LABEL){
+        check_goto_statement(stmt->if_stmt.then_branch,labels,vars);
+    }
+
+    else if (stmt->type==STMT_IF){
+        check_goto_statement(stmt->if_stmt.then_branch,labels,vars);
+
+        if (stmt->if_stmt.else_branch){
+            check_goto_statement(stmt->if_stmt.else_branch,labels,vars);
+        }
+    }
 }
 
 void resolve_expression(Exp *e,IdentifierMap *map){
@@ -1108,22 +1206,36 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
         }
     }
 
+    else if (stmt->type==STMT_LABEL){
+        resolve_statement(stmt->if_stmt.then_branch,map);
+    }
+
     //don't need deal with STMT_NULL
 }
 
 void resolve_program(Program *prog){
     IdentifierMap *map=NULL;
+    LabelMap *labels=NULL;
 
+    // pass1 :collect labels
+    for(int i=0;i<prog->fn->body_count;i++){
+        BlockItem *bi=prog->fn->body[i];
+
+        if (bi->type==BI_STMT){
+            check_labels_statement(bi->stmt,&labels);
+        }
+    }
+            
+    // pass2 : resolve variables + check goto
     for(int i=0;i<prog->fn->body_count;i++){
         BlockItem *bi=prog->fn->body[i];
         if (bi->type==BI_DECL){
             resolve_declaration(bi->decl,&map);
         }else{
+            check_goto_statement(bi->stmt,labels,map);
             resolve_statement(bi->stmt,map);
         }
     }
-
-    
 }
 
 // //assemble generation
@@ -1800,7 +1912,23 @@ void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
         ret->type=TACKY_INST_RETURN;
         ret->src=val;
         append_tacky_inst(inst_list,ret);
-    }else if (stmt->type==STMT_EXPRESSION){
+    }else if (stmt->type==STMT_LABEL){
+        TackyInstruction *lab=calloc(1,sizeof(TackyInstruction));
+        lab->type=TACKY_INST_LABEL;
+        lab->label_name=strdup(stmt->label);
+
+        append_tacky_inst(inst_list,lab);
+
+        gen_tacky_statement(stmt->if_stmt.then_branch,inst_list);
+    }
+    else if (stmt->type==STMT_GOTO){
+       TackyInstruction *jmp=calloc(1,sizeof(TackyInstruction));
+       jmp->type=TACKY_INST_JUMP;
+       jmp->label_name=strdup(stmt->label);
+       
+       append_tacky_inst(inst_list,jmp);
+    }
+    else if (stmt->type==STMT_EXPRESSION){
         if (stmt->exp){
             gen_tacky_exp(stmt->exp,inst_list);
         } 
