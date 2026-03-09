@@ -11,6 +11,12 @@ typedef  enum{
     TOK_ELSE,
     TOK_GOTO,
 
+    TOK_DO,
+    TOK_WHILE,
+    TOK_FOR,
+    TOK_BREAK,
+    TOK_CONTINUE,
+
     TOK_IDENTIFIER, TOK_CONSTANT,
     TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
     TOK_SEMICOLON, 
@@ -531,6 +537,12 @@ TokenType check_keyword(const char *s){
     if (strcmp(s,"if")==0) return TOK_IF;
     if (strcmp(s,"else")==0) return TOK_ELSE;
     if (strcmp(s,"goto")==0) return TOK_GOTO;
+
+    if (strcmp(s,"do")==0) return TOK_DO;
+    if (strcmp(s,"while")==0) return TOK_WHILE;
+    if (strcmp(s,"for")==0) return TOK_FOR;
+    if (strcmp(s,"break")==0) return TOK_BREAK;
+    if (strcmp(s,"continue")==0) return TOK_CONTINUE;
 
     return TOK_IDENTIFIER;
 }
