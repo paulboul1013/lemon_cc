@@ -1748,6 +1748,7 @@ void fix_and_allocate(AsmProg *asmp){
 }
 
 //Tacky generation
+void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_list);
 
 // Generate TACKY IR for <expression>
 //
@@ -2143,7 +2144,12 @@ void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
         l_end->type=TACKY_INST_LABEL;
         l_end->label_name=strdup(end_label);
         append_tacky_inst(inst_list,l_end);
-        
+    }
+    else if(stmt->type==STMT_COMPOUND){
+        gen_tacky_block_items(stmt->block_items,stmt->block_count,inst_list);
+    }
+    else if (stmt->type==STMT_NULL){
+        return;
     }
 }
 
@@ -2159,20 +2165,24 @@ void gen_tacky_decl(Declaration *decl,TackyInstruction **inst_list){
     }
 }
 
+void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_list){
+    for (int i=0;i<count;i++){
+        BlockItem *bi=items[i];
+        if (bi->type==BI_STMT){
+            gen_tacky_statement(bi->stmt,inst_list);
+        }else{
+            gen_tacky_decl(bi->decl,inst_list);
+        }
+    }
+}
+
 TackyProgram *generate_tacky(Program *prog){
     TackyProgram *t_prog=malloc(sizeof(TackyProgram));
     t_prog->function_name=strdup(prog->fn->name);
     t_prog->instructions=NULL;
 
     //travseral all BlockItem
-    for(int i=0;i<prog->fn->body_count;i++){
-        BlockItem *bi=prog->fn->body[i];
-        if (bi->type==BI_STMT){
-            gen_tacky_statement(bi->stmt,&t_prog->instructions);
-        }else {
-            gen_tacky_decl(bi->decl,&t_prog->instructions);
-        }
-    }
+    gen_tacky_block_items(prog->fn->body,prog->fn->body_count,&t_prog->instructions);
 
     //if functio have no return，add return 0
     TackyInstruction *final_inst=calloc(1,sizeof(TackyInstruction));
