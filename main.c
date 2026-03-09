@@ -1132,14 +1132,25 @@ void check_labels_statement(Statement *stmt,LabelMap **map){
             check_labels_statement(stmt->if_stmt.else_branch,map);
         }
     }
+    else if (stmt->type==STMT_COMPOUND){
+        for(int i=0;i<stmt->block_count;i++){
+            BlockItem *bi=stmt->block_items[i];
+            if (bi->type==BI_STMT){
+                check_labels_statement(bi->stmt,map);
+            }
+        }
+    }
 }
 
 
 typedef struct IdentifierMap{
     char *user_name;
     char *unique_name;
+    int from_current_block;
     struct IdentifierMap *next;
 } IdentifierMap;
+
+void resolve_block_items(BlockItem **items,int count,IdentifierMap **map);
 
 //find vairable in  the mapping table 
 char *map_get(IdentifierMap *map,const char *name){
@@ -1150,6 +1161,25 @@ char *map_get(IdentifierMap *map,const char *name){
         map=map->next;
     }
     return NULL;
+}
+
+IdentifierMap *copy_identifier_map(IdentifierMap *map){
+    IdentifierMap *new_head=NULL;
+    IdentifierMap **tail=&new_head;
+
+    while(map){
+        IdentifierMap *node=malloc(sizeof(IdentifierMap));
+        node->user_name=strdup(map->user_name);
+        node->unique_name=strdup(map->unique_name);
+        node->from_current_block=0;
+        node->next=NULL;
+
+        *tail=node;
+        tail=&node->next;
+        map=map->next;
+    }
+
+    return new_head;
 }
 
 void check_goto_statement(Statement *stmt,LabelMap *labels,IdentifierMap *vars){
@@ -1171,6 +1201,15 @@ void check_goto_statement(Statement *stmt,LabelMap *labels,IdentifierMap *vars){
 
         if (stmt->if_stmt.else_branch){
             check_goto_statement(stmt->if_stmt.else_branch,labels,vars);
+        }
+    }
+
+    else if (stmt->type==STMT_COMPOUND){
+        for(int i=0;i<stmt->block_count;i++){
+            BlockItem *bi=stmt->block_items[i];
+            if (bi->type==BI_STMT){
+                check_goto_statement(bi->stmt,labels,vars);
+            }
         }
     }
 }
@@ -1237,12 +1276,20 @@ void resolve_expression(Exp *e,IdentifierMap *map){
 }
 
 void resolve_declaration(Declaration *decl,IdentifierMap **map){
-    //check current scope exist repeat declare
-    if (map_get(*map,decl->name)){
-        fprintf(stderr, "Semantic Error: Duplicate declaration of variable '%s'\n", decl->name);
-        exit(1);
-    }
 
+    //same name is illegal only if an existing declaration is from current block 
+    IdentifierMap *curr=*map;
+    while(curr){
+        if (strcmp(curr->user_name,decl->name)==0){
+            if (curr->from_current_block){
+                fprintf(stderr,"Semantic Error: Duplicate declaration of variable '%s'\n",decl->name);
+                exit(1);
+            }
+            break;
+        }
+        curr=curr->next;
+    }
+    
 
     char *unique=make_temporary(); // make only name
 
@@ -1250,9 +1297,12 @@ void resolve_declaration(Declaration *decl,IdentifierMap **map){
     IdentifierMap *new_entry=malloc(sizeof(IdentifierMap));
     new_entry->user_name=strdup(decl->name);
     new_entry->unique_name=strdup(unique);
+    new_entry->from_current_block=1;
     new_entry->next=*map;
     *map=new_entry;
 
+
+    //initializer can see the newly declared variable itself
     if (decl->init){
         resolve_expression(decl->init,*map);
     }
@@ -1268,8 +1318,6 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
             resolve_expression(stmt->exp,map);
         }
     }
-    
-
     else if (stmt->type==STMT_IF){
         // resolve if condition statement
         resolve_expression(stmt->if_stmt.condition,map);
@@ -1282,12 +1330,27 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
             resolve_statement(stmt->if_stmt.else_branch,map);
         }
     }
-
     else if (stmt->type==STMT_LABEL){
         resolve_statement(stmt->if_stmt.then_branch,map);
     }
+    else if (stmt->type==STMT_COMPOUND){
+        //inner block gets a copy of current map
+        IdentifierMap *inner_map=copy_identifier_map(map);
+        resolve_block_items(stmt->block_items,stmt->block_count,&inner_map);
+    }
 
     //don't need deal with STMT_NULL
+}
+
+void resolve_block_items(BlockItem **items,int count,IdentifierMap **map){
+    for (int i=0;i<count;i++){
+        BlockItem *bi=items[i];
+        if (bi->type==BI_DECL){
+            resolve_declaration(bi->decl,map);
+        }else{
+            resolve_statement(bi->stmt,*map);
+        }
+    }
 }
 
 void resolve_program(Program *prog){
@@ -1302,15 +1365,15 @@ void resolve_program(Program *prog){
             check_labels_statement(bi->stmt,&labels);
         }
     }
-            
-    // pass2 : resolve variables + check goto
+        
+    // pass2 : resolve function body as one top-level block
+    resolve_block_items(prog->fn->body,prog->fn->body_count,&map);
+
+    // pass3 : check goto
     for(int i=0;i<prog->fn->body_count;i++){
         BlockItem *bi=prog->fn->body[i];
-        if (bi->type==BI_DECL){
-            resolve_declaration(bi->decl,&map);
-        }else{
+        if (bi->type==BI_STMT){
             check_goto_statement(bi->stmt,labels,map);
-            resolve_statement(bi->stmt,map);
         }
     }
 }
