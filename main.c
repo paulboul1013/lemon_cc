@@ -156,12 +156,29 @@ typedef enum {
     STMT_GOTO,
     STMT_LABEL,
     STMT_COMPOUND,
+
+    STMT_BREAK,
+    STMT_CONTINUE,
+    STMT_WHILE,
+    STMT_DO_WHILE,
+    STMT_FOR,   
 }StmtType;
 
 typedef struct {
     char *name;
     Exp *init; //optional
 } Declaration;
+
+typedef enum {
+    FOR_INIT_DECL,
+    FOR_INIT_EXP
+}ForInitType;
+
+typedef struct {
+    ForInitType type;
+    Declaration *decl;// when type is FOR_INIT_DECL
+    Exp *exp;// when type is FOR_INIT_EXP , NULL means empty
+} ForInit;
 
 typedef enum {
     BI_STMT,
@@ -179,6 +196,23 @@ typedef struct Statement{
         struct Statement *then_branch;
         struct Statement *else_branch;
     } if_stmt;
+
+    struct {
+        Exp *condition;
+        struct Statement *body;
+    }while_stmt;
+
+    struct {
+        struct Statement *body;
+        Exp *condition;
+    } do_while_stmt;
+
+    struct {
+        ForInit *init;
+        Exp *condition; //optional
+        Exp *post; //optional
+        struct Statement *body;
+    } for_stmt;
 
     BlockItem **block_items;
     int block_count;
@@ -771,6 +805,12 @@ Exp *parse_factor();
 Statement *parse_statement();
 Declaration *parse_declaration();
 
+Exp *parse_optional_exp(TokenType end_token);
+ForInit *parse_for_init();
+Statement *parse_for_statement();
+Statement *parse_do_while_statement();
+Statement *parse_while_statement();
+
 void expect(TokenType type){
     Token t=take();
     if (t.type!=type){
@@ -806,6 +846,88 @@ Statement *parse_block(){
     return s;
 }
 
+Exp *parse_optional_exp(TokenType end_token){
+    if (peek().type==end_token){
+        return NULL;
+    }
+    return parse_exp(0);
+}
+
+ForInit *parse_for_init(){
+    ForInit *init=malloc(sizeof(ForInit));
+
+    if (peek().type==TOK_INT){
+        init->type=FOR_INIT_DECL;
+        init->decl=parse_declaration(); //remove after int ';'
+        init->exp=NULL;
+    }else{
+        init->type=FOR_INIT_EXP;
+        init->decl=NULL;
+        init->exp=parse_optional_exp(TOK_SEMICOLON);
+        expect(TOK_SEMICOLON);
+    }
+
+    return init;
+}
+
+Statement *parse_while_statement(){
+    expect(TOK_WHILE);
+    expect(TOK_LPAREN);
+    Exp *cond=parse_exp(0);
+    expect(TOK_RPAREN);
+
+    Statement *body=parse_statement();
+
+    Statement *s=malloc(sizeof(Statement));
+    s->type=STMT_WHILE;
+    s->while_stmt.condition=cond;
+    s->while_stmt.body=body;
+
+    return s;
+}
+
+Statement *parse_do_while_statement(){
+    expect(TOK_DO);
+
+    Statement *body=parse_statement();
+
+    expect(TOK_WHILE);
+    expect(TOK_LPAREN);
+    Exp *cond=parse_exp(0);
+    expect(TOK_RPAREN);
+    expect(TOK_SEMICOLON);
+    
+
+    Statement *s=malloc(sizeof(Statement));
+    s->type=STMT_DO_WHILE;
+    s->do_while_stmt.body=body;
+    s->do_while_stmt.condition=cond;
+    return s;
+}
+
+Statement *parse_for_statement(){
+    expect(TOK_FOR);
+    expect(TOK_LPAREN);
+
+    ForInit *init=parse_for_init();
+
+    Exp *cond=parse_optional_exp(TOK_SEMICOLON);
+    expect(TOK_SEMICOLON);
+
+    Exp *post=parse_optional_exp(TOK_RPAREN);
+    expect(TOK_RPAREN);
+
+    Statement *body=parse_statement();
+
+    Statement *s=malloc(sizeof(Statement));
+    s->type=STMT_FOR;
+    s->for_stmt.init=init;
+    s->for_stmt.condition=cond;
+    s->for_stmt.post=post;
+    s->for_stmt.body=body;
+
+    return s;
+}
 
 // binary operators (precedence handled by parse_exp)
 //
@@ -963,6 +1085,18 @@ Statement *parse_statement() {
         return parse_block();
     }
 
+    if (peek().type==TOK_WHILE){
+        return parse_while_statement();
+    }
+
+    if (peek().type==TOK_DO){
+        return parse_do_while_statement();
+    }
+
+    if (peek().type==TOK_FOR){
+        return parse_for_statement();
+    }
+
     Statement *s=malloc(sizeof(Statement));
 
     if (peek().type==TOK_RETURN){
@@ -970,7 +1104,20 @@ Statement *parse_statement() {
         s->type=STMT_RETURN;
         s->exp=parse_exp(0);
         expect(TOK_SEMICOLON);
-    }else if (peek().type==TOK_GOTO){
+    }
+    else if (peek().type==TOK_BREAK){
+        take();
+        expect(TOK_SEMICOLON);
+        s->type=STMT_BREAK;
+        s->exp=NULL;
+    }
+    else if (peek().type==TOK_CONTINUE){
+        take();
+        expect(TOK_SEMICOLON);
+        s->type=STMT_CONTINUE;
+        s->exp=NULL;
+    }
+    else if (peek().type==TOK_GOTO){
         take();
         Token id=take();
 
