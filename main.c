@@ -217,7 +217,9 @@ typedef struct Statement{
     BlockItem **block_items;
     int block_count;
 
-    char *label;/*for goto label
+    char *label;
+    char *loop_label;
+    /*for goto label
                 label:        */
 } Statement;
 
@@ -811,11 +813,39 @@ Statement *parse_for_statement();
 Statement *parse_do_while_statement();
 Statement *parse_while_statement();
 
+
+typedef struct IdentifierMap{
+    char *user_name;
+    char *unique_name;
+    int from_current_block;
+    struct IdentifierMap *next;
+} IdentifierMap;
+
+void resolve_for_init(ForInit *init,IdentifierMap **map);
+void label_statement(Statement *stmt,char *current_loop_label);
+void label_block_items(BlockItem **items,int count,char *current_loop_label);
+void resolve_declaration(Declaration *decl,IdentifierMap **map);
+void resolve_expression(Exp *e,IdentifierMap *map);
+
 void expect(TokenType type){
     Token t=take();
     if (t.type!=type){
         fprintf(stderr, "Parse Error: Expected type %d but got %d\n", type, t.type);
         exit(1);//pass invalid_parse test
+    }
+}
+
+void resolve_for_init(ForInit *init,IdentifierMap **map){
+    if (!init){
+        return;
+    }
+
+    if (init->type==FOR_INIT_DECL){
+        resolve_declaration(init->decl,map);
+    }else{
+        if(init->exp){
+            resolve_expression(init->exp,*map);
+        }
     }
 }
 
@@ -1299,15 +1329,18 @@ void check_labels_statement(Statement *stmt,LabelMap **map){
             }
         }
     }
+    else if (stmt->type==STMT_WHILE){
+        check_labels_statement(stmt->while_stmt.body,map);
+    }
+    else if (stmt->type==STMT_DO_WHILE){
+        check_labels_statement(stmt->do_while_stmt.body,map);
+    }
+    else if (stmt->type==STMT_FOR){
+        check_labels_statement(stmt->for_stmt.body,map);
+    }
 }
 
 
-typedef struct IdentifierMap{
-    char *user_name;
-    char *unique_name;
-    int from_current_block;
-    struct IdentifierMap *next;
-} IdentifierMap;
 
 void resolve_block_items(BlockItem **items,int count,IdentifierMap **map);
 
@@ -1370,6 +1403,16 @@ void check_goto_statement(Statement *stmt,LabelMap *labels,IdentifierMap *vars){
                 check_goto_statement(bi->stmt,labels,vars);
             }
         }
+    }
+
+    else if (stmt->type==STMT_WHILE){
+        check_goto_statement(stmt->while_stmt.body,labels,vars);
+    }
+    else if (stmt->type==STMT_DO_WHILE){
+        check_goto_statement(stmt->do_while_stmt.body,labels,vars);
+    }
+    else if (stmt->type==STMT_FOR){
+        check_goto_statement(stmt->for_stmt.body,labels,vars);
     }
 }
 
@@ -1497,6 +1540,32 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
         IdentifierMap *inner_map=copy_identifier_map(map);
         resolve_block_items(stmt->block_items,stmt->block_count,&inner_map);
     }
+    else if (stmt->type==STMT_WHILE){
+        resolve_expression(stmt->while_stmt.condition,map);
+        resolve_statement(stmt->while_stmt.body,map);
+    }
+    else if (stmt->type==STMT_DO_WHILE){
+        resolve_statement(stmt->do_while_stmt.body,map);
+        resolve_expression(stmt->do_while_stmt.condition,map);
+    }
+    else if (stmt->type==STMT_FOR){
+        IdentifierMap *inner_map=copy_identifier_map(map);
+
+        resolve_for_init(stmt->for_stmt.init,&inner_map);
+
+        if (stmt->for_stmt.condition){
+            resolve_expression(stmt->for_stmt.condition,inner_map);
+        }
+
+        if (stmt->for_stmt.post){
+            resolve_expression(stmt->for_stmt.post,inner_map);
+        }
+
+        resolve_statement(stmt->for_stmt.body,inner_map);
+    }
+    else if (stmt->type==STMT_BREAK || stmt->type==STMT_CONTINUE){
+        return;
+    }
 
     //don't need deal with STMT_NULL
 }
@@ -1509,6 +1578,62 @@ void resolve_block_items(BlockItem **items,int count,IdentifierMap **map){
         }else{
             resolve_statement(bi->stmt,*map);
         }
+    }
+}
+
+void label_block_items(BlockItem **items,int count ,char *current_loop_label){
+    for(int i=0;i<count;i++){
+        BlockItem *bi=items[i];
+        if (bi->type==BI_STMT){
+            label_statement(bi->stmt,current_loop_label);
+        }
+    }
+}
+
+void label_statement(Statement *stmt,char *current_loop_label){
+    if (!stmt) return;
+
+    if (stmt->type==STMT_BREAK){
+        if (!current_loop_label){
+            fprintf(stderr,"Label Error: Break statement outside of loop\n");
+            exit(1);
+        }
+        stmt->loop_label=strdup(current_loop_label);
+    }
+
+    else if (stmt->type==STMT_CONTINUE){
+        if (!current_loop_label){
+            fprintf(stderr, "Semantic Error: continue statement outside of loop\n");
+            exit(1);
+        }
+        stmt->loop_label=strdup(current_loop_label);
+    }
+    else if (stmt->type==STMT_WHILE){
+        char *new_label=make_label("loop");
+        stmt->loop_label=strdup(new_label);
+        label_statement(stmt->while_stmt.body,new_label);
+    }
+    else if (stmt->type==STMT_DO_WHILE){
+        char *new_label=make_label("loop");
+        stmt->loop_label=strdup(new_label);
+        label_statement(stmt->do_while_stmt.body,new_label);
+    }
+    else if (stmt->type==STMT_FOR){
+        char *new_label=make_label("loop");
+        stmt->loop_label=strdup(new_label);
+        label_statement(stmt->for_stmt.body,new_label);
+    }
+    else if (stmt->type==STMT_IF){
+        label_statement(stmt->if_stmt.then_branch,current_loop_label);
+        if (stmt->if_stmt.else_branch){
+            label_statement(stmt->if_stmt.else_branch,current_loop_label);
+        }
+    }
+    else if (stmt->type==STMT_LABEL){
+        label_statement(stmt->if_stmt.then_branch,current_loop_label);
+    }
+    else if (stmt->type==STMT_COMPOUND){
+        label_block_items(stmt->block_items,stmt->block_count,current_loop_label);
     }
 }
 
@@ -1535,6 +1660,9 @@ void resolve_program(Program *prog){
             check_goto_statement(bi->stmt,labels,map);
         }
     }
+
+    //pass 4 : label goto
+    label_block_items(prog->fn->body, prog->fn->body_count, NULL);
 }
 
 // //assemble generation
