@@ -2036,6 +2036,15 @@ void fix_and_allocate(AsmProg *asmp){
 
 //Tacky generation
 void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_list);
+void gen_tacky_decl(Declaration *decl,TackyInstruction **inst_list);
+void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list);
+static char *make_loop_target(const char *kind,const char *loop_id);
+static void emit_tacky_label(TackyInstruction **inst_list,const char *label);
+static void emit_tacky_jump(TackyInstruction **inst_list,const char *label);
+static void emit_tacky_jz(TackyInstruction **inst_list,TackyVal *cond,const char *label);
+static void emit_tacky_jnz(TackyInstruction **inst_list,TackyVal *cond,const char *label);
+static void gen_tacky_for_init(ForInit *init,TackyInstruction **inst_list);
+
 
 // Generate TACKY IR for <expression>
 //
@@ -2438,6 +2447,70 @@ void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
     else if (stmt->type==STMT_NULL){
         return;
     }
+    else if (stmt->type==STMT_BREAK){
+        char *break_label=make_loop_target("break",stmt->loop_label);
+        emit_tacky_jump(inst_list,break_label);
+    }
+    else if (stmt->type==STMT_CONTINUE){
+        char *continue_label=make_loop_target("continue",stmt->loop_label);
+        emit_tacky_jump(inst_list,continue_label);
+    }
+    else if (stmt->type==STMT_WHILE){
+        char *continue_label=make_loop_target("continue",stmt->loop_label);
+        char *break_label=make_loop_target("break",stmt->loop_label);
+
+        emit_tacky_label(inst_list,continue_label);
+        
+        TackyVal *cond=gen_tacky_exp(stmt->while_stmt.condition,inst_list);
+        emit_tacky_jz(inst_list,cond,break_label);
+
+        gen_tacky_statement(stmt->while_stmt.body,inst_list);
+
+        emit_tacky_jump(inst_list,continue_label);
+        emit_tacky_label(inst_list,break_label);
+    }
+    else if (stmt->type==STMT_DO_WHILE){
+        char *start_label=make_loop_target("start",stmt->loop_label);
+        char *continue_label=make_loop_target("continue",stmt->loop_label);
+        char *break_label=make_loop_target("break",stmt->loop_label);
+
+        emit_tacky_label(inst_list,start_label);
+
+        gen_tacky_statement(stmt->do_while_stmt.body,inst_list);
+
+        emit_tacky_label(inst_list,continue_label);
+
+        TackyVal *cond=gen_tacky_exp(stmt->do_while_stmt.condition,inst_list);
+        emit_tacky_jnz(inst_list,cond,start_label);
+
+        emit_tacky_label(inst_list,break_label);
+
+    }
+    else if (stmt->type==STMT_FOR){
+        char *start_label=make_loop_target("start",stmt->loop_label);
+        char *continue_label=make_loop_target("continue",stmt->loop_label);
+        char *break_label=make_loop_target("break",stmt->loop_label);
+
+        gen_tacky_for_init(stmt->for_stmt.init,inst_list);
+
+        emit_tacky_label(inst_list,start_label);
+
+        if (stmt->for_stmt.condition){
+            TackyVal *cond=gen_tacky_exp(stmt->for_stmt.condition,inst_list);
+            emit_tacky_jz(inst_list,cond,break_label);
+        }
+
+        gen_tacky_statement(stmt->for_stmt.body,inst_list);
+
+        emit_tacky_label(inst_list,continue_label);
+
+        if (stmt->for_stmt.post){
+            (void)gen_tacky_exp(stmt->for_stmt.post,inst_list);
+        }
+
+        emit_tacky_jump(inst_list,start_label);
+        emit_tacky_label(inst_list,break_label);
+    }
 }
 
 // let Declaration turn to TACKY (only have init value need to generate)
@@ -2512,6 +2585,56 @@ const char *cond_to_str(CondCode c){
         case COND_L: return "l";
         case COND_LE: return "le";
         default: return "";
+    }
+}
+
+
+static char *make_loop_target(const char *kind,const char *loop_id){
+    size_t len=strlen(kind)+1+strlen(loop_id)+1;
+    char *name=malloc(len);
+    snprintf(name,len,"%s_%s",kind,loop_id);
+    return name;
+}
+
+static void emit_tacky_label(TackyInstruction **inst_list,const char *label){
+    TackyInstruction *inst=calloc(1,sizeof(TackyInstruction));
+    inst->type=TACKY_INST_LABEL;
+    inst->label_name=strdup(label);
+    append_tacky_inst(inst_list,inst);
+}
+
+static void emit_tacky_jump(TackyInstruction **inst_list,const char *label){
+    TackyInstruction *inst=calloc(1,sizeof(TackyInstruction));
+    inst->type=TACKY_INST_JUMP;
+    inst->label_name=strdup(label);
+    append_tacky_inst(inst_list,inst);
+}
+
+static void emit_tacky_jz(TackyInstruction **inst_list,TackyVal *cond,const char *label){
+    TackyInstruction *inst=calloc(1,sizeof(TackyInstruction));
+    inst->type=TACKY_INST_JZ;
+    inst->src=cond;
+    inst->label_name=strdup(label);
+    append_tacky_inst(inst_list,inst);
+}
+
+static void emit_tacky_jnz(TackyInstruction **inst_list,TackyVal *cond,const char *label){
+    TackyInstruction *inst=calloc(1,sizeof(TackyInstruction));
+    inst->type=TACKY_INST_JNZ;
+    inst->src=cond;
+    inst->label_name=strdup(label);
+    append_tacky_inst(inst_list,inst);
+}
+
+static void gen_tacky_for_init(ForInit *init,TackyInstruction **inst_list){
+    if (!init) return;
+
+    if (init->type==FOR_INIT_DECL){
+        gen_tacky_decl(init->decl,inst_list);
+    }else{
+        if (init->exp){
+            (void)gen_tacky_exp(init->exp,inst_list);
+        }
     }
 }
 
