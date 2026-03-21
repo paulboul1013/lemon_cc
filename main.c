@@ -166,6 +166,11 @@ typedef enum {
     STMT_WHILE,
     STMT_DO_WHILE,
     STMT_FOR,   
+
+    STMT_SWITCH,
+    STMT_CASE,
+    STMT_DEFAULT,
+    
 }StmtType;
 
 typedef struct {
