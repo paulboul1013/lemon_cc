@@ -170,7 +170,7 @@ typedef enum {
     STMT_SWITCH,
     STMT_CASE,
     STMT_DEFAULT,
-    
+
 }StmtType;
 
 typedef struct {
@@ -194,6 +194,11 @@ typedef enum {
     BI_DECL
 } BlockItemType;
 
+typedef struct SwitchCaseInfo{
+    int value;
+    char *label;
+    struct SwitchCaseInfo *next;
+}SwitchCaseInfo;
 
 typedef struct BlockItem BlockItem;
 typedef struct Statement{
