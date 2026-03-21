@@ -1010,12 +1010,29 @@ Statement *parse_switch_statement(){
 
     Statement *body=parse_statement();
 
-    Statement *s=malloc(sizeof(Statement));
+    Statement *s=calloc(1,sizeof(Statement));
     s->type=STMT_SWITCH;
     s->switch_stmt.control=cond;
     s->switch_stmt.body=body;
     s->switch_stmt.cases=NULL;
-    s->switch_stmt.default_case=NULL;
+    s->switch_stmt.default_label=NULL;
+
+    return s;
+}
+
+Statement *parse_case_statement(){
+    expect(TOK_CASE);
+
+    Exp *value_exp=parse_exp(0);
+    expect(TOK_COLON);
+
+    Statement *body=parse_statement();
+
+    Statement *s=calloc(1,sizeof(Statement));
+    s->type=STMT_CASE;
+    s->case_stmt.value_exp=value_exp;
+    s->case_stmt.body=body;
+    s->case_stmt.case_label=NULL;
 
     return s;
 }
