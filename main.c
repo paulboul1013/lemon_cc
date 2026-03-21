@@ -1037,6 +1037,20 @@ Statement *parse_case_statement(){
     return s;
 }
 
+Statement *parse_default_statement(){
+    expect(TOK_DEFAULT);
+    expect(TOK_COLON);
+
+    Statement *body=parse_statement();
+
+    Statement *s=calloc(1,sizeof(Statement));
+    s->type=STMT_DEFAULT;
+    s->default_stmt.body=body;
+    s->default_stmt.default_label=NULL;
+
+    return s;
+}
+
 // binary operators (precedence handled by parse_exp)
 //
 // assignment
