@@ -1002,6 +1002,24 @@ Statement *parse_for_statement(){
     return s;
 }
 
+Statement *parse_switch_statement(){
+    expect(TOK_SWITCH);
+    expect(TOK_LPAREN);
+    Exp *cond=parse_exp(0);
+    expect(TOK_RPAREN);
+
+    Statement *body=parse_statement();
+
+    Statement *s=malloc(sizeof(Statement));
+    s->type=STMT_SWITCH;
+    s->switch_stmt.control=cond;
+    s->switch_stmt.body=body;
+    s->switch_stmt.cases=NULL;
+    s->switch_stmt.default_case=NULL;
+
+    return s;
+}
+
 // binary operators (precedence handled by parse_exp)
 //
 // assignment
