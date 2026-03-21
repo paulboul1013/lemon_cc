@@ -1219,6 +1219,18 @@ Statement *parse_statement() {
         return parse_for_statement();
     }
 
+    if (peek().type==TOK_SWITCH){
+        return parse_while_statement();
+    }
+
+    if (peek().type==TOK_CASE){
+        return parse_case_statement();
+    }
+
+    if (peek().type==TOK_DEFAULT){
+        return parse_default_statement();
+    }
+
     Statement *s=malloc(sizeof(Statement));
 
     if (peek().type==TOK_RETURN){
