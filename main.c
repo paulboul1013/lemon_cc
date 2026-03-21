@@ -235,6 +235,27 @@ typedef struct Statement{
     char *loop_label;
     /*for goto label
                 label:        */
+
+    struct {
+        Exp *control;
+        struct Statement *body;
+        SwitchCaseInfo *cases;
+        char *default_label;
+    } switch_stmt;
+
+    struct {
+        Exp *value_exp; //origin case expresion
+        int value;      // semantic pass calculate constant value
+        struct Statement *body;
+        char *case_label; // TACKY or asm use inner label
+    } case_stmt;
+
+    struct {
+        struct Statement *body;
+        char *default_label; // TACKY or asm use inner label
+    } default_stmt;
+
+
 } Statement;
 
 
