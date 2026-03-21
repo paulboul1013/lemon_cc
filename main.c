@@ -852,6 +852,10 @@ Statement *parse_for_statement();
 Statement *parse_do_while_statement();
 Statement *parse_while_statement();
 
+Statement *parse_switch_statement();
+Statement *parse_case_statement();
+Statement *parse_default_statement();
+
 
 typedef struct IdentifierMap{
     char *user_name;
