@@ -584,6 +584,10 @@ TokenType check_keyword(const char *s){
     if (strcmp(s,"break")==0) return TOK_BREAK;
     if (strcmp(s,"continue")==0) return TOK_CONTINUE;
 
+    if (strcmp(s,"switch")) return TOK_SWITCH;
+    if (strcmp(s,"case")) return TOK_CASE;
+    if (strcmp(s,"default")) return TOK_DEFAULT;
+
     return TOK_IDENTIFIER;
 }
 
