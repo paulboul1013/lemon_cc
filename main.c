@@ -1712,59 +1712,70 @@ void resolve_block_items(BlockItem **items,int count,IdentifierMap **map){
     }
 }
 
-void label_block_items(BlockItem **items,int count ,char *current_loop_label){
+void label_block_items(BlockItem **items,int count ,char *current_break_label,char *current_continue_label){
     for(int i=0;i<count;i++){
         BlockItem *bi=items[i];
         if (bi->type==BI_STMT){
-            label_statement(bi->stmt,current_loop_label);
+            label_statement(bi->stmt,current_break_label,current_continue_label);
         }
     }
 }
 
-void label_statement(Statement *stmt,char *current_loop_label){
+void label_statement(Statement *stmt,char *current_break_label,char *current_continue_label){
     if (!stmt) return;
 
     if (stmt->type==STMT_BREAK){
-        if (!current_loop_label){
+        if (!current_break_label){
             fprintf(stderr,"Label Error: Break statement outside of loop\n");
             exit(1);
         }
-        stmt->loop_label=strdup(current_loop_label);
+        stmt->loop_label=strdup(current_break_label);
     }
 
     else if (stmt->type==STMT_CONTINUE){
-        if (!current_loop_label){
+        if (!current_continue_label){
             fprintf(stderr, "Semantic Error: continue statement outside of loop\n");
             exit(1);
         }
-        stmt->loop_label=strdup(current_loop_label);
+        stmt->loop_label=strdup(current_continue_label);
     }
     else if (stmt->type==STMT_WHILE){
         char *new_label=make_label("loop");
         stmt->loop_label=strdup(new_label);
-        label_statement(stmt->while_stmt.body,new_label);
+        label_statement(stmt->while_stmt.body,new_label,new_label);
     }
     else if (stmt->type==STMT_DO_WHILE){
         char *new_label=make_label("loop");
         stmt->loop_label=strdup(new_label);
-        label_statement(stmt->do_while_stmt.body,new_label);
+        label_statement(stmt->do_while_stmt.body,new_label,new_label);
     }
     else if (stmt->type==STMT_FOR){
         char *new_label=make_label("loop");
         stmt->loop_label=strdup(new_label);
-        label_statement(stmt->for_stmt.body,new_label);
+        label_statement(stmt->for_stmt.body,new_label,new_label);
+    }
+    else if (stmt->type==STMT_SWITCH){
+        char *new_label=make_label("switch");
+        stmt->loop_label=strdup(new_label);
+        label_statement(stmt->switch_stmt.body,new_label,current_continue_label);
+    }
+    else if (stmt->type==STMT_CASE){
+        label_statement(stmt->case_stmt.body,current_break_label,current_continue_label);
+    }
+    else if (stmt->type==STMT_DEFAULT){
+        label_statement(stmt->default_stmt.body,current_break_label,current_continue_label);
     }
     else if (stmt->type==STMT_IF){
-        label_statement(stmt->if_stmt.then_branch,current_loop_label);
+        label_statement(stmt->if_stmt.then_branch,current_break_label,current_continue_label);
         if (stmt->if_stmt.else_branch){
-            label_statement(stmt->if_stmt.else_branch,current_loop_label);
+            label_statement(stmt->if_stmt.else_branch,current_break_label,current_continue_label);
         }
     }
     else if (stmt->type==STMT_LABEL){
-        label_statement(stmt->if_stmt.then_branch,current_loop_label);
+        label_statement(stmt->if_stmt.then_branch,current_break_label,current_continue_label);
     }
     else if (stmt->type==STMT_COMPOUND){
-        label_block_items(stmt->block_items,stmt->block_count,current_loop_label);
+        label_block_items(stmt->block_items,stmt->block_count,current_break_label,current_continue_label);
     }
 }
 
@@ -1793,7 +1804,7 @@ void resolve_program(Program *prog){
     }
 
     //pass 4 : label goto
-    label_block_items(prog->fn->body, prog->fn->body_count, NULL);
+    label_block_items(prog->fn->body, prog->fn->body_count, NULL,NULL);
 }
 
 // //assemble generation
