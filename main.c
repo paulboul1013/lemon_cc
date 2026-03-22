@@ -1688,6 +1688,15 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
     else if (stmt->type==STMT_BREAK || stmt->type==STMT_CONTINUE){
         return;
     }
+    else if (stmt->type==STMT_SWITCH){
+        resolve_statement(stmt->switch_stmt.body,map);
+    }
+    else if (stmt->type==STMT_CASE){
+        resolve_statement(stmt->case_stmt.body,map);
+    }
+    else if (stmt->type==STMT_DEFAULT){
+        resolve_statement(stmt->default_stmt.body,map);
+    }
 
     //don't need deal with STMT_NULL
 }
