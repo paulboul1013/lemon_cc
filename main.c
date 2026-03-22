@@ -865,8 +865,8 @@ typedef struct IdentifierMap{
 } IdentifierMap;
 
 void resolve_for_init(ForInit *init,IdentifierMap **map);
-void label_statement(Statement *stmt,char *current_loop_label);
-void label_block_items(BlockItem **items,int count,char *current_loop_label);
+void label_statement(Statement *stmt,char *current_break_label,char *current_continue_label);
+void label_block_items(BlockItem **items,int count,char *current_break_label,char *current_continue_label);
 void resolve_declaration(Declaration *decl,IdentifierMap **map);
 void resolve_expression(Exp *e,IdentifierMap *map);
 
