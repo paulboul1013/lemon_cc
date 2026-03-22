@@ -1442,6 +1442,15 @@ void check_labels_statement(Statement *stmt,LabelMap **map){
     else if (stmt->type==STMT_FOR){
         check_labels_statement(stmt->for_stmt.body,map);
     }
+    else if (stmt->type==STMT_SWITCH){
+        check_labels_statement(stmt->switch_stmt.body,map);
+    }
+    else if (stmt->type==STMT_CASE){
+        check_labels_statement(stmt->case_stmt.body,map);
+    }
+    else if (stmt->type==STMT_DEFAULT){
+        check_labels_statement(stmt->default_stmt.body,map);
+    }
 }
 
 
