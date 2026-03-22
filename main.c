@@ -1527,6 +1527,15 @@ void check_goto_statement(Statement *stmt,LabelMap *labels,IdentifierMap *vars){
     else if (stmt->type==STMT_FOR){
         check_goto_statement(stmt->for_stmt.body,labels,vars);
     }
+    else if (stmt->type==STMT_SWITCH){
+        check_goto_statement(stmt->switch_stmt.body,labels,vars);
+    }
+    else if (stmt->type==STMT_CASE){
+        check_goto_statement(stmt->case_stmt.body,labels,vars);
+    }
+    else if (stmt->type==STMT_DEFAULT){
+        check_goto_statement(stmt->default_stmt.body,labels,vars);
+    }
 }
 
 void resolve_expression(Exp *e,IdentifierMap *map){
