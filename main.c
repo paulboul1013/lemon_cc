@@ -615,9 +615,9 @@ TokenType check_keyword(const char *s){
     if (strcmp(s,"break")==0) return TOK_BREAK;
     if (strcmp(s,"continue")==0) return TOK_CONTINUE;
 
-    if (strcmp(s,"switch")) return TOK_SWITCH;
-    if (strcmp(s,"case")) return TOK_CASE;
-    if (strcmp(s,"default")) return TOK_DEFAULT;
+    if (strcmp(s,"switch")==0) return TOK_SWITCH;
+    if (strcmp(s,"case")==0) return TOK_CASE;
+    if (strcmp(s,"default")==0) return TOK_DEFAULT;
 
     return TOK_IDENTIFIER;
 }
@@ -1220,7 +1220,7 @@ Statement *parse_statement() {
     }
 
     if (peek().type==TOK_SWITCH){
-        return parse_while_statement();
+        return parse_switch_statement();
     }
 
     if (peek().type==TOK_CASE){
@@ -1689,6 +1689,7 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
         return;
     }
     else if (stmt->type==STMT_SWITCH){
+        resolve_expression(stmt->switch_stmt.control,map);
         resolve_statement(stmt->switch_stmt.body,map);
     }
     else if (stmt->type==STMT_CASE){
@@ -1949,6 +1950,10 @@ void collect_switch_cases_statement(Statement *stmt,Statement *current_switch){
 
         case STMT_FOR:
             collect_switch_cases_statement(stmt->for_stmt.body,current_switch);
+            return;
+
+        case STMT_DO_WHILE:
+            collect_switch_cases_statement(stmt->do_while_stmt.body,current_switch);
             return;
 
         default:
