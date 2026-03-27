@@ -2844,6 +2844,35 @@ void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
     }
 }
 
+static void emit_switch_dispatch(
+    TackyInstruction **inst_list,
+    TackyVal *control,
+    SwitchCaseInfo *cases,
+    const char *default_label,
+    const char *break_label
+){
+    for(SwitchCaseInfo *c=cases;c;c=c->next){
+        TackyVal *is_match=tacky_val_var(make_temporary());
+        
+        TackyInstruction *cmp=calloc(1,sizeof(TackyInstruction));
+        cmp->type=TACKY_INST_BINARY;
+        cmp->binary_op=BINARY_EQ;
+        cmp->src=control;
+        cmp->src2=tacky_val_constant(c->value);
+        cmp->dst=is_match;
+        append_tacky_inst(inst_list,cmp);
+
+        emit_tacky_jnz(inst_list,is_match,c->label);
+        
+    }
+
+    if (default_label){
+        emit_tacky_jump(inst_list,default_label);
+    }else{
+        emit_tacky_jump(inst_list,break_label);
+    }
+}
+
 // let Declaration turn to TACKY (only have init value need to generate)
 void gen_tacky_decl(Declaration *decl,TackyInstruction **inst_list){
     if (decl->init){
