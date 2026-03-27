@@ -1856,6 +1856,22 @@ static int switch_case_exists(SwitchCaseInfo *cases,int value){
     return 0;
 }
 
+static void add_switch_case(Statement *switch_stmt,int value,const char *label){
+    SwitchCaseInfo *node=calloc(1,sizeof(SwitchCaseInfo));
+    node->value=value;
+    node->label=strdup(label);
+    node->next=NULL;
+
+    if (!switch_stmt->switch_stmt.cases){
+        switch_stmt->switch_stmt.cases=node;
+        return;
+    }
+
+    SwitchCaseInfo *curr=switch_stmt->switch_stmt.cases;
+    while(curr->next) curr=curr->next;
+    curr->next=node;
+}
+
 void resolve_program(Program *prog){
     IdentifierMap *map=NULL;
     LabelMap *labels=NULL;
