@@ -2375,7 +2375,13 @@ static void emit_tacky_jump(TackyInstruction **inst_list,const char *label);
 static void emit_tacky_jz(TackyInstruction **inst_list,TackyVal *cond,const char *label);
 static void emit_tacky_jnz(TackyInstruction **inst_list,TackyVal *cond,const char *label);
 static void gen_tacky_for_init(ForInit *init,TackyInstruction **inst_list);
-
+static void emit_switch_dispatch(
+    TackyInstruction **inst_list,
+    TackyVal *control,
+    SwitchCaseInfo *cases,
+    const char *default_label,
+    const char *break_label
+);
 
 // Generate TACKY IR for <expression>
 //
@@ -2841,6 +2847,31 @@ void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
 
         emit_tacky_jump(inst_list,start_label);
         emit_tacky_label(inst_list,break_label);
+    }
+    else if (stmt->type==STMT_SWITCH){
+        char *break_label=make_loop_target("break",stmt->loop_label);
+        
+        TackyVal *control=gen_tacky_exp(stmt->switch_stmt.control,inst_list);
+
+        emit_switch_dispatch(
+            inst_list,
+            control,
+            stmt->switch_stmt.cases,
+            stmt->switch_stmt.default_label,
+            break_label
+        );
+
+        gen_tacky_statement(stmt->switch_stmt.body,inst_list);
+
+        emit_tacky_label(inst_list,break_label);
+    }
+    else if (stmt->type==STMT_CASE){
+        emit_tacky_label(inst_list,stmt->case_stmt.case_label);
+        gen_tacky_statement(stmt->case_stmt.body,inst_list);
+    }
+    else if (stmt->type==STMT_DEFAULT){
+        emit_tacky_label(inst_list,stmt->default_stmt.default_label);
+        gen_tacky_statement(stmt->default_stmt.body,inst_list);
     }
 }
 
