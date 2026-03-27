@@ -1872,6 +1872,99 @@ static void add_switch_case(Statement *switch_stmt,int value,const char *label){
     curr->next=node;
 }
 
+void collect_switch_cases_block_items(BlockItem **items,int count,Statement *current_switch);
+
+void collect_switch_cases_statement(Statement *stmt,Statement *current_switch){
+    if (!stmt) return;
+
+    switch (stmt->type){
+        case STMT_SWITCH:
+            stmt->switch_stmt.cases=NULL;
+            stmt->switch_stmt.default_label=NULL;
+            collect_switch_cases_statement(stmt->switch_stmt.body,stmt);
+            return;
+
+        case STMT_CASE: {
+            if (!current_switch){
+                fprintf(stderr, "Semantic Error: case label outside of switch\n");
+                exit(1);
+            }
+
+            int value;
+            if (!eval_const_expr(stmt->case_stmt.value_exp,&value)){
+                fprintf(stderr, "Semantic Error: case label outside of switch\n");
+                exit(1);
+            }
+
+            if (switch_case_exists(current_switch->switch_stmt.cases,value)){
+                fprintf(stderr, "Semantic Error: case label is not an integer constant expression\n");
+                exit(1);
+            }
+
+            stmt->case_stmt.value=value;
+            stmt->case_stmt.case_label=make_label("case");
+            add_switch_case(current_switch,value,stmt->case_stmt.case_label);
+
+            collect_switch_cases_statement(stmt->case_stmt.body,current_switch);
+            return;
+        }
+
+        case STMT_DEFAULT:{
+            if (!current_switch){
+                fprintf(stderr, "Semantic Error: default label outside of switch\n");
+                exit(1);
+            }
+
+            if (current_switch->switch_stmt.default_label){
+                fprintf(stderr, "Semantic Error: default label outside of switch\n");
+                exit(1);
+            }
+
+            stmt->default_stmt.default_label=make_label("default");
+            current_switch->switch_stmt.default_label=strdup(stmt->default_stmt.default_label);
+
+            collect_switch_cases_statement(stmt->default_stmt.body,current_switch);
+            return;
+
+        }
+
+        case STMT_IF:
+            collect_switch_cases_statement(stmt->if_stmt.then_branch,current_switch);
+            if (stmt->if_stmt.else_branch){
+                collect_switch_cases_statement(stmt->if_stmt.else_branch,current_switch);
+            }
+            return;
+
+        case STMT_LABEL:
+            collect_switch_cases_statement(stmt->if_stmt.then_branch,current_switch);
+            return;
+
+        case STMT_COMPOUND:
+            collect_switch_cases_block_items(stmt->block_items,stmt->block_count,current_switch);
+            return;
+
+        case STMT_WHILE:
+            collect_switch_cases_statement(stmt->while_stmt.body,current_switch);
+            return;
+
+        case STMT_FOR:
+            collect_switch_cases_statement(stmt->for_stmt.body,current_switch);
+            return;
+
+        default:
+            return;
+    }
+}
+
+void collect_switch_cases_block_items(BlockItem **items,int count ,Statement *current_switch){
+    for (int i=0;i<count;i++){
+        BlockItem *bi=items[i];
+        if (bi->type==BI_STMT){
+            collect_switch_cases_statement(bi->stmt,current_switch);
+        }
+    }
+}
+
 void resolve_program(Program *prog){
     IdentifierMap *map=NULL;
     LabelMap *labels=NULL;
@@ -1900,7 +1993,7 @@ void resolve_program(Program *prog){
     label_block_items(prog->fn->body, prog->fn->body_count, NULL,NULL);
 
     //pass 5: collect case/default labels for every switch
-    
+    collect_switch_cases_block_items(prog->fn->body,prog->fn->body_count,NULL);
 }
 
 // //assemble generation
