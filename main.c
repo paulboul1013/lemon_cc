@@ -1779,6 +1779,75 @@ void label_statement(Statement *stmt,char *current_break_label,char *current_con
     }
 }
 
+//collect case/default 
+static int eval_const_expr(Exp *e,int *out){
+    if (!e) {
+        return 0;
+    }
+
+    switch(e->type){
+        case EXP_CONSTANT:
+            *out=e->int_value;
+            return 1;
+
+        case EXP_UNARY: {
+            int v;
+            if (!eval_const_expr(e->unary.exp,&v)) return 0;
+
+            switch (e->unary.op){
+                case UNARY_NEGATION: *out=-v; return 1;
+                case UNARY_COMPLEMENT: *out=~v; return 1;
+                case UNARY_NOT: *out=!v; return 1;
+            }
+            
+            return 0;
+        }
+
+        case EXP_BINARY:{
+            int l,r;
+            if (!eval_const_expr(e->binary.left,&l)) return 0;
+            if (!eval_const_expr(e->binary.right,&r)) return 0;
+
+            switch (e->binary.op){
+                case BINARY_ADD : *out=l+r; return 1;
+                case BINARY_SUB: *out=l-r; return 1;
+                case BINARY_MULT: *out=l*r; return 1;
+                case BINARY_DIV: if (r==0) return 0; *out=l/r; return 1;
+                case BINARY_REM: if (r==0) return 0; *out=l%r; return 1;
+
+                case BINARY_LSHIFT: *out=l<<r; return 1;
+                case BINARY_RSHIFT: *out=l>>r; return 1;
+                
+                case BINARY_BITWISE_AND: *out=l&r; return 1;
+                case BINARY_BITWISE_OR: *out=l|r; return 1;
+                case BINARY_BITWISE_XOR: *out=l^r; return 1;
+
+                case BINARY_LOGICAL_AND: *out=(l&&r); return 1;
+                case BINARY_LOGICAL_OR: *out=(l||r); return 1;
+
+                case BINARY_EQ: *out=(l==r); return 1;
+                case BINARY_NEQ: *out=(l!=r); return 1;
+                case BINARY_LT: *out=(l<r); return 1;
+                case BINARY_LTE: *out = (l <= r); return 1;
+                case BINARY_GT: *out = (l > r); return 1;
+                case BINARY_GTE: *out = (l >= r); return 1;
+            }
+
+            return 0;
+        }
+
+        case EXP_CONDITIONAL:{
+            int cond;
+            if (!eval_const_expr(e->conditional.condition,&cond)) return 0;
+            if (cond) return eval_const_expr(e->conditional.true_expr,out);
+            return eval_const_expr(e->conditional.false_expr,out);
+        }
+
+        default:
+            return 0;
+    }
+}
+
 void resolve_program(Program *prog){
     IdentifierMap *map=NULL;
     LabelMap *labels=NULL;
