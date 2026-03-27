@@ -1779,7 +1779,7 @@ void label_statement(Statement *stmt,char *current_break_label,char *current_con
     }
 }
 
-//collect case/default 
+//eval case/default expression
 static int eval_const_expr(Exp *e,int *out){
     if (!e) {
         return 0;
@@ -1848,6 +1848,14 @@ static int eval_const_expr(Exp *e,int *out){
     }
 }
 
+static int switch_case_exists(SwitchCaseInfo *cases,int value){
+    while(cases){
+        if (cases->value==value) return 1;
+        cases=cases->next;
+    }
+    return 0;
+}
+
 void resolve_program(Program *prog){
     IdentifierMap *map=NULL;
     LabelMap *labels=NULL;
@@ -1872,8 +1880,11 @@ void resolve_program(Program *prog){
         }
     }
 
-    //pass 4 : label goto
+    //pass 4 : annotate break / continue /switch break targets
     label_block_items(prog->fn->body, prog->fn->body_count, NULL,NULL);
+
+    //pass 5: collect case/default labels for every switch
+    
 }
 
 // //assemble generation
