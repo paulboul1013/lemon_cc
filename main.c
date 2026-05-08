@@ -24,6 +24,7 @@ typedef  enum{
     TOK_IDENTIFIER, TOK_CONSTANT,
     TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
     TOK_SEMICOLON, 
+    TOK_COMMA,
     
     TOK_QUESTION, //?
     TOK_COLON, //:
@@ -705,6 +706,9 @@ void lex(const char *input){
                 break;
             case ';':
                 add_token(TOK_SEMICOLON,NULL);
+                break;
+            case ',':
+                add_token(TOK_COMMA,NULL);
                 break;
             case '?':
                 add_token(TOK_QUESTION,NULL);
