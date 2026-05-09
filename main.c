@@ -90,6 +90,7 @@ typedef enum {
     EXP_PREFIX_OP, //++a,--a
     EXP_POSTFIX_OP, //a++,a--
     EXP_CONDITIONAL,
+    EXP_FUNCTION_CALL,
 }ExpType;
 
 typedef enum {
@@ -144,6 +145,12 @@ typedef struct Exp {
             struct Exp *true_expr;
             struct Exp *false_expr;
         } conditional;
+
+        struct {
+            char *name;
+            struct Exp **args;
+            int arg_count;
+        } function_call;
     };
 } Exp;
 
@@ -192,7 +199,8 @@ typedef struct {
 
 typedef enum {
     BI_STMT,
-    BI_DECL
+    BI_DECL,
+    BI_FUN_DECL
 } BlockItemType;
 
 typedef struct SwitchCaseInfo{
@@ -201,6 +209,7 @@ typedef struct SwitchCaseInfo{
     struct SwitchCaseInfo *next;
 }SwitchCaseInfo;
 
+typedef struct Function Function;
 typedef struct BlockItem BlockItem;
 typedef struct Statement{
     StmtType type;
@@ -265,16 +274,27 @@ typedef struct BlockItem{
     union {
         Statement *stmt;
         Declaration *decl;
+        Function *fun_decl;
     };
 } BlockItem;
 
-typedef struct {
+typedef struct Function {
     char *name; 
+
+    char **params;
+    int param_count;
+
     BlockItem **body; 
     int body_count;
+
+    int has_body; //1= function definition, 0 = function declaration
 } Function;
 
-typedef struct {Function *fn;} Program;
+typedef struct {
+    Function *fn; //keep it，avoid crash
+    Function **functions; //chapter 9 program = function_declaration*
+    int function_count;
+} Program;
 
 
 
@@ -336,6 +356,15 @@ Exp *make_inc_dec_exp(ExpType type,int is_increment,Exp *lvalue){
     e->type=type;
     e->inc_dec.lvalue=lvalue;
     e->inc_dec.is_increment=is_increment;
+    return e;
+}
+
+Exp *make_function_call_exp(char *name, Exp **args,int arg_count){
+    Exp *e=malloc(sizeof(Exp));
+    e->type=EXP_FUNCTION_CALL;
+    e->function_call.name=strdup(name);
+    e->function_call.args=args;
+    e->function_call.arg_count=arg_count;
     return e;
 }
 
@@ -848,7 +877,11 @@ Token take() {return token_list[token_pos++];}
 Exp *parse_exp(int min_prec);
 Exp *parse_factor();
 Statement *parse_statement();
-Declaration *parse_declaration();
+
+Declaration *parse_declaration(); //variable declaration only
+Function *parse_function_declaration(); //function declaration / definition
+BlockItem *parse_block_item();
+
 
 Exp *parse_optional_exp(TokenType end_token);
 ForInit *parse_for_init();
@@ -896,31 +929,92 @@ void resolve_for_init(ForInit *init,IdentifierMap **map){
     }
 }
 
+int is_function_declaration_start() {
+    return peek().type==TOK_INT
+        && token_list[token_pos+1].type==TOK_IDENTIFIER
+        && token_list[token_pos+2].type==TOK_LPAREN;
+}
+
+BlockItem *parse_block_item() {
+    BlockItem *bi=calloc(1,sizeof(BlockItem));
+
+    if (peek().type==TOK_INT) {
+        if (is_function_declaration_start()) {
+            bi->type=BI_FUN_DECL;
+            bi->fun_decl=parse_function_declaration();
+        } else {
+            bi->type=BI_DECL;
+            bi->decl=parse_declaration();
+        }
+    } else {
+        bi->type=BI_STMT;
+        bi->stmt=parse_statement();
+    }
+
+    return bi;
+}
+
 Statement *parse_block(){
     expect(TOK_LBRACE);
     
     Statement *s=malloc(sizeof(Statement));
     s->type=STMT_COMPOUND;
 
-    s->block_items=malloc(sizeof(BlockItem*)*100);
+    s->block_items=NULL;
     s->block_count=0;
 
     while(peek().type!=TOK_RBRACE){
-        BlockItem *bi=malloc(sizeof(BlockItem));
+        BlockItem *bi= parse_block_item();
 
-        if (peek().type==TOK_INT){
-            bi->type=BI_DECL;
-            bi->decl=parse_declaration();
-        }else{
-            bi->type=BI_STMT;
-            bi->stmt=parse_statement();
-        }
+        s->block_items=realloc(
+            s->block_items,
+            sizeof(BlockItem*) * (s->block_count+1)
+        );
 
         s->block_items[s->block_count++]=bi;
     }
 
     expect(TOK_RBRACE);
     return s;
+}
+
+char **parse_param_list(int *out_count) {
+    char **params=NULL;
+    int count=0;
+
+    if (peek().type == TOK_VOID) {
+        take();
+        *out_count=0;
+        return NULL;
+    }
+
+    if (peek().type!=TOK_INT) {
+        fprintf(stderr,"Parse Error: expected parameter list\n");
+        exit(1);
+    }
+
+    while (1) {
+        expect(TOK_INT);
+
+        Token id = take();
+        if (id.type!=TOK_IDENTIFIER) {
+            fprintf(stderr, "Parse Error: expected parameter name\n");
+            exit(1);
+        }
+
+        params=realloc(params,sizeof(char*) * (count+1));
+        params[count++]=strdup(id.value);
+
+        if (peek().type==TOK_COMMA) {
+            take();
+            continue;
+        }
+
+        break;
+    }
+
+    *out_count=count;
+    return params;
 }
 
 Exp *parse_optional_exp(TokenType end_token){
@@ -1122,6 +1216,34 @@ Exp *parse_exp(int min_prec){
    return left;
 } 
 
+Exp **parse_argument_list(int *out_count) {
+    Exp **args=NULL;
+    int count=0;
+
+    if (peek().type==TOK_RPAREN) {
+        *out_count=0;
+        return NULL;
+    }
+
+    while (1) {
+        Exp *arg=parse_exp(0);
+        
+        args=realloc(args,sizeof(Exp*)*(count+1));
+        args[count++]=arg;
+
+        if (peek().type==TOK_COMMA) {
+            take();
+            continue;
+        }
+
+        break;
+    }
+
+    
+    *out_count=count;
+    return args;
+}
+
 //deal with number and parentheses and unary operator
 //note:unary operator make sure higher precedence than binary operator
 // <factor> ::= <constant>
@@ -1149,7 +1271,21 @@ Exp *parse_factor(){
     }
     else if (t.type==TOK_IDENTIFIER){
         take();
-        inner=make_var_exp(t.value);
+
+        if (peek().type==TOK_LPAREN){
+            take(); //comsume '('
+            
+            int arg_count=0;
+            Exp **args=parse_argument_list(&arg_count);
+
+            expect(TOK_RPAREN);
+
+            inner=make_function_call_exp(t.value,args,arg_count);
+            
+        } else{
+            inner=make_var_exp(t.value);
+        }
+
     }
     else if (t.type==TOK_NEGATION || t.type==TOK_COMPLEMENT || t.type==TOK_LOGICAL_NOT){
         take();
@@ -1348,6 +1484,58 @@ Declaration *parse_declaration(){
     return d;
 }
 
+Function *parse_function_declaration() {
+    expect(TOK_INT);
+
+    Token id = take();
+    if (id.type!= TOK_IDENTIFIER) {
+        fprintf(stderr, "Parse Error: Expected function name\n");
+        exit(1);
+    }
+
+    expect(TOK_LPAREN);
+
+    int param_count=0;
+    char **params = parse_param_list(&param_count);
+
+    expect(TOK_RPAREN);
+
+    Function *f=calloc(1,sizeof(Function));
+    f->name=strdup(id.value);
+    f->params=params;
+    f->param_count = param_count;
+    f->body=NULL;
+    f->body_count=0;
+    f->has_body=0;
+
+    if (peek().type==TOK_SEMICOLON) {
+        take();
+        return f;
+    }
+
+    if (peek().type!=TOK_LBRACE) {
+        fprintf(stderr,"Parse Error: expected function body or ';'\n");
+        exit(1);
+    }
+
+    take(); //comsume '{'
+
+    f->has_body=1;
+
+    while(peek().type!=TOK_RBRACE) {
+        BlockItem *bi= parse_block_item();
+
+        f->body = realloc(f->body,sizeof(BlockItem*) * (f->body_count+1));
+
+        f->body[f->body_count++] = bi;
+    }
+
+    expect(TOK_RBRACE);
+
+    return f;
+}
+
+//keep it old parse_function()
 // <function> ::= "int" <identifier> "(" "void" ")" "{" { <block_item> } "}"
 //
 // <block_item> ::= <declaration> | <statement>
@@ -1385,9 +1573,24 @@ Function *parse_function() {
 
 // <program> ::= <function> EOF
 Program *parse_program() {
-    Program *prog=malloc(sizeof(Program));
-    prog->fn=parse_function();
-    if (peek().type!=TOK_EOF) exit(1); //make sure not extra tokens
+    Program *prog=calloc(1,sizeof(Program));
+    prog->functions=NULL;
+    prog->function_count=0;
+    prog->fn=NULL;
+
+    while(peek().type!=TOK_EOF){
+        Function *fn = parse_function_declaration();
+
+        prog->functions = realloc(prog->functions,sizeof(Function*) * (prog->function_count+1));
+
+        prog->functions[prog->function_count++]=fn;
+    
+
+        if (prog->fn==NULL || (!prog->fn->has_body && fn->has_body)) {
+            prog->fn=fn;
+        }
+    }
+
     return prog;
 }
 
