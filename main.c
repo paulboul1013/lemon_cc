@@ -3864,6 +3864,53 @@ void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_l
     }
 }
 
+TackyFunction *generate_tacky_function(Function *fn) {
+    if (!fn || !fn->has_body) {
+        return NULL;
+    }
+
+    TackyFunction *t_fn= calloc(1,sizeof(TackyFunction));
+
+    t_fn->name = strdup(fn->name);
+    t_fn->param_count = fn->param_count;
+    t_fn->instructions = NULL;
+
+    //copy function paramters
+
+    if (fn->param_count > 0){
+        t_fn->param_count = calloc(
+            (size_t)fn->param_count,
+            sizeof(char*)
+        );
+
+        for(int i=0;i<fn->param_count;i++) {
+            t_fn->params[i] = strdup(fn->params[i]);
+        }
+    }
+    else{
+        t_fn->params = NULL;
+    }
+
+    gen_tacky_block_items(
+        fn->body,
+        fn->body_count,
+        &t_fn->instructions
+    );
+
+    //Add return(0) in the end of function
+    TackyInstruction *final_inst = calloc(1,sizeof(TackyInstruction));
+
+    final_inst->type = TACKY_INST_RETURN;
+    final_inst->src = tacky_val_constant(0);
+
+    append_tacky_inst(
+        &t_fn->instructions,
+        final_inst
+    );
+
+    return t_fn;
+}
+
 TackyProgram *generate_tacky(Program *prog){
     TackyProgram *t_prog=malloc(sizeof(TackyProgram));
     t_prog->function_name=strdup(prog->fn->name);
