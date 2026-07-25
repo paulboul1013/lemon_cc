@@ -581,6 +581,17 @@ typedef struct TackyInstruction{
 } TackyInstruction;
 
 typedef struct {
+    char *name;
+    char **params;
+    int param_count;
+    TackyInstruction *instructions;
+} TackyFunction;
+
+typedef struct {
+    TackyFunction **functions;
+    int function_count;
+
+    //keep old format，let old version assembly backend can compile
     char *function_name;
     TackyInstruction *instructions;
 } TackyProgram;
