@@ -561,6 +561,7 @@ typedef enum {
     TACKY_INST_JZ,
     TACKY_INST_JNZ,
     TACKY_INST_LABEL
+    TACKY_INST_FUN_CALL
 } TackyInstType;
 
 typedef struct TackyInstruction{
@@ -571,6 +572,11 @@ typedef struct TackyInstruction{
     TackyVal *src2;
     TackyVal *dst;
     char *label_name;
+
+    char *fun_name;
+    TackyVal **args;
+    int arg_count;
+    
     struct TackyInstruction *next;
 } TackyInstruction;
 
