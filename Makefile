@@ -1,7 +1,7 @@
 all: main
 
 main:main.c
-	gcc -o main main.c
+	gcc -o main main.c -Wall -Wextra
 
 clean:
 	rm -f main *.o
