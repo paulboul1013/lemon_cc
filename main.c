@@ -3948,6 +3948,7 @@ TackyProgram *generate_tacky(Program *prog){
         }
 
         t_prog->functions[t_prog->function_count] = t_fn;
+        t_prog->function_count++;
     }
 
     
