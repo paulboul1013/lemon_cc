@@ -3921,6 +3921,18 @@ TackyProgram *generate_tacky(Program *prog){
     t_prog->function_name=strdup(prog->fn->name);
     t_prog->instructions=NULL;
 
+    TackyFunction **new_functions= realloc(
+        t_prog->functions,
+        sizeof(TackyFunction*) * (size_t)(t_prog->function_count+1)
+    );
+
+    if (!new_functions) {
+        perror("realloc TACKY function fail");
+        exit(1);
+    }
+
+    t_prog->functions = new_functions;
+
     //program includes many top function delcation and definiation
     for(int i=0;i<prog->function_count;i++) {
         Function *fn = prog->functions[i];
