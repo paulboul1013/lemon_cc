@@ -560,7 +560,7 @@ typedef enum {
     TACKY_INST_JUMP,
     TACKY_INST_JZ,
     TACKY_INST_JNZ,
-    TACKY_INST_LABEL
+    TACKY_INST_LABEL,
     TACKY_INST_FUN_CALL
 } TackyInstType;
 
