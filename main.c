@@ -3269,6 +3269,7 @@ void fix_and_allocate(AsmProg *asmp){
 void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_list);
 void gen_tacky_decl(Declaration *decl,TackyInstruction **inst_list);
 void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list);
+static TackyFunction *generate_tacky_function(Function *fn);
 static char *make_loop_target(const char *kind,const char *loop_id);
 static void emit_tacky_label(TackyInstruction **inst_list,const char *label);
 static void emit_tacky_jump(TackyInstruction **inst_list,const char *label);
