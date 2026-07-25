@@ -3916,7 +3916,7 @@ TackyProgram *generate_tacky(Program *prog){
         return NULL;
     }
 
-    TackyProgram *t_prog=malloc(sizeof(TackyProgram));
+    TackyProgram *t_prog=calloc(1, sizeof(TackyProgram));
 
     t_prog->function_name=strdup(prog->fn->name);
     t_prog->instructions=NULL;
