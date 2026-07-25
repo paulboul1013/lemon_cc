@@ -3854,8 +3854,11 @@ void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_l
         BlockItem *bi=items[i];
         if (bi->type==BI_STMT){
             gen_tacky_statement(bi->stmt,inst_list);
-        }else{
+        }else if (bi->type==BI_DECL){
             gen_tacky_decl(bi->decl,inst_list);
+        }
+        else if (bi->type==BI_FUN_DECL) { //only function decl not gen IR
+            continue;
         }
     }
 }
