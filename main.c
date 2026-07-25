@@ -3299,6 +3299,39 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     if (e->type==EXP_CONSTANT){
         return tacky_val_constant(e->int_value);
     }
+    else if (e->type==EXP_FUNCTION_CALL) {
+        int arg_count= e->function_call.arg_count;
+        TackyVal **args=NULL;
+
+        if (arg_count > 0) {
+            args = calloc(
+                (size_t)arg_count,
+                sizeof(TackyVal*)
+            );
+        }
+
+        //orderly calculate arguments
+        for(int i=0; i< arg_count;i++){
+            args[i]=gen_tacky_exp(
+                e->function_call.args[i],
+                inst_list
+            );
+        }
+
+        TackyVal *dst = tacky_val_var(make_temporary());
+
+        TackyInstruction *call = calloc(1,sizeof(TackyInstruction));
+
+        call->type = TACKY_INST_FUN_CALL;
+        call->fun_name = strdup(e->function_call.name);
+        call->args = args;
+        call->arg_count = arg_count;
+        call->dst = dst;
+
+        append_tacky_inst(inst_list,call);
+
+        return dst;
+    }
     else if (e->type==EXP_CONDITIONAL){
         char *false_label=make_label("cond_false");  
         char *end_label=make_label("cond_end");
