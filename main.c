@@ -3883,6 +3883,11 @@ TackyFunction *generate_tacky_function(Function *fn) {
             sizeof(char*)
         );
 
+        if (!t_fn->params) {
+            perror("calloc TACKY parameters fail");
+            exit(1);
+        }
+
         for(int i=0;i<fn->param_count;i++) {
             t_fn->params[i] = strdup(fn->params[i]);
         }
