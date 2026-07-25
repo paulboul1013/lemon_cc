@@ -3878,7 +3878,7 @@ TackyFunction *generate_tacky_function(Function *fn) {
     //copy function paramters
 
     if (fn->param_count > 0){
-        t_fn->param_count = calloc(
+        t_fn->params = calloc(
             (size_t)fn->param_count,
             sizeof(char*)
         );
@@ -3912,18 +3912,43 @@ TackyFunction *generate_tacky_function(Function *fn) {
 }
 
 TackyProgram *generate_tacky(Program *prog){
+    if (!prog) {
+        return NULL;
+    }
+
     TackyProgram *t_prog=malloc(sizeof(TackyProgram));
+
     t_prog->function_name=strdup(prog->fn->name);
     t_prog->instructions=NULL;
 
-    //travseral all BlockItem
-    gen_tacky_block_items(prog->fn->body,prog->fn->body_count,&t_prog->instructions);
+    //program includes many top function delcation and definiation
+    for(int i=0;i<prog->function_count;i++) {
+        Function *fn = prog->functions[i];
 
-    //if functio have no return，add return 0
-    TackyInstruction *final_inst=calloc(1,sizeof(TackyInstruction));
-    final_inst->type=TACKY_INST_RETURN;
-    final_inst->src=tacky_val_constant(0);
-    append_tacky_inst(&t_prog->instructions,final_inst);
+        if (!fn || !fn->has_body) {
+            continue;
+        }
+
+        TackyFunction *t_fn = generate_tacky_function(fn);
+
+        if (!t_fn) {
+            continue;
+        }
+
+        t_prog->functions[t_prog->function_count] = t_fn;
+    }
+
+    
+    if (t_prog->function_count > 0){
+        TackyFunction *first = t_prog->functions[0];
+
+        t_prog->function_name = strdup(first->name);
+
+        t_prog->instructions = first->instructions;
+    } else{
+        t_prog->function_name = NULL;
+        t_prog->instructions = NULL;
+    }
 
     return t_prog;
     
