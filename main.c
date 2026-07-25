@@ -897,7 +897,12 @@ Statement *parse_default_statement();
 typedef struct IdentifierMap{
     char *user_name;
     char *unique_name;
+    //from_current_block is represnet current scope
     int from_current_block;
+
+    // 1= have linkage for function, 0 = no linkage for local variable / parameter
+    int has_linkage;
+
     struct IdentifierMap *next;
 } IdentifierMap;
 
@@ -1610,6 +1615,524 @@ int label_exists(LabelMap *map,const char *name){
     return 0;
 }
 
+
+typedef enum {
+    SYMBOL_INT,
+    SYMBOL_FUNCTION
+} Symbol_Type;
+
+typedef struct Symbol {
+    char *name;
+
+    /*
+        SYMBOL_INT: normal int variable or function parameter
+        SYMBOL_FUNCTION: function
+    */
+
+    Symbol_Type type;
+
+    //only SYMBOL_FUNCTION need to count the number of parameter
+    int param_count;
+
+    // 0:current only declared
+    // 1:already have function defined
+    int defined;
+
+    struct Symbol *next;
+} Symbol;
+
+void typecheck_program(Program *prog);
+
+void typecheck_function_declaration(Function *fn,Symbol **symbols);
+
+void typecheck_block_items(BlockItem **items,int count ,Symbol **symbols);
+
+void typecheck_variable_declaration(Declaration *decl,Symbol **symbols);
+
+void typecheck_statement(Statement *stmt,Symbol **symbols);
+
+void typecheck_expression(Exp *exp,Symbol **symbols);
+
+void typecheck_for_init(ForInit *init,Symbol **symbols);
+
+Symbol *symbol_find(Symbol *symbols,const char *name) {
+    while(symbols) {
+        if (strcmp(symbols->name,name)==0){
+            return symbols;
+        }
+        symbols = symbols->next;
+    }
+
+    return NULL;
+}
+
+void symbol_add_int(Symbol **symbols,const char *name) {
+    /*
+        local variable and parameter after identifer resolution
+        already have own id,like tmp.0,tmp.1
+
+        no conflict with other symbol
+    */
+
+    Symbol *entry = calloc(1,sizeof(Symbol));
+
+    entry->name = strdup(name);
+    entry->type = SYMBOL_INT;
+    entry->param_count = 0;
+    entry->defined = 0;
+
+    entry->next = *symbols;
+    *symbols = entry;
+}
+
+void symbol_add_function(Symbol **symbols, const char *name,int param_count,int defined) {
+    Symbol *entry = calloc(1,sizeof(Symbol));
+
+    entry->name = strdup(name);
+    entry->type = SYMBOL_FUNCTION;
+    entry->param_count = param_count;
+
+    //int foo(int a); -> defined=0
+    //int foo(int a){...} -> defined=1
+    entry->defined = defined;
+
+    entry->next = *symbols;
+    *symbols = entry;
+}
+
+void typecheck_expression(Exp *exp,Symbol **symbols) {
+    if (!exp) {
+        return;
+    }
+
+    switch(exp->type) {
+        case EXP_CONSTANT:
+            //constant value is int
+            return;
+
+        case EXP_VAR:{
+            Symbol *entry= symbol_find(*symbols,exp->var_name);
+
+            if (!entry) {
+                fprintf(stderr,"Type Error:unkown identifer '%s'\n",exp->var_name);
+                exit(1);
+            }
+
+            //EXP_VAR represent identifier become normal int value to use
+            //if symbol is function，this is type error
+            // int x=3, return x();
+
+            if (entry->type!=SYMBOL_INT) {
+                fprintf(
+                    stderr,
+                    "Type Error: function '%s' used as variable\n",
+                    exp->var_name
+                );
+                exit(1);
+            }
+
+            return;
+        }
+
+        case EXP_FUNCTION_CALL: {
+            Symbol *entry = symbol_find(*symbols,exp->function_call.name);
+
+            if (!entry) {
+                fprintf(
+                    stderr,
+                    "Type Error: unkown function '%s'\n",
+                    exp->function_call.name
+                );
+                exit(1);
+            }
+
+            //function call name must be compare with function type
+            if (entry->type!=SYMBOL_FUNCTION) {
+                fprintf(stderr,"Type Error: called object '%s' is not a function\n",exp->function_call.name);
+                exit(1);
+            }
+
+            //current function call paramter type is int，templately only check argument count
+            if (entry->param_count!=exp->function_call.arg_count){
+                fprintf(stderr,"Type Error: function '%s' expects %d arguments but got %d\n",
+                exp->function_call.name,
+                entry->param_count,
+                exp->function_call.arg_count);
+                exit(1);
+            }
+
+            //every arguemnt also a expression
+            //must recursive  continue type checking
+            for(int i=0;i<exp->function_call.arg_count;i++){
+                typecheck_expression(exp->function_call.args[i],symbols);
+            }
+
+            return;
+        }
+
+        case EXP_UNARY:
+            typecheck_expression(exp->unary.exp,symbols);
+            return;
+
+        case EXP_BINARY:
+            typecheck_expression(exp->binary.left,symbols);
+            typecheck_expression(exp->binary.right,symbols);
+            return;
+
+        case EXP_ASSIGN:
+            typecheck_expression(exp->assign.lvalue,symbols);
+            typecheck_expression(exp->assign.rvalue,symbols);
+            return;
+
+        case EXP_COMPOUND_ASSIGN:
+            typecheck_expression(exp->compound.lvalue,symbols);
+            typecheck_expression(exp->compound.rvalue,symbols);
+            return;
+
+        case EXP_PREFIX_OP:
+        case EXP_POSTFIX_OP:
+            typecheck_expression(
+                exp->inc_dec.lvalue,
+                symbols
+            );
+            return;
+
+        case EXP_CONDITIONAL:
+            typecheck_expression(
+                exp->conditional.condition,
+                symbols
+            );
+
+            typecheck_expression(
+                exp->conditional.true_expr,
+                symbols
+            );
+
+            typecheck_expression(
+                exp->conditional.false_expr,
+                symbols
+            );
+
+            return;
+    }
+}
+
+void typecheck_variable_declaration(Declaration *decl,Symbol **symbols) {
+    /*
+        identifier resolution already let local variable change into only name
+        
+        x->tmp.0
+
+        register into int
+    */
+
+    symbol_add_int(symbols,decl->name);
+
+    /*
+        variable into initializer already in scope
+
+        int x=x;
+
+        alrough not init yet，but identifier use itself legal
+    */
+    if (decl->init) {
+        typecheck_expression(decl->init,symbols);
+    }
+    /*
+        int x=foo(1);
+        let x register into SYMBOL_INT
+        check foo(1) type and #arg count
+    */
+}
+
+void typecheck_for_init(ForInit *init,Symbol **symbols) {
+    if (!init){
+        return;
+    }
+
+    if (init->type==FOR_INIT_DECL) { //int i=0;
+        typecheck_variable_declaration(
+            init->decl,
+            symbols
+        );
+    } 
+    else if (init->type==FOR_INIT_EXP) { //i=0;
+        if (init->exp) {
+            typecheck_expression(
+                init->exp,
+                symbols
+            );
+        }
+    }
+}
+
+void typecheck_statement(Statement *stmt, Symbol **symbols) {
+    if (!stmt) {
+        return;
+    }
+
+    switch (stmt->type) {
+        case STMT_RETURN:
+        case STMT_EXPRESSION:
+            if (stmt->exp) {
+                typecheck_expression(stmt->exp,symbols);
+            }
+            return;
+
+        case STMT_IF:
+            typecheck_expression(stmt->if_stmt.condition,symbols);
+            typecheck_statement(stmt->if_stmt.then_branch,symbols);
+
+            if (stmt->if_stmt.else_branch) {
+                typecheck_statement(stmt->if_stmt.else_branch,symbols);
+            }
+
+            return;
+
+        case STMT_COMPOUND:
+            /*
+                identifier resolution already different local variable scope \
+                change to different own name，
+                type checker don't need to copy symbol table             
+            */
+            typecheck_block_items(
+                stmt->block_items,
+                stmt->block_count,
+                symbols
+            );
+            return;
+
+        case STMT_LABEL:
+            typecheck_statement(
+                stmt->if_stmt.then_branch,
+                symbols
+            );
+            return;
+
+        case STMT_WHILE:
+            typecheck_expression(
+                stmt->while_stmt.condition,
+                symbols
+            );
+
+            typecheck_statement(
+                stmt->while_stmt.body,
+                symbols
+            );
+            return;
+
+        case STMT_DO_WHILE:
+            typecheck_statement(
+                stmt->do_while_stmt.body,
+                symbols
+            );
+
+            typecheck_expression(
+                stmt->do_while_stmt.condition,
+                symbols
+            );
+            return;
+
+        case STMT_FOR:
+            typecheck_for_init(
+                stmt->for_stmt.init,
+                symbols
+            );
+
+            if (stmt->for_stmt.condition) {
+                typecheck_expression(
+                    stmt->for_stmt.condition,
+                    symbols
+                );
+            }
+
+            if (stmt->for_stmt.post) {
+                typecheck_expression(
+                    stmt->for_stmt.post,
+                    symbols
+                );
+            }
+
+            typecheck_statement(
+                stmt->for_stmt.body,
+                symbols
+            );
+            return;
+
+        case STMT_SWITCH:
+            typecheck_expression(
+                stmt->switch_stmt.control,
+                symbols
+            );
+
+            typecheck_statement(
+                stmt->switch_stmt.body,
+                symbols
+            );
+            return;
+
+        case STMT_CASE:
+            /*
+                check case identifier type
+            */
+            typecheck_expression(
+                stmt->case_stmt.value_exp,
+                symbols
+            );
+
+            typecheck_statement(
+                stmt->case_stmt.body,
+                symbols
+            );
+            return;
+
+        case STMT_DEFAULT:
+            typecheck_statement(
+                stmt->default_stmt.body,
+                symbols
+            );
+            return;
+
+        case STMT_BREAK:
+        case STMT_CONTINUE:
+        case STMT_GOTO:
+        case STMT_NULL:
+            //don't need to tyepcheck
+            return;
+    }
+}
+
+void typecheck_block_items(BlockItem **items,int count,Symbol **symbols) {
+    for(int i=0;i<count;i++) {
+        BlockItem *bi=items[i];
+        
+        if (bi->type==BI_DECL) {
+            typecheck_variable_declaration(
+                bi->decl,
+                symbols
+            );
+        }
+
+        else if (bi->type==BI_STMT) {
+            typecheck_statement(
+                bi->stmt,
+                symbols
+            );
+        }
+
+        else if (bi->type==BI_FUN_DECL) {
+            typecheck_function_declaration(
+                bi->fun_decl,
+                symbols
+            );
+        }
+    }
+}
+
+void typecheck_function_declaration(Function *fn,Symbol **symbols) {
+    //check function whether define or declare
+
+    Symbol *old_symbol = symbol_find(*symbols,fn->name);
+
+    if (old_symbol) {
+        /*
+            same name identifier must be function
+            
+            type checker still keep variable and function conflict
+        */
+        if (old_symbol->type!=SYMBOL_FUNCTION) {
+            fprintf(
+                stderr,
+                "Type Error: '%s' redeclared as function\n",
+                fn->name
+            );
+            exit(1);
+        }
+
+        /*
+            every same function delcare，
+            args count must same
+        */
+        if (old_symbol->param_count!=fn->param_count) {
+            fprintf(
+                stderr,
+                "Type Error: conflicting declarations of function '%s': "
+                "expected %d parameters but got %d\n",
+                fn->name,
+                old_symbol->param_count,
+                fn->param_count);
+            exit(1);
+        }
+
+        //repeat function definition
+        if (old_symbol->defined && fn->has_body) {
+            fprintf(
+                stderr,
+                "Type Error: function '%s' defined more than once\n",
+                fn->name
+            );
+            exit(1);
+        }
+
+        //current node is definition
+        //update defined status in symbol table
+        if (fn->has_body) {
+            old_symbol->defined=1;
+        } 
+    } else{
+        //first time check function
+        symbol_add_function(
+            symbols,
+            fn->name,
+            fn->param_count,
+            fn->has_body
+        );
+    }
+
+    //function only declartion
+    if (!fn->has_body) {
+        return;
+    }
+
+    //add function parameter into symbol table
+    for(int i=0;i<fn->param_count;i++){
+        symbol_add_int(
+            symbols,
+            fn->params[i]
+        );
+    }
+
+    //function itself already into symbol table
+    //also check function body with recursive call
+    typecheck_block_items(
+        fn->body,
+        fn->body_count,
+        symbols
+    );
+}
+
+void typecheck_program(Program *prog) {
+    if (!prog) {
+        return;
+    }
+
+    /*
+        all program share same symbol table
+
+        so can compare same function mulitple declation
+        and record function have already defined
+    */
+
+    Symbol *symbols=NULL;
+
+    for(int i=0;i<prog->function_count;i++){
+        typecheck_function_declaration(
+            prog->functions[i],
+            &symbols
+        );
+    }
+}
+
 void check_labels_statement(Statement *stmt,LabelMap **map){
     if (stmt->type==STMT_LABEL){
         if (label_exists(*map,stmt->label)){
@@ -1664,16 +2187,35 @@ void check_labels_statement(Statement *stmt,LabelMap **map){
 
 void resolve_block_items(BlockItem **items,int count,IdentifierMap **map);
 
-//find vairable in  the mapping table 
-char *map_get(IdentifierMap *map,const char *name){
-    while(map){
-        if (strcmp(map->user_name,name)==0){
-            return map->unique_name;
+IdentifierMap *map_find(IdentifierMap *map, const char *name){
+    while (map) {
+        if (strcmp(map->user_name,name)==0) {
+            return map;
         }
         map=map->next;
     }
     return NULL;
 }
+
+//find vairable in  the mapping table 
+char *map_get(IdentifierMap *map,const char *name){
+    IdentifierMap *entry=map_find(map,name);
+    return entry ? entry->unique_name : NULL;
+}
+
+void map_add(IdentifierMap **map,
+            const char *user_name,
+            const char *unique_name,
+            int from_current_block,
+            int has_linkage) {
+                IdentifierMap *entry=malloc(sizeof(IdentifierMap));
+                entry->user_name=strdup(user_name);
+                entry->unique_name=strdup(unique_name);
+                entry->from_current_block=from_current_block;
+                entry->has_linkage=has_linkage;
+                entry->next=*map;
+                *map=entry;
+            }
 
 IdentifierMap *copy_identifier_map(IdentifierMap *map){
     IdentifierMap *new_head=NULL;
@@ -1684,10 +2226,12 @@ IdentifierMap *copy_identifier_map(IdentifierMap *map){
         node->user_name=strdup(map->user_name);
         node->unique_name=strdup(map->unique_name);
         node->from_current_block=0;
+        node->has_linkage=map->has_linkage;
         node->next=NULL;
 
         *tail=node;
         tail=&node->next;
+
         map=map->next;
     }
 
@@ -1748,7 +2292,7 @@ void check_goto_statement(Statement *stmt,LabelMap *labels,IdentifierMap *vars){
 void resolve_expression(Exp *e,IdentifierMap *map){
     if (!e) return;
     switch (e->type){
-        
+
         case EXP_CONDITIONAL:
             resolve_expression(e->conditional.condition,map);
             resolve_expression(e->conditional.true_expr,map);
@@ -1785,6 +2329,26 @@ void resolve_expression(Exp *e,IdentifierMap *map){
             break;
         }
 
+        case EXP_FUNCTION_CALL: {
+            IdentifierMap *entry=map_find(map,e->function_call.name);
+
+            if (!entry) {
+                fprintf(stderr,
+                        "Semantic Error: undeclared function '%s'\n",
+                    e->function_call.name);
+                exit(1);
+            }
+
+            free(e->function_call.name);
+            e->function_call.name=strdup(entry->unique_name);
+
+            for(int i=0;i<e->function_call.arg_count;i++) {
+                resolve_expression(e->function_call.args[i],map);
+            }
+            
+            break;
+        }
+
         case EXP_ASSIGN:
             //lvalue check
             if (e->assign.lvalue->type!=EXP_VAR){
@@ -1806,41 +2370,99 @@ void resolve_expression(Exp *e,IdentifierMap *map){
     }
 }
 
+char *resolve_local_name(const char *name,IdentifierMap **map){
+    IdentifierMap *curr=*map;
+
+    while(curr) {
+        if (strcmp(curr->user_name,name)==0 && curr->from_current_block) {
+            fprintf(stderr,"Semantic Error: duplicate declaration of '%s'\n",name);
+            exit(1);
+        }
+        curr = curr->next;
+    }
+
+    char *unique = make_temporary();
+
+    map_add(
+        map,
+        name,
+        unique,
+        1, // from current scope
+        0 // no linkage
+    );
+
+    return unique;
+}
+
 void resolve_declaration(Declaration *decl,IdentifierMap **map){
 
-    //same name is illegal only if an existing declaration is from current block 
-    IdentifierMap *curr=*map;
-    while(curr){
-        if (strcmp(curr->user_name,decl->name)==0){
-            if (curr->from_current_block){
-                fprintf(stderr,"Semantic Error: Duplicate declaration of variable '%s'\n",decl->name);
-                exit(1);
-            }
-            break;
-        }
-        curr=curr->next;
-    }
-    
+    char *unique = resolve_local_name(decl->name,map);
 
-    char *unique=make_temporary(); // make only name
-
-    //let new mapping adding link list
-    IdentifierMap *new_entry=malloc(sizeof(IdentifierMap));
-    new_entry->user_name=strdup(decl->name);
-    new_entry->unique_name=strdup(unique);
-    new_entry->from_current_block=1;
-    new_entry->next=*map;
-    *map=new_entry;
-
-
-    //initializer can see the newly declared variable itself
-    if (decl->init){
+    if (decl->init) {
         resolve_expression(decl->init,*map);
     }
 
-    //make AST node name to unique name
     free(decl->name);
     decl->name=strdup(unique);
+}
+
+void resolve_function_declaration(Function *fn ,IdentifierMap **map) {
+    IdentifierMap *prev=map_find(*map,fn->name);
+
+    /*
+        if same scope aleardy have no-linkage delcaration for example:
+
+        int main(void) {
+            int foo=3;
+            int foo(void);
+        }
+
+        this is a conflict
+
+        but same scope many delcaration function is legal
+        int foo(void);
+        int foo(void);
+    */
+
+    if (prev && prev->from_current_block && !prev->has_linkage) {
+        fprintf(stderr, "Semantic Error: conflicting function declaration '%s'\n", fn->name);
+        exit(1);
+    }
+
+    // function have external linkage,no change name
+    map_add(
+        map,
+        fn->name,
+        fn->name,
+        1, //current scope
+        1 //has linkage
+    );
+
+    /*
+        parameter into new inner scope
+        note: function name already in the outer map，so recursive call itself is legal
+    */
+
+    IdentifierMap *inner_map=copy_identifier_map(*map);
+
+    for (int i=0;i<fn->param_count;i++) {
+        char *unique=resolve_local_name(fn->params[i],&inner_map);
+        
+        free(fn->params[i]);
+        fn->params[i] = strdup(unique);
+    }
+    /*
+        function body and function parametrs is same scope
+        so here can not copy inner_map
+
+        int foo(int a){
+            int a=3; // this is error
+        }
+    */
+
+    if (fn->has_body) {
+        resolve_block_items(fn->body,fn->body_count,&inner_map);
+    }
 }
 
 void resolve_statement(Statement *stmt,IdentifierMap *map){
@@ -1912,9 +2534,21 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
 void resolve_block_items(BlockItem **items,int count,IdentifierMap **map){
     for (int i=0;i<count;i++){
         BlockItem *bi=items[i];
-        if (bi->type==BI_DECL){
+        if (bi->type==BI_DECL){ //local variable declaration
             resolve_declaration(bi->decl,map);
-        }else{
+        }else if (bi->type ==BI_FUN_DECL) {
+            //C not allow define another function in the function
+
+            if (bi->fun_decl->has_body){
+                fprintf(stderr,"Semantic Error:nested function definition '%s'\n",
+                bi->fun_decl->name);
+                exit(1);
+            }
+
+            //deal with function declaration
+            resolve_function_declaration(bi->fun_decl,map);
+        }
+        else if (bi->type==BI_STMT){ //normal statement
             resolve_statement(bi->stmt,*map);
         }
     }
@@ -2177,13 +2811,19 @@ void collect_switch_cases_block_items(BlockItem **items,int count ,Statement *cu
     }
 }
 
-void resolve_program(Program *prog){
-    IdentifierMap *map=NULL;
+void validate_program_pass(Function *fn,IdentifierMap **map) {
+    if (!fn) {
+        return;
+    }
+
+    //label is function scope
+    //different must have own label map
+
     LabelMap *labels=NULL;
 
     // pass1 :collect labels
-    for(int i=0;i<prog->fn->body_count;i++){
-        BlockItem *bi=prog->fn->body[i];
+    for(int i=0;i<fn->body_count;i++){
+        BlockItem *bi=fn->body[i];
 
         if (bi->type==BI_STMT){
             check_labels_statement(bi->stmt,&labels);
@@ -2191,21 +2831,52 @@ void resolve_program(Program *prog){
     }
         
     // pass2 : resolve function body as one top-level block
-    resolve_block_items(prog->fn->body,prog->fn->body_count,&map);
+    resolve_function_declaration(fn,map);
+
+    if (!fn->has_body){
+        return;
+    }
 
     // pass3 : check goto
-    for(int i=0;i<prog->fn->body_count;i++){
-        BlockItem *bi=prog->fn->body[i];
+    for(int i=0;i<fn->body_count;i++){
+        BlockItem *bi=fn->body[i];
         if (bi->type==BI_STMT){
-            check_goto_statement(bi->stmt,labels,map);
+            check_goto_statement(bi->stmt,labels,NULL);
         }
     }
 
     //pass 4 : annotate break / continue /switch break targets
-    label_block_items(prog->fn->body, prog->fn->body_count, NULL,NULL);
+    label_block_items(fn->body, fn->body_count, NULL,NULL);
 
     //pass 5: collect case/default labels for every switch
-    collect_switch_cases_block_items(prog->fn->body,prog->fn->body_count,NULL);
+    collect_switch_cases_block_items(fn->body,fn->body_count,NULL);
+}
+
+void resolve_program(Program *prog){
+    if (!prog) {
+        return;
+    }
+
+    IdentifierMap *map=NULL;
+    
+    //deal with function delcare and define
+    //add function name into identifier map
+    //parse function parameter and body
+    for(int i=0;i<prog->function_count;i++) {
+        resolve_function_declaration(
+            prog->functions[i],
+            &map
+        );
+    }
+
+    //check label,goto,break,continue,switch
+    for(int i=0;i<prog->function_count;i++) {
+        validate_program_pass(
+            prog->functions[i],
+            &map
+        );
+    }
+
 }
 
 // //assemble generation
@@ -3435,7 +4106,13 @@ int main(int argc,char *argv[]){
     }
 
     //semantic analysis
+
+    //identifer resolution
     resolve_program(prog);
+
+    //type checking
+    typecheck_program(prog);
+
     if (stage==3){ //--validate
         return 0;
     }
