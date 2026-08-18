@@ -291,8 +291,7 @@ typedef struct Function {
 } Function;
 
 typedef struct {
-    Function *fn; //keep it，avoid crash
-    Function **functions; //chapter 9 program = function_declaration*
+    Function **functions; //top-level function declarations and definitions
     int function_count;
 } Program;
 
@@ -544,9 +543,6 @@ typedef struct {
 typedef struct {
     AsmFunc **functions;
     int function_count;
-
-    //Compatibility with the old single-function backend/emitter.
-    AsmFunc *fn;
 } AsmProg;
 
 
@@ -602,10 +598,6 @@ typedef struct {
 typedef struct {
     TackyFunction **functions;
     int function_count;
-
-    //keep old format，let old version assembly backend can compile
-    char *function_name;
-    TackyInstruction *instructions;
 } TackyProgram;
 
 int label_counter=0;
@@ -1569,48 +1561,11 @@ Function *parse_function_declaration() {
     return f;
 }
 
-//keep it old parse_function()
-// <function> ::= "int" <identifier> "(" "void" ")" "{" { <block_item> } "}"
-//
-// <block_item> ::= <declaration> | <statement>
-Function *parse_function() {
-    expect(TOK_INT);
-    Token id=take();
-    if (id.type!=TOK_IDENTIFIER) {
-        fprintf(stderr, "Parse Error: Expected function name\n");
-        exit(1); 
-    }
-    expect(TOK_LPAREN);
-    expect(TOK_VOID);
-    expect(TOK_RPAREN);
-    expect(TOK_LBRACE);
-    Function *f=malloc(sizeof(Function));
-    f->name=strdup(id.value);
-    f->body=malloc(sizeof(BlockItem*)*100);
-    f->body_count=0;
-
-    while(peek().type!=TOK_RBRACE){
-        BlockItem *bi=malloc(sizeof(BlockItem));
-        if (peek().type==TOK_INT){
-            bi->type=BI_DECL;
-            bi->decl=parse_declaration();
-        }else{
-            bi->type=BI_STMT;
-            bi->stmt=parse_statement();
-        }
-        f->body[f->body_count++]=bi;
-    }
-    
-    expect(TOK_RBRACE);
-    return f;
-}
-
 // <program> ::= <function> EOF
 Program *parse_program() {
     Program *prog=calloc(1,sizeof(Program));
     prog->functions=NULL;
     prog->function_count=0;
-    prog->fn=NULL;
 
     while(peek().type!=TOK_EOF){
         Function *fn = parse_function_declaration();
@@ -1618,11 +1573,6 @@ Program *parse_program() {
         prog->functions = realloc(prog->functions,sizeof(Function*) * (prog->function_count+1));
 
         prog->functions[prog->function_count++]=fn;
-    
-
-        if (prog->fn==NULL || (!prog->fn->has_body && fn->has_body)) {
-            prog->fn=fn;
-        }
     }
 
     return prog;
@@ -2908,31 +2858,6 @@ void resolve_program(Program *prog){
 
 }
 
-// //assemble generation
-// AsmProgram *generate_asm(Program *prog){
-//     AsmProgram *asm_prog=malloc(sizeof(AsmProgram));
-//     asm_prog->fn=malloc(sizeof(AsmFunction));
-//     asm_prog->fn->name=strdup(prog->fn->name);
-
-//     //one return statement to mov and ret two instructions
-//     asm_prog->fn->inst_count=2;
-//     asm_prog->fn->instructions=malloc(sizeof(AsmInstruction)*2);
-
-//     asm_prog->fn->instructions[0].type=ASM_MOV;
-
-//     if (prog->fn->body->exp->type==EXP_CONSTANT){
-//         asm_prog->fn->instructions[0].imm=prog->fn->body->exp->int_value;
-
-//     }else{
-//         asm_prog->fn->instructions[0].imm=0;
-//     }
-
-
-//     asm_prog->fn->instructions[1].type=ASM_RET;
-
-//     return asm_prog;
-// }
-
 //support build operator
 AsmOperand as_imm(int i){
     return (AsmOperand){
@@ -3317,9 +3242,6 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
         asmp->functions[asmp->function_count++]=asm_fn;
     }
 
-    //Compatibility for the old emitter. Chapter 9 codegen itself uses functions[].
-    asmp->fn=(asmp->function_count>0) ? asmp->functions[0] : NULL;
-
     return asmp;
 }
 
@@ -3384,8 +3306,8 @@ static void fix_and_allocate_function(AsmFunc *fn){
     int raw_stack_size=-(current_stack+4);
 
     /*
-    Chapter 9: each function gets its own stack size, rounded up to a
-    multiple of 16 so calls made from this function remain easy to align.
+    Each function gets its own stack size, rounded up to a
+    multiple of 16 so calls made from this function remain aligned.
     */
     int aligned_stack_size=0;
     if (raw_stack_size>0){
@@ -3402,8 +3324,7 @@ static void fix_and_allocate_function(AsmFunc *fn){
     }
 
     /*
-    Instruction fix-up. Same rules as earlier chapters, but applied
-    independently to every function.
+    Apply instruction fix-up independently to every function.
     */
     curr=fn->instructions;
     while (curr){
@@ -3505,8 +3426,6 @@ void fix_and_allocate(AsmProg *asmp){
             fix_and_allocate_function(asmp->functions[i]);
         }
     }
-
-    asmp->fn=(asmp->function_count>0) ? asmp->functions[0] : NULL;
 }
 
 //Tacky generation
@@ -4197,14 +4116,31 @@ TackyProgram *generate_tacky(Program *prog){
         t_prog->functions[t_prog->function_count++]=t_fn;
     }
 
-    //Compatibility with older code paths.
-    if (t_prog->function_count>0){
-        TackyFunction *first=t_prog->functions[0];
-        t_prog->function_name=strdup(first->name);
-        t_prog->instructions=first->instructions;
-    }
-
     return t_prog;
+}
+
+static const char *reg_name_64(AsmReg reg){
+    static const char *names[]={
+        "%rax","%r10","%rdx","%r11","%rcx",
+        "%rdi","%rsi","%r8","%r9"
+    };
+    return names[reg];
+}
+
+static const char *reg_name_32(AsmReg reg){
+    static const char *names[]={
+        "%eax","%r10d","%edx","%r11d","%ecx",
+        "%edi","%esi","%r8d","%r9d"
+    };
+    return names[reg];
+}
+
+static const char *reg_name_8(AsmReg reg){
+    static const char *names[]={
+        "%al","%r10b","%dl","%r11b","%cl",
+        "%dil","%sil","%r8b","%r9b"
+    };
+    return names[reg];
 }
 
 void emit_op(AsmOperand op,FILE *out){
@@ -4212,20 +4148,43 @@ void emit_op(AsmOperand op,FILE *out){
         fprintf(out,"$%d",op.imm);
     }
     else if (op.type==AS_REG){
-        const char *reg_names[]={"%eax","%r10d","%edx","%r11d","%ecx","%edi","%esi","%r8d","%r9d"};
-        fprintf(out,"%s",reg_names[op.reg]);
+        fprintf(out,"%s",reg_name_32(op.reg));
     }
     else if (op.type==AS_STACK){
-        fprintf(out, "%d(%%rbp)", op.stack_offset);
+        fprintf(out,"%d(%%rbp)",op.stack_offset);
+    }
+    else{
+        fprintf(stderr,"Emitter Error: unresolved operand\n");
+        exit(1);
+    }
+}
+
+void emit_op_64bit(AsmOperand op,FILE *out){
+    if (op.type==AS_IMM){
+        fprintf(out,"$%d",op.imm);
+    }
+    else if (op.type==AS_REG){
+        fprintf(out,"%s",reg_name_64(op.reg));
+    }
+    else if (op.type==AS_STACK){
+        fprintf(out,"%d(%%rbp)",op.stack_offset);
+    }
+    else{
+        fprintf(stderr,"Emitter Error: unresolved 64-bit operand\n");
+        exit(1);
     }
 }
 
 void emit_op_8bit(AsmOperand op,FILE *out){
     if (op.type==AS_REG){
-        const char *reg_name_8[]={"%al","%r10b","%dl","%r11b","%cl","%dil","%sil","%r8b","%r9b"};
-        fprintf(out,"%s",reg_name_8[op.reg]);
-    }else if (op.type==AS_STACK){
+        fprintf(out,"%s",reg_name_8(op.reg));
+    }
+    else if (op.type==AS_STACK){
         fprintf(out,"%d(%%rbp)",op.stack_offset);
+    }
+    else{
+        fprintf(stderr,"Emitter Error: invalid 8-bit operand\n");
+        exit(1);
     }
 }
 
@@ -4291,128 +4250,222 @@ static void gen_tacky_for_init(ForInit *init,TackyInstruction **inst_list){
     }
 }
 
-void emit_asm_new(AsmProg * asmp,FILE *out){
-    char *name = asmp->fn->name;
+static int asm_function_defined(AsmProg *asmp,const char *name){
+    if (!asmp || !name){
+        return 0;
+    }
+
+    for (int i=0;i<asmp->function_count;i++){
+        AsmFunc *fn=asmp->functions[i];
+        if (fn && fn->name && strcmp(fn->name,name)==0){
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void emit_call_target(
+    AsmProg *asmp,
+    const char *name,
+    FILE *out
+){
 #ifdef __APPLE__
-    fprintf(out, ".globl _%s\n_%s:\n", name, name);
+    fprintf(out,"_%s",name);
 #else
-    fprintf(out, ".globl %s\n%s:\n", name, name);
+    fprintf(out,"%s",name);
+
+    if (!asm_function_defined(asmp,name)){
+        fprintf(out,"@PLT");
+    }
+#endif
+}
+
+static void emit_instruction(
+    AsmProg *asmp,
+    AsmInst *curr,
+    FILE *out
+){
+    switch (curr->type){
+        case AS_ALLOCATE_STACK:
+            fprintf(out,"    subq    $%d, %%rsp\n",curr->src.imm);
+            break;
+
+        case AS_DEALLOCATE_STACK:
+            fprintf(out,"    addq    $%d, %%rsp\n",curr->src.imm);
+            break;
+
+        case AS_PUSH:
+            fprintf(out,"    pushq   ");
+            emit_op_64bit(curr->src,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_CALL:
+            fprintf(out,"    call    ");
+            emit_call_target(asmp,curr->label,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_MOV:
+            fprintf(out,"    movl    ");
+            emit_op(curr->src,out);
+            fprintf(out,", ");
+            emit_op(curr->dst,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_NEG:
+            fprintf(out,"    negl    ");
+            emit_op(curr->dst,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_NOT:
+            fprintf(out,"    notl    ");
+            emit_op(curr->dst,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_RET:
+            fprintf(out,"    movq    %%rbp, %%rsp\n");
+            fprintf(out,"    popq    %%rbp\n");
+            fprintf(out,"    ret\n");
+            break;
+
+        case AS_BINARY:{
+            const char *op_str=NULL;
+
+            switch (curr->binary_op){
+                case BINARY_ADD:
+                    op_str="addl";
+                    break;
+                case BINARY_SUB:
+                    op_str="subl";
+                    break;
+                case BINARY_MULT:
+                    op_str="imull";
+                    break;
+                case BINARY_BITWISE_AND:
+                    op_str="andl";
+                    break;
+                case BINARY_BITWISE_OR:
+                    op_str="orl";
+                    break;
+                case BINARY_BITWISE_XOR:
+                    op_str="xorl";
+                    break;
+                case BINARY_LSHIFT:
+                    op_str="sall";
+                    break;
+                case BINARY_RSHIFT:
+                    op_str="sarl";
+                    break;
+                default:
+                    fprintf(stderr,"Emitter Error: unsupported binary operator\n");
+                    exit(1);
+            }
+
+            fprintf(out,"    %s    ",op_str);
+
+            if (curr->binary_op==BINARY_LSHIFT ||
+                curr->binary_op==BINARY_RSHIFT){
+                if (curr->src.type==AS_IMM){
+                    emit_op(curr->src,out);
+                }else{
+                    fprintf(out,"%%cl");
+                }
+            }else{
+                emit_op(curr->src,out);
+            }
+
+            fprintf(out,", ");
+            emit_op(curr->dst,out);
+            fprintf(out,"\n");
+            break;
+        }
+
+        case AS_IDIV:
+            fprintf(out,"    idivl   ");
+            emit_op(curr->src,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_CDQ:
+            fprintf(out,"    cdq\n");
+            break;
+
+        case AS_CMP:
+            fprintf(out,"    cmpl    ");
+            emit_op(curr->src,out);
+            fprintf(out,", ");
+            emit_op(curr->dst,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_JMP:
+            fprintf(out,"    jmp     .L%s\n",curr->label);
+            break;
+
+        case AS_JMP_CC:
+            fprintf(
+                out,
+                "    j%s     .L%s\n",
+                cond_to_str(curr->cond),
+                curr->label
+            );
+            break;
+
+        case AS_SET_CC:
+            fprintf(out,"    set%s   ",cond_to_str(curr->cond));
+            emit_op_8bit(curr->dst,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_LABEL:
+            fprintf(out,".L%s:\n",curr->label);
+            break;
+    }
+}
+
+static void emit_function(
+    AsmProg *asmp,
+    AsmFunc *fn,
+    FILE *out
+){
+#ifdef __APPLE__
+    fprintf(out,".globl _%s\n_%s:\n",fn->name,fn->name);
+#else
+    fprintf(out,".globl %s\n%s:\n",fn->name,fn->name);
 #endif
 
+    fprintf(out,"    pushq   %%rbp\n");
+    fprintf(out,"    movq    %%rsp, %%rbp\n");
 
-    // Function Prologue
-    fprintf(out, "    pushq   %%rbp\n");
-    fprintf(out, "    movq    %%rsp, %%rbp\n");
-    
-    AsmInst *curr = asmp->fn->instructions;
-    while (curr) {
-        switch (curr->type) {
-            case AS_ALLOCATE_STACK: fprintf(out, "    subq    $%d, %%rsp\n", curr->src.imm); break;
-            case AS_MOV: 
-                fprintf(out, "    movl    ");
-                emit_op(curr->src, out); fprintf(out, ", "); emit_op(curr->dst, out);
-                fprintf(out, "\n"); break;
-            case AS_NEG: fprintf(out, "    negl    "); emit_op(curr->dst, out); fprintf(out, "\n"); break;
-            case AS_NOT: fprintf(out, "    notl    "); emit_op(curr->dst, out); fprintf(out, "\n"); break;
-            case AS_RET:
-                //Function Epilogue
-                fprintf(out, "    movq    %%rbp, %%rsp\n");
-                fprintf(out, "    popq    %%rbp\n");
-                fprintf(out, "    ret\n"); break;
-            case AS_BINARY:
-                {
-                    const char *op_str=NULL;
-                    switch (curr->binary_op){
-                        case BINARY_ADD: op_str="addl"; break;
-                        case BINARY_SUB: op_str = "subl"; break;
-                        case BINARY_MULT: op_str = "imull"; break;
-                         // logical operation (&&, ||) will not reach here, here processing bitwise operation (&, |)
-                        case BINARY_BITWISE_AND: op_str = "andl"; break;
-                        case BINARY_BITWISE_OR:  op_str = "orl"; break;
-                        case BINARY_BITWISE_XOR: op_str = "xorl"; break;
-                        case BINARY_LSHIFT: op_str = "sall"; break; // arithmetic shift left
-                        case BINARY_RSHIFT: op_str = "sarl"; break; // arithmetic shift right
-                        default: break;
-                    }
-
-                    if (op_str){
-                        
-                        //shift speical deal with:if it's shift，and source is ECX ，output %cl
-                        if (curr->binary_op==BINARY_LSHIFT || curr->binary_op==BINARY_RSHIFT){
-                            fprintf(out, "    %s    ", op_str);
-                            //check offset (src)
-                            if (curr->src.type==AS_IMM){
-                                //if is immediate，directly output
-                                emit_op(curr->src,out);
-                            }else{
-                                //if not，msut be %cl
-                                //tacky_to_asm phase make sure src2 move into ECX
-                                //only output %cl
-                                fprintf(out, "%%cl");
-                            }
-
-                            fprintf(out, ", ");
-                            emit_op(curr->dst, out);
-                            fprintf(out, "\n");
-                        }else{ //other binary operators
-                            fprintf(out, "    %s    ", op_str);
-                            emit_op(curr->src,out);
-                            fprintf(out,", ");
-                            emit_op(curr->dst,out);
-                            fprintf(out,"\n");
-                        }
-
-
-                    }
-
-                }
-                break;
-            
-            case AS_IDIV:
-                fprintf(out, "    idivl   ");
-                emit_op(curr->src, out); 
-                fprintf(out, "\n");
-                break;
-            
-            case AS_CDQ:
-                fprintf(out, "    cdq\n");
-                break;
-            
-            case AS_CMP:
-                fprintf(out, "    cmpl    ");
-                emit_op(curr->src, out); fprintf(out, ", "); emit_op(curr->dst, out);
-                fprintf(out, "\n"); break;
-            case AS_JMP:
-                fprintf(out, "    jmp     .L%s\n", curr->label); break;
-            case AS_JMP_CC:
-                // 減少多餘空格
-                fprintf(out, "    j%s .L%s\n", cond_to_str(curr->cond), curr->label); break;
-            case AS_SET_CC:
-                fprintf(out, "    set%s ", cond_to_str(curr->cond)); // 減少多餘空格
-                emit_op_8bit(curr->dst, out);
-                fprintf(out, "\n"); 
-                break;
-            case AS_LABEL:
-                fprintf(out, ".L%s:\n", curr->label); break;
-
-            /*
-             * codegen knows these instructions now.
-             * Their final textual assembly emission belongs to the next stage.
-             * --codegen returns before emit_asm_new(), so this does not affect
-             * the codegen test.
-             */
-            case AS_DEALLOCATE_STACK:
-            case AS_PUSH:
-            case AS_CALL:
-                fprintf(stderr,
-                        "Emitter Error:call instruction emission is not implemented yet\n");
-                exit(1);
-        }
-        curr = curr->next;
+    for (AsmInst *curr=fn->instructions;
+         curr!=NULL;
+         curr=curr->next){
+        emit_instruction(asmp,curr,out);
     }
-    // Linux safe stack marking
+
+    fprintf(out,"\n");
+}
+
+void emit_asm_new(AsmProg *asmp,FILE *out){
+    if (!asmp || !out){
+        return;
+    }
+
+    for (int i=0;i<asmp->function_count;i++){
+        AsmFunc *fn=asmp->functions[i];
+
+        if (fn){
+            emit_function(asmp,fn,out);
+        }
+    }
+
 #ifndef __APPLE__
-    fprintf(out, ".section .note.GNU-stack,\"\",@progbits\n");
+    fprintf(out,".section .note.GNU-stack,\"\",@progbits\n");
 #endif
 }
 
@@ -4442,6 +4495,7 @@ int main(int argc,char *argv[]){
     char *input_path=NULL;
     int stage=6;
     int s_flag=0;
+    int c_flag=0;
 
     for(int i=1;i<argc;i++){
         if (strcmp(argv[i],"--lex")==0){
@@ -4466,6 +4520,10 @@ int main(int argc,char *argv[]){
         }
         else if (strcmp(argv[i],"-S")==0){
             s_flag=1;
+            continue;
+        }
+        else if (strcmp(argv[i],"-c")==0){
+            c_flag=1;
             continue;
         }
         else if (argv[i][0]!='-'){
@@ -4545,8 +4603,33 @@ int main(int argc,char *argv[]){
         return 0;
     }
 
-    //use gcc make final execute
     char cmd[1024];
+
+    if (c_flag){
+        char obj_path[256];
+        strncpy(obj_path, input_path, sizeof(obj_path) - 1);
+        obj_path[sizeof(obj_path) - 1] = '\0';
+
+        dot = strrchr(obj_path, '.');
+        if (dot){
+            strcpy(dot, ".o");
+        }else{
+            strcat(obj_path, ".o");
+        }
+
+        snprintf(
+            cmd,
+            sizeof(cmd),
+            "gcc -c %s -o %s",
+            asm_path,
+            obj_path
+        );
+
+        int res=system(cmd);
+        remove(asm_path);
+        return res;
+    }
+
     char out_path[256];
     strncpy(out_path, input_path, sizeof(out_path) - 1);
     out_path[sizeof(out_path) - 1] = '\0';
