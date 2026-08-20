@@ -6,6 +6,7 @@
 //define Token type
 typedef  enum{
     TOK_INT, TOK_VOID, TOK_RETURN,
+    TOK_STATIC, TOK_EXTERN,
 
     TOK_IF,
     TOK_ELSE,
@@ -655,6 +656,8 @@ TokenType check_keyword(const char *s){
     if (strcmp(s,"int")==0) return TOK_INT;
     if (strcmp(s,"void")==0) return TOK_VOID;
     if (strcmp(s,"return")==0) return TOK_RETURN;
+    if (strcmp(s,"static")==0) return TOK_STATIC;
+    if (strcmp(s,"extern")==0) return TOK_EXTERN;
 
     if (strcmp(s,"if")==0) return TOK_IF;
     if (strcmp(s,"else")==0) return TOK_ELSE;
