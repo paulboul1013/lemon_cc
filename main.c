@@ -182,9 +182,31 @@ typedef enum {
 
 }StmtType;
 
+typedef enum {
+    STORAGE_NONE,
+    STORAGE_STATIC,
+    STORAGE_EXTERN
+} StorageClass;
+
 typedef struct {
     char *name;
     Exp *init; //optional
+    StorageClass storage_class;
+} VariableDeclaration;
+
+typedef struct Function Function;
+
+typedef enum {
+    DECL_VAR,
+    DECL_FUN
+} DeclarationType;
+
+typedef struct Declaration {
+    DeclarationType type;
+    union {
+        VariableDeclaration *var;
+        Function *fun;
+    };
 } Declaration;
 
 typedef enum {
@@ -194,14 +216,13 @@ typedef enum {
 
 typedef struct {
     ForInitType type;
-    Declaration *decl;// when type is FOR_INIT_DECL
+    VariableDeclaration *decl;// when type is FOR_INIT_DECL
     Exp *exp;// when type is FOR_INIT_EXP , NULL means empty
 } ForInit;
 
 typedef enum {
     BI_STMT,
-    BI_DECL,
-    BI_FUN_DECL
+    BI_DECL
 } BlockItemType;
 
 typedef struct SwitchCaseInfo{
@@ -210,7 +231,6 @@ typedef struct SwitchCaseInfo{
     struct SwitchCaseInfo *next;
 }SwitchCaseInfo;
 
-typedef struct Function Function;
 typedef struct BlockItem BlockItem;
 typedef struct Statement{
     StmtType type;
@@ -275,7 +295,6 @@ typedef struct BlockItem{
     union {
         Statement *stmt;
         Declaration *decl;
-        Function *fun_decl;
     };
 } BlockItem;
 
@@ -289,11 +308,12 @@ typedef struct Function {
     int body_count;
 
     int has_body; //1= function definition, 0 = function declaration
+    StorageClass storage_class;
 } Function;
 
 typedef struct {
-    Function **functions; //top-level function declarations and definitions
-    int function_count;
+    Declaration **declarations;
+    int declaration_count;
 } Program;
 
 
@@ -765,11 +785,9 @@ void lex(const char *input){
                 break;
             case '?':
                 add_token(TOK_QUESTION,NULL);
-                p++;
                 break;
             case ':':
                 add_token(TOK_COLON,NULL);
-                p++;
                 break;
             case '~':
                 add_token(TOK_COMPLEMENT,NULL);
@@ -902,8 +920,7 @@ Exp *parse_exp(int min_prec);
 Exp *parse_factor();
 Statement *parse_statement();
 
-Declaration *parse_declaration(); //variable declaration only
-Function *parse_function_declaration(); //function declaration / definition
+Declaration *parse_declaration();
 BlockItem *parse_block_item();
 
 
@@ -933,7 +950,7 @@ typedef struct IdentifierMap{
 void resolve_for_init(ForInit *init,IdentifierMap **map);
 void label_statement(Statement *stmt,char *current_break_label,char *current_continue_label);
 void label_block_items(BlockItem **items,int count,char *current_break_label,char *current_continue_label);
-void resolve_declaration(Declaration *decl,IdentifierMap **map);
+void resolve_declaration(VariableDeclaration *decl,IdentifierMap **map);
 void resolve_expression(Exp *e,IdentifierMap *map);
 
 void expect(TokenType type){
@@ -958,23 +975,17 @@ void resolve_for_init(ForInit *init,IdentifierMap **map){
     }
 }
 
-int is_function_declaration_start() {
-    return peek().type==TOK_INT
-        && token_list[token_pos+1].type==TOK_IDENTIFIER
-        && token_list[token_pos+2].type==TOK_LPAREN;
+int is_declaration_start(void) {
+    TokenType type=peek().type;
+    return type==TOK_INT || type==TOK_STATIC || type==TOK_EXTERN;
 }
 
 BlockItem *parse_block_item() {
     BlockItem *bi=calloc(1,sizeof(BlockItem));
 
-    if (peek().type==TOK_INT) {
-        if (is_function_declaration_start()) {
-            bi->type=BI_FUN_DECL;
-            bi->fun_decl=parse_function_declaration();
-        } else {
-            bi->type=BI_DECL;
-            bi->decl=parse_declaration();
-        }
+    if (is_declaration_start()) {
+        bi->type=BI_DECL;
+        bi->decl=parse_declaration();
     } else {
         bi->type=BI_STMT;
         bi->stmt=parse_statement();
@@ -1054,11 +1065,18 @@ Exp *parse_optional_exp(TokenType end_token){
 }
 
 ForInit *parse_for_init(){
-    ForInit *init=malloc(sizeof(ForInit));
+    ForInit *init=calloc(1,sizeof(ForInit));
 
-    if (peek().type==TOK_INT){
+    if (is_declaration_start()){
+        Declaration *decl=parse_declaration();
+
+        if (decl->type!=DECL_VAR){
+            fprintf(stderr,"Parse Error: function declaration is not allowed in for initializer\n");
+            exit(1);
+        }
+
         init->type=FOR_INIT_DECL;
-        init->decl=parse_declaration(); //remove after int ';'
+        init->decl=decl->var;
         init->exp=NULL;
     }else{
         init->type=FOR_INIT_EXP;
@@ -1490,92 +1508,163 @@ Statement *parse_if_statment(){
     return s;
 }
 
-// <declaration> ::= "int" <identifier> [ "=" <expression> ] ";"
-Declaration *parse_declaration(){
-    expect(TOK_INT);
-    Token id=take(); //get variable name
+typedef struct {
+    StorageClass storage_class;
+} ParsedSpecifiers;
 
-    if (id.type!=TOK_IDENTIFIER){
-        fprintf(stderr, "Parse Error: Expected identifier as variable name, but got token type %d\n", id.type);
-        exit(1); // 必須退出，這樣測試腳本才能捕捉到失敗
-    }
-
-    Declaration *d=malloc(sizeof(Declaration));
-    d->name=strdup(id.value);
-
-    if (peek().type==TOK_ASSIGN){
-        take();
-        d->init=parse_exp(0);
-    }else{
-        d->init=NULL;
-    }
-    expect(TOK_SEMICOLON);
-    return d;
+int is_specifier_token(TokenType type){
+    return type==TOK_INT || type==TOK_STATIC || type==TOK_EXTERN;
 }
 
-Function *parse_function_declaration() {
-    expect(TOK_INT);
+ParsedSpecifiers parse_type_and_storage_class(){
+    TokenType *specifiers=NULL;
+    int specifier_count=0;
 
-    Token id = take();
-    if (id.type!= TOK_IDENTIFIER) {
-        fprintf(stderr, "Parse Error: Expected function name\n");
+    while(is_specifier_token(peek().type)){
+        Token tok=take();
+
+        specifiers=realloc(
+            specifiers,
+            sizeof(TokenType)*(specifier_count+1)
+        );
+        specifiers[specifier_count++]=tok.type;
+    }
+
+    int type_count=0;
+    int storage_count=0;
+    StorageClass storage=STORAGE_NONE;
+
+    for(int i=0;i<specifier_count;i++){
+        if (specifiers[i]==TOK_INT){
+            type_count++;
+        }else if (specifiers[i]==TOK_STATIC){
+            storage_count++;
+            storage=STORAGE_STATIC;
+        }else if (specifiers[i]==TOK_EXTERN){
+            storage_count++;
+            storage=STORAGE_EXTERN;
+        }
+    }
+
+    free(specifiers);
+
+    if (type_count!=1){
+        fprintf(stderr,"Parse Error: invalid type specifier\n");
         exit(1);
     }
 
+    if (storage_count>1){
+        fprintf(stderr,"Parse Error: invalid storage class\n");
+        exit(1);
+    }
+
+    ParsedSpecifiers result;
+    result.storage_class=storage;
+    return result;
+}
+
+Function *parse_function_after_name(
+    const char *name,
+    StorageClass storage_class
+){
     expect(TOK_LPAREN);
 
     int param_count=0;
-    char **params = parse_param_list(&param_count);
+    char **params=parse_param_list(&param_count);
 
     expect(TOK_RPAREN);
 
     Function *f=calloc(1,sizeof(Function));
-    f->name=strdup(id.value);
+    f->name=strdup(name);
     f->params=params;
-    f->param_count = param_count;
+    f->param_count=param_count;
     f->body=NULL;
     f->body_count=0;
     f->has_body=0;
+    f->storage_class=storage_class;
 
-    if (peek().type==TOK_SEMICOLON) {
+    if (peek().type==TOK_SEMICOLON){
         take();
         return f;
     }
 
-    if (peek().type!=TOK_LBRACE) {
+    if (peek().type!=TOK_LBRACE){
         fprintf(stderr,"Parse Error: expected function body or ';'\n");
         exit(1);
     }
 
-    take(); //comsume '{'
+    take();
 
     f->has_body=1;
 
-    while(peek().type!=TOK_RBRACE) {
-        BlockItem *bi= parse_block_item();
+    while(peek().type!=TOK_RBRACE){
+        if (peek().type==TOK_EOF){
+            fprintf(stderr,"Parse Error: expected '}' before end of file\n");
+            exit(1);
+        }
 
-        f->body = realloc(f->body,sizeof(BlockItem*) * (f->body_count+1));
+        BlockItem *bi=parse_block_item();
 
-        f->body[f->body_count++] = bi;
+        f->body=realloc(
+            f->body,
+            sizeof(BlockItem*)*(f->body_count+1)
+        );
+        f->body[f->body_count++]=bi;
     }
 
     expect(TOK_RBRACE);
-
     return f;
 }
 
-// <program> ::= <function> EOF
+Declaration *parse_declaration(){
+    ParsedSpecifiers specs=parse_type_and_storage_class();
+
+    Token id=take();
+    if (id.type!=TOK_IDENTIFIER){
+        fprintf(stderr,"Parse Error: expected identifier in declaration\n");
+        exit(1);
+    }
+
+    Declaration *decl=calloc(1,sizeof(Declaration));
+
+    if (peek().type==TOK_LPAREN){
+        decl->type=DECL_FUN;
+        decl->fun=parse_function_after_name(
+            id.value,
+            specs.storage_class
+        );
+        return decl;
+    }
+
+    VariableDeclaration *var=calloc(1,sizeof(VariableDeclaration));
+    var->name=strdup(id.value);
+    var->storage_class=specs.storage_class;
+
+    if (peek().type==TOK_ASSIGN){
+        take();
+        var->init=parse_exp(0);
+    }else{
+        var->init=NULL;
+    }
+
+    expect(TOK_SEMICOLON);
+
+    decl->type=DECL_VAR;
+    decl->var=var;
+    return decl;
+}
+
 Program *parse_program() {
     Program *prog=calloc(1,sizeof(Program));
-    prog->functions=NULL;
-    prog->function_count=0;
 
     while(peek().type!=TOK_EOF){
-        Function *fn = parse_function_declaration();
+        Declaration *decl=parse_declaration();
 
-        prog->functions = realloc(prog->functions,sizeof(Function*) * (prog->function_count+1));
-
-        prog->functions[prog->function_count++]=fn;
+        prog->declarations=realloc(
+            prog->declarations,
+            sizeof(Declaration*)*(prog->declaration_count+1)
+        );
+        prog->declarations[prog->declaration_count++]=decl;
     }
 
     return prog;
@@ -1629,7 +1718,7 @@ void typecheck_function_declaration(Function *fn,Symbol **symbols);
 
 void typecheck_block_items(BlockItem **items,int count ,Symbol **symbols);
 
-void typecheck_variable_declaration(Declaration *decl,Symbol **symbols);
+void typecheck_variable_declaration(VariableDeclaration *decl,Symbol **symbols);
 
 void typecheck_statement(Statement *stmt,Symbol **symbols);
 
@@ -1799,7 +1888,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
     }
 }
 
-void typecheck_variable_declaration(Declaration *decl,Symbol **symbols) {
+void typecheck_variable_declaration(VariableDeclaration *decl,Symbol **symbols) {
     /*
         identifier resolution already let local variable change into only name
         
@@ -1989,22 +2078,22 @@ void typecheck_block_items(BlockItem **items,int count,Symbol **symbols) {
         BlockItem *bi=items[i];
         
         if (bi->type==BI_DECL) {
-            typecheck_variable_declaration(
-                bi->decl,
-                symbols
-            );
+            if (bi->decl->type==DECL_VAR) {
+                typecheck_variable_declaration(
+                    bi->decl->var,
+                    symbols
+                );
+            } else {
+                typecheck_function_declaration(
+                    bi->decl->fun,
+                    symbols
+                );
+            }
         }
 
         else if (bi->type==BI_STMT) {
             typecheck_statement(
                 bi->stmt,
-                symbols
-            );
-        }
-
-        else if (bi->type==BI_FUN_DECL) {
-            typecheck_function_declaration(
-                bi->fun_decl,
                 symbols
             );
         }
@@ -2107,11 +2196,15 @@ void typecheck_program(Program *prog) {
 
     Symbol *symbols=NULL;
 
-    for(int i=0;i<prog->function_count;i++){
-        typecheck_function_declaration(
-            prog->functions[i],
-            &symbols
-        );
+    for(int i=0;i<prog->declaration_count;i++){
+        Declaration *decl=prog->declarations[i];
+
+        if (decl->type==DECL_FUN){
+            typecheck_function_declaration(
+                decl->fun,
+                &symbols
+            );
+        }
     }
 }
 
@@ -2376,7 +2469,7 @@ char *resolve_local_name(const char *name,IdentifierMap **map){
     return unique;
 }
 
-void resolve_declaration(Declaration *decl,IdentifierMap **map){
+void resolve_declaration(VariableDeclaration *decl,IdentifierMap **map){
 
     char *unique = resolve_local_name(decl->name,map);
 
@@ -2516,21 +2609,22 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
 void resolve_block_items(BlockItem **items,int count,IdentifierMap **map){
     for (int i=0;i<count;i++){
         BlockItem *bi=items[i];
-        if (bi->type==BI_DECL){ //local variable declaration
-            resolve_declaration(bi->decl,map);
-        }else if (bi->type ==BI_FUN_DECL) {
-            //C not allow define another function in the function
+        if (bi->type==BI_DECL){
+            if (bi->decl->type==DECL_VAR){
+                resolve_declaration(bi->decl->var,map);
+            }else{
+                Function *fn=bi->decl->fun;
 
-            if (bi->fun_decl->has_body){
-                fprintf(stderr,"Semantic Error:nested function definition '%s'\n",
-                bi->fun_decl->name);
-                exit(1);
+                if (fn->has_body){
+                    fprintf(stderr,"Semantic Error:nested function definition '%s'\n",
+                    fn->name);
+                    exit(1);
+                }
+
+                resolve_function_declaration(fn,map);
             }
-
-            //deal with function declaration
-            resolve_function_declaration(bi->fun_decl,map);
         }
-        else if (bi->type==BI_STMT){ //normal statement
+        else if (bi->type==BI_STMT){
             resolve_statement(bi->stmt,*map);
         }
     }
@@ -2841,22 +2935,26 @@ void resolve_program(Program *prog){
 
     IdentifierMap *map=NULL;
     
-    //deal with function delcare and define
-    //add function name into identifier map
-    //parse function parameter and body
-    for(int i=0;i<prog->function_count;i++) {
-        resolve_function_declaration(
-            prog->functions[i],
-            &map
-        );
+    for(int i=0;i<prog->declaration_count;i++) {
+        Declaration *decl=prog->declarations[i];
+
+        if (decl->type==DECL_FUN) {
+            resolve_function_declaration(
+                decl->fun,
+                &map
+            );
+        }
     }
 
-    //check label,goto,break,continue,switch
-    for(int i=0;i<prog->function_count;i++) {
-        validate_program_pass(
-            prog->functions[i],
-            &map
-        );
+    for(int i=0;i<prog->declaration_count;i++) {
+        Declaration *decl=prog->declarations[i];
+
+        if (decl->type==DECL_FUN) {
+            validate_program_pass(
+                decl->fun,
+                &map
+            );
+        }
     }
 
 }
@@ -3433,7 +3531,7 @@ void fix_and_allocate(AsmProg *asmp){
 
 //Tacky generation
 void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_list);
-void gen_tacky_decl(Declaration *decl,TackyInstruction **inst_list);
+void gen_tacky_decl(VariableDeclaration *decl,TackyInstruction **inst_list);
 void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list);
 static TackyFunction *generate_tacky_function(Function *fn);
 static char *make_loop_target(const char *kind,const char *loop_id);
@@ -4005,7 +4103,7 @@ static void emit_switch_dispatch(
 }
 
 // let Declaration turn to TACKY (only have init value need to generate)
-void gen_tacky_decl(Declaration *decl,TackyInstruction **inst_list){
+void gen_tacky_decl(VariableDeclaration *decl,TackyInstruction **inst_list){
     if (decl->init){
         TackyVal *src=gen_tacky_exp(decl->init,inst_list);
         TackyInstruction *copy=calloc(1,sizeof(TackyInstruction));
@@ -4022,10 +4120,11 @@ void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_l
         if (bi->type==BI_STMT){
             gen_tacky_statement(bi->stmt,inst_list);
         }else if (bi->type==BI_DECL){
-            gen_tacky_decl(bi->decl,inst_list);
-        }
-        else if (bi->type==BI_FUN_DECL) { //only function decl not gen IR
-            continue;
+            if (bi->decl->type==DECL_VAR){
+                gen_tacky_decl(bi->decl->var,inst_list);
+            }else{
+                continue;
+            }
         }
     }
 }
@@ -4093,10 +4192,15 @@ TackyProgram *generate_tacky(Program *prog){
         exit(1);
     }
 
-    for (int i=0;i<prog->function_count;i++){
-        Function *fn=prog->functions[i];
+    for (int i=0;i<prog->declaration_count;i++){
+        Declaration *decl=prog->declarations[i];
 
-        //Function declarations without a body do not generate TACKY.
+        if (decl->type!=DECL_FUN){
+            continue;
+        }
+
+        Function *fn=decl->fun;
+
         if (!fn || !fn->has_body){
             continue;
         }
