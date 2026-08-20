@@ -611,14 +611,34 @@ typedef struct TackyInstruction{
 
 typedef struct {
     char *name;
+    int global;
     char **params;
     int param_count;
     TackyInstruction *instructions;
 } TackyFunction;
 
 typedef struct {
-    TackyFunction **functions;
-    int function_count;
+    char *name;
+    int global;
+    int init;
+} TackyStaticVariable;
+
+typedef enum {
+    TACKY_TOP_FUNCTION,
+    TACKY_TOP_STATIC_VARIABLE
+} TackyTopLevelType;
+
+typedef struct {
+    TackyTopLevelType type;
+    union {
+        TackyFunction *function;
+        TackyStaticVariable *static_variable;
+    };
+} TackyTopLevel;
+
+typedef struct {
+    TackyTopLevel **top_levels;
+    int top_level_count;
 } TackyProgram;
 
 int label_counter=0;
@@ -950,7 +970,8 @@ typedef struct IdentifierMap{
 void resolve_for_init(ForInit *init,IdentifierMap **map);
 void label_statement(Statement *stmt,char *current_break_label,char *current_continue_label);
 void label_block_items(BlockItem **items,int count,char *current_break_label,char *current_continue_label);
-void resolve_declaration(VariableDeclaration *decl,IdentifierMap **map);
+void resolve_file_scope_variable_declaration(VariableDeclaration *decl,IdentifierMap **map);
+void resolve_local_variable_declaration(VariableDeclaration *decl,IdentifierMap **map);
 void resolve_expression(Exp *e,IdentifierMap *map);
 
 void expect(TokenType type){
@@ -967,7 +988,7 @@ void resolve_for_init(ForInit *init,IdentifierMap **map){
     }
 
     if (init->type==FOR_INIT_DECL){
-        resolve_declaration(init->decl,map);
+        resolve_local_variable_declaration(init->decl,map);
     }else{
         if(init->exp){
             resolve_expression(init->exp,*map);
@@ -1692,38 +1713,46 @@ typedef enum {
     SYMBOL_FUNCTION
 } Symbol_Type;
 
+typedef enum {
+    SYMBOL_ATTR_FUNCTION,
+    SYMBOL_ATTR_STATIC,
+    SYMBOL_ATTR_LOCAL
+} SymbolAttrType;
+
+typedef enum {
+    INITIAL_TENTATIVE,
+    INITIAL_VALUE,
+    INITIAL_NONE
+} InitialValueType;
+
+typedef struct {
+    InitialValueType type;
+    int value;
+} InitialValue;
+
 typedef struct Symbol {
     char *name;
-
-    /*
-        SYMBOL_INT: normal int variable or function parameter
-        SYMBOL_FUNCTION: function
-    */
-
     Symbol_Type type;
 
-    //only SYMBOL_FUNCTION need to count the number of parameter
     int param_count;
 
-    // 0:current only declared
-    // 1:already have function defined
+    SymbolAttrType attr_type;
+
     int defined;
+    int global;
+
+    InitialValue init;
 
     struct Symbol *next;
 } Symbol;
 
-void typecheck_program(Program *prog);
-
+Symbol *typecheck_program(Program *prog);
 void typecheck_function_declaration(Function *fn,Symbol **symbols);
-
-void typecheck_block_items(BlockItem **items,int count ,Symbol **symbols);
-
-void typecheck_variable_declaration(VariableDeclaration *decl,Symbol **symbols);
-
+void typecheck_block_items(BlockItem **items,int count,Symbol **symbols);
+void typecheck_file_scope_variable_declaration(VariableDeclaration *decl,Symbol **symbols);
+void typecheck_local_variable_declaration(VariableDeclaration *decl,Symbol **symbols);
 void typecheck_statement(Statement *stmt,Symbol **symbols);
-
 void typecheck_expression(Exp *exp,Symbol **symbols);
-
 void typecheck_for_init(ForInit *init,Symbol **symbols);
 
 Symbol *symbol_find(Symbol *symbols,const char *name) {
@@ -1731,44 +1760,63 @@ Symbol *symbol_find(Symbol *symbols,const char *name) {
         if (strcmp(symbols->name,name)==0){
             return symbols;
         }
-        symbols = symbols->next;
+        symbols=symbols->next;
     }
 
     return NULL;
 }
 
-void symbol_add_int(Symbol **symbols,const char *name) {
-    /*
-        local variable and parameter after identifer resolution
-        already have own id,like tmp.0,tmp.1
-
-        no conflict with other symbol
-    */
-
-    Symbol *entry = calloc(1,sizeof(Symbol));
-
-    entry->name = strdup(name);
-    entry->type = SYMBOL_INT;
-    entry->param_count = 0;
-    entry->defined = 0;
-
-    entry->next = *symbols;
-    *symbols = entry;
+InitialValue make_initial_value(InitialValueType type,int value) {
+    InitialValue init;
+    init.type=type;
+    init.value=value;
+    return init;
 }
 
-void symbol_add_function(Symbol **symbols, const char *name,int param_count,int defined) {
-    Symbol *entry = calloc(1,sizeof(Symbol));
+Symbol *symbol_add(Symbol **symbols,const char *name,Symbol_Type type) {
+    Symbol *entry=calloc(1,sizeof(Symbol));
+    if (!entry){
+        perror("calloc Symbol");
+        exit(1);
+    }
 
-    entry->name = strdup(name);
-    entry->type = SYMBOL_FUNCTION;
-    entry->param_count = param_count;
+    entry->name=strdup(name);
+    entry->type=type;
+    entry->next=*symbols;
+    *symbols=entry;
 
-    //int foo(int a); -> defined=0
-    //int foo(int a){...} -> defined=1
-    entry->defined = defined;
+    return entry;
+}
 
-    entry->next = *symbols;
-    *symbols = entry;
+void symbol_add_local_int(Symbol **symbols,const char *name) {
+    Symbol *entry=symbol_add(symbols,name,SYMBOL_INT);
+    entry->attr_type=SYMBOL_ATTR_LOCAL;
+}
+
+void symbol_add_static_int(
+    Symbol **symbols,
+    const char *name,
+    InitialValue init,
+    int global
+) {
+    Symbol *entry=symbol_add(symbols,name,SYMBOL_INT);
+    entry->attr_type=SYMBOL_ATTR_STATIC;
+    entry->init=init;
+    entry->global=global;
+}
+
+void symbol_add_function(
+    Symbol **symbols,
+    const char *name,
+    int param_count,
+    int defined,
+    int global
+) {
+    Symbol *entry=symbol_add(symbols,name,SYMBOL_FUNCTION);
+    entry->param_count=param_count;
+    entry->attr_type=SYMBOL_ATTR_FUNCTION;
+    entry->defined=defined;
+    entry->global=global;
 }
 
 void typecheck_expression(Exp *exp,Symbol **symbols) {
@@ -1778,20 +1826,15 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
     switch(exp->type) {
         case EXP_CONSTANT:
-            //constant value is int
             return;
 
-        case EXP_VAR:{
-            Symbol *entry= symbol_find(*symbols,exp->var_name);
+        case EXP_VAR: {
+            Symbol *entry=symbol_find(*symbols,exp->var_name);
 
             if (!entry) {
-                fprintf(stderr,"Type Error:unkown identifer '%s'\n",exp->var_name);
+                fprintf(stderr,"Type Error: unknown identifier '%s'\n",exp->var_name);
                 exit(1);
             }
-
-            //EXP_VAR represent identifier become normal int value to use
-            //if symbol is function，this is type error
-            // int x=3, return x();
 
             if (entry->type!=SYMBOL_INT) {
                 fprintf(
@@ -1806,34 +1849,37 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
         }
 
         case EXP_FUNCTION_CALL: {
-            Symbol *entry = symbol_find(*symbols,exp->function_call.name);
+            Symbol *entry=symbol_find(*symbols,exp->function_call.name);
 
             if (!entry) {
                 fprintf(
                     stderr,
-                    "Type Error: unkown function '%s'\n",
+                    "Type Error: unknown function '%s'\n",
                     exp->function_call.name
                 );
                 exit(1);
             }
 
-            //function call name must be compare with function type
             if (entry->type!=SYMBOL_FUNCTION) {
-                fprintf(stderr,"Type Error: called object '%s' is not a function\n",exp->function_call.name);
+                fprintf(
+                    stderr,
+                    "Type Error: called object '%s' is not a function\n",
+                    exp->function_call.name
+                );
                 exit(1);
             }
 
-            //current function call paramter type is int，templately only check argument count
-            if (entry->param_count!=exp->function_call.arg_count){
-                fprintf(stderr,"Type Error: function '%s' expects %d arguments but got %d\n",
-                exp->function_call.name,
-                entry->param_count,
-                exp->function_call.arg_count);
+            if (entry->param_count!=exp->function_call.arg_count) {
+                fprintf(
+                    stderr,
+                    "Type Error: function '%s' expects %d arguments but got %d\n",
+                    exp->function_call.name,
+                    entry->param_count,
+                    exp->function_call.arg_count
+                );
                 exit(1);
             }
 
-            //every arguemnt also a expression
-            //must recursive  continue type checking
             for(int i=0;i<exp->function_call.arg_count;i++){
                 typecheck_expression(exp->function_call.args[i],symbols);
             }
@@ -1862,87 +1908,221 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
         case EXP_PREFIX_OP:
         case EXP_POSTFIX_OP:
-            typecheck_expression(
-                exp->inc_dec.lvalue,
-                symbols
-            );
+            typecheck_expression(exp->inc_dec.lvalue,symbols);
             return;
 
         case EXP_CONDITIONAL:
-            typecheck_expression(
-                exp->conditional.condition,
-                symbols
-            );
-
-            typecheck_expression(
-                exp->conditional.true_expr,
-                symbols
-            );
-
-            typecheck_expression(
-                exp->conditional.false_expr,
-                symbols
-            );
-
+            typecheck_expression(exp->conditional.condition,symbols);
+            typecheck_expression(exp->conditional.true_expr,symbols);
+            typecheck_expression(exp->conditional.false_expr,symbols);
             return;
     }
 }
 
-void typecheck_variable_declaration(VariableDeclaration *decl,Symbol **symbols) {
-    /*
-        identifier resolution already let local variable change into only name
-        
-        x->tmp.0
+void typecheck_file_scope_variable_declaration(
+    VariableDeclaration *decl,
+    Symbol **symbols
+) {
+    InitialValue initial_value;
 
-        register into int
-    */
-
-    symbol_add_int(symbols,decl->name);
-
-    /*
-        variable into initializer already in scope
-
-        int x=x;
-
-        alrough not init yet，but identifier use itself legal
-    */
     if (decl->init) {
-        typecheck_expression(decl->init,symbols);
-    }
-    /*
-        int x=foo(1);
-        let x register into SYMBOL_INT
-        check foo(1) type and #arg count
-    */
-}
+        if (decl->init->type!=EXP_CONSTANT) {
+            fprintf(
+                stderr,
+                "Type Error: non-constant initializer for file-scope variable '%s'\n",
+                decl->name
+            );
+            exit(1);
+        }
 
-void typecheck_for_init(ForInit *init,Symbol **symbols) {
-    if (!init){
+        initial_value=make_initial_value(
+            INITIAL_VALUE,
+            decl->init->int_value
+        );
+    }
+    else if (decl->storage_class==STORAGE_EXTERN) {
+        initial_value=make_initial_value(INITIAL_NONE,0);
+    }
+    else {
+        initial_value=make_initial_value(INITIAL_TENTATIVE,0);
+    }
+
+    int global=(decl->storage_class!=STORAGE_STATIC);
+
+    Symbol *old_symbol=symbol_find(*symbols,decl->name);
+
+    if (old_symbol) {
+        if (old_symbol->type!=SYMBOL_INT) {
+            fprintf(
+                stderr,
+                "Type Error: function '%s' redeclared as variable\n",
+                decl->name
+            );
+            exit(1);
+        }
+
+        if (old_symbol->attr_type!=SYMBOL_ATTR_STATIC) {
+            fprintf(
+                stderr,
+                "Type Error: conflicting declaration of variable '%s'\n",
+                decl->name
+            );
+            exit(1);
+        }
+
+        if (decl->storage_class==STORAGE_EXTERN) {
+            global=old_symbol->global;
+        }
+        else if (old_symbol->global!=global) {
+            fprintf(
+                stderr,
+                "Type Error: conflicting variable linkage for '%s'\n",
+                decl->name
+            );
+            exit(1);
+        }
+
+        if (old_symbol->init.type==INITIAL_VALUE) {
+            if (initial_value.type==INITIAL_VALUE) {
+                fprintf(
+                    stderr,
+                    "Type Error: conflicting file-scope definitions of '%s'\n",
+                    decl->name
+                );
+                exit(1);
+            }
+
+            initial_value=old_symbol->init;
+        }
+        else if (
+            initial_value.type!=INITIAL_VALUE &&
+            old_symbol->init.type==INITIAL_TENTATIVE
+        ) {
+            initial_value=old_symbol->init;
+        }
+
+        old_symbol->attr_type=SYMBOL_ATTR_STATIC;
+        old_symbol->init=initial_value;
+        old_symbol->global=global;
         return;
     }
 
-    if (init->type==FOR_INIT_DECL) { //int i=0;
-        typecheck_variable_declaration(
-            init->decl,
-            symbols
+    symbol_add_static_int(
+        symbols,
+        decl->name,
+        initial_value,
+        global
+    );
+}
+
+void typecheck_local_variable_declaration(
+    VariableDeclaration *decl,
+    Symbol **symbols
+) {
+    if (decl->storage_class==STORAGE_EXTERN) {
+        if (decl->init) {
+            fprintf(
+                stderr,
+                "Type Error: initializer on local extern variable '%s'\n",
+                decl->name
+            );
+            exit(1);
+        }
+
+        Symbol *old_symbol=symbol_find(*symbols,decl->name);
+
+        if (old_symbol) {
+            if (old_symbol->type!=SYMBOL_INT) {
+                fprintf(
+                    stderr,
+                    "Type Error: function '%s' redeclared as variable\n",
+                    decl->name
+                );
+                exit(1);
+            }
+
+            return;
+        }
+
+        symbol_add_static_int(
+            symbols,
+            decl->name,
+            make_initial_value(INITIAL_NONE,0),
+            1
         );
-    } 
-    else if (init->type==FOR_INIT_EXP) { //i=0;
-        if (init->exp) {
-            typecheck_expression(
-                init->exp,
-                symbols
+        return;
+    }
+
+    if (decl->storage_class==STORAGE_STATIC) {
+        InitialValue initial_value;
+
+        if (decl->init) {
+            if (decl->init->type!=EXP_CONSTANT) {
+                fprintf(
+                    stderr,
+                    "Type Error: non-constant initializer on local static variable '%s'\n",
+                    decl->name
+                );
+                exit(1);
+            }
+
+            initial_value=make_initial_value(
+                INITIAL_VALUE,
+                decl->init->int_value
             );
         }
+        else {
+            initial_value=make_initial_value(INITIAL_VALUE,0);
+        }
+
+        symbol_add_static_int(
+            symbols,
+            decl->name,
+            initial_value,
+            0
+        );
+        return;
+    }
+
+    symbol_add_local_int(symbols,decl->name);
+
+    if (decl->init) {
+        typecheck_expression(decl->init,symbols);
     }
 }
 
-void typecheck_statement(Statement *stmt, Symbol **symbols) {
+void typecheck_for_init(ForInit *init,Symbol **symbols) {
+    if (!init) {
+        return;
+    }
+
+    if (init->type==FOR_INIT_DECL) {
+        if (init->decl->storage_class!=STORAGE_NONE) {
+            fprintf(
+                stderr,
+                "Type Error: storage-class specifier is not allowed in for-loop declaration\n"
+            );
+            exit(1);
+        }
+
+        typecheck_local_variable_declaration(
+            init->decl,
+            symbols
+        );
+        return;
+    }
+
+    if (init->exp) {
+        typecheck_expression(init->exp,symbols);
+    }
+}
+
+void typecheck_statement(Statement *stmt,Symbol **symbols) {
     if (!stmt) {
         return;
     }
 
-    switch (stmt->type) {
+    switch(stmt->type) {
         case STMT_RETURN:
         case STMT_EXPRESSION:
             if (stmt->exp) {
@@ -1957,15 +2137,9 @@ void typecheck_statement(Statement *stmt, Symbol **symbols) {
             if (stmt->if_stmt.else_branch) {
                 typecheck_statement(stmt->if_stmt.else_branch,symbols);
             }
-
             return;
 
         case STMT_COMPOUND:
-            /*
-                identifier resolution already different local variable scope \
-                change to different own name，
-                type checker don't need to copy symbol table             
-            */
             typecheck_block_items(
                 stmt->block_items,
                 stmt->block_count,
@@ -1985,7 +2159,6 @@ void typecheck_statement(Statement *stmt, Symbol **symbols) {
                 stmt->while_stmt.condition,
                 symbols
             );
-
             typecheck_statement(
                 stmt->while_stmt.body,
                 symbols
@@ -1997,7 +2170,6 @@ void typecheck_statement(Statement *stmt, Symbol **symbols) {
                 stmt->do_while_stmt.body,
                 symbols
             );
-
             typecheck_expression(
                 stmt->do_while_stmt.condition,
                 symbols
@@ -2035,7 +2207,6 @@ void typecheck_statement(Statement *stmt, Symbol **symbols) {
                 stmt->switch_stmt.control,
                 symbols
             );
-
             typecheck_statement(
                 stmt->switch_stmt.body,
                 symbols
@@ -2043,14 +2214,10 @@ void typecheck_statement(Statement *stmt, Symbol **symbols) {
             return;
 
         case STMT_CASE:
-            /*
-                check case identifier type
-            */
             typecheck_expression(
                 stmt->case_stmt.value_exp,
                 symbols
             );
-
             typecheck_statement(
                 stmt->case_stmt.body,
                 symbols
@@ -2068,29 +2235,32 @@ void typecheck_statement(Statement *stmt, Symbol **symbols) {
         case STMT_CONTINUE:
         case STMT_GOTO:
         case STMT_NULL:
-            //don't need to tyepcheck
             return;
     }
 }
 
-void typecheck_block_items(BlockItem **items,int count,Symbol **symbols) {
+void typecheck_block_items(
+    BlockItem **items,
+    int count,
+    Symbol **symbols
+) {
     for(int i=0;i<count;i++) {
         BlockItem *bi=items[i];
-        
+
         if (bi->type==BI_DECL) {
             if (bi->decl->type==DECL_VAR) {
-                typecheck_variable_declaration(
+                typecheck_local_variable_declaration(
                     bi->decl->var,
                     symbols
                 );
-            } else {
+            }
+            else {
                 typecheck_function_declaration(
                     bi->decl->fun,
                     symbols
                 );
             }
         }
-
         else if (bi->type==BI_STMT) {
             typecheck_statement(
                 bi->stmt,
@@ -2100,17 +2270,17 @@ void typecheck_block_items(BlockItem **items,int count,Symbol **symbols) {
     }
 }
 
-void typecheck_function_declaration(Function *fn,Symbol **symbols) {
-    //check function whether define or declare
+void typecheck_function_declaration(
+    Function *fn,
+    Symbol **symbols
+) {
+    int has_body=fn->has_body;
+    int already_defined=0;
+    int global=(fn->storage_class!=STORAGE_STATIC);
 
-    Symbol *old_symbol = symbol_find(*symbols,fn->name);
+    Symbol *old_symbol=symbol_find(*symbols,fn->name);
 
     if (old_symbol) {
-        /*
-            same name identifier must be function
-            
-            type checker still keep variable and function conflict
-        */
         if (old_symbol->type!=SYMBOL_FUNCTION) {
             fprintf(
                 stderr,
@@ -2120,23 +2290,18 @@ void typecheck_function_declaration(Function *fn,Symbol **symbols) {
             exit(1);
         }
 
-        /*
-            every same function delcare，
-            args count must same
-        */
         if (old_symbol->param_count!=fn->param_count) {
             fprintf(
                 stderr,
-                "Type Error: conflicting declarations of function '%s': "
-                "expected %d parameters but got %d\n",
-                fn->name,
-                old_symbol->param_count,
-                fn->param_count);
+                "Type Error: incompatible declarations of function '%s'\n",
+                fn->name
+            );
             exit(1);
         }
 
-        //repeat function definition
-        if (old_symbol->defined && fn->has_body) {
+        already_defined=old_symbol->defined;
+
+        if (already_defined && has_body) {
             fprintf(
                 stderr,
                 "Type Error: function '%s' defined more than once\n",
@@ -2145,36 +2310,44 @@ void typecheck_function_declaration(Function *fn,Symbol **symbols) {
             exit(1);
         }
 
-        //current node is definition
-        //update defined status in symbol table
-        if (fn->has_body) {
-            old_symbol->defined=1;
-        } 
-    } else{
-        //first time check function
+        if (
+            old_symbol->global &&
+            fn->storage_class==STORAGE_STATIC
+        ) {
+            fprintf(
+                stderr,
+                "Type Error: static declaration of function '%s' follows non-static declaration\n",
+                fn->name
+            );
+            exit(1);
+        }
+
+        global=old_symbol->global;
+        old_symbol->defined=(already_defined || has_body);
+        old_symbol->global=global;
+        old_symbol->attr_type=SYMBOL_ATTR_FUNCTION;
+    }
+    else {
         symbol_add_function(
             symbols,
             fn->name,
             fn->param_count,
-            fn->has_body
+            has_body,
+            global
         );
     }
 
-    //function only declartion
-    if (!fn->has_body) {
+    if (!has_body) {
         return;
     }
 
-    //add function parameter into symbol table
-    for(int i=0;i<fn->param_count;i++){
-        symbol_add_int(
+    for(int i=0;i<fn->param_count;i++) {
+        symbol_add_local_int(
             symbols,
             fn->params[i]
         );
     }
 
-    //function itself already into symbol table
-    //also check function body with recursive call
     typecheck_block_items(
         fn->body,
         fn->body_count,
@@ -2182,30 +2355,31 @@ void typecheck_function_declaration(Function *fn,Symbol **symbols) {
     );
 }
 
-void typecheck_program(Program *prog) {
+Symbol *typecheck_program(Program *prog) {
     if (!prog) {
-        return;
+        return NULL;
     }
-
-    /*
-        all program share same symbol table
-
-        so can compare same function mulitple declation
-        and record function have already defined
-    */
 
     Symbol *symbols=NULL;
 
-    for(int i=0;i<prog->declaration_count;i++){
+    for(int i=0;i<prog->declaration_count;i++) {
         Declaration *decl=prog->declarations[i];
 
-        if (decl->type==DECL_FUN){
+        if (decl->type==DECL_FUN) {
             typecheck_function_declaration(
                 decl->fun,
                 &symbols
             );
         }
+        else {
+            typecheck_file_scope_variable_declaration(
+                decl->var,
+                &symbols
+            );
+        }
     }
+
+    return symbols;
 }
 
 void check_labels_statement(Statement *stmt,LabelMap **map){
@@ -2449,29 +2623,88 @@ char *resolve_local_name(const char *name,IdentifierMap **map){
     IdentifierMap *curr=*map;
 
     while(curr) {
-        if (strcmp(curr->user_name,name)==0 && curr->from_current_block) {
-            fprintf(stderr,"Semantic Error: duplicate declaration of '%s'\n",name);
+        if (
+            strcmp(curr->user_name,name)==0 &&
+            curr->from_current_block
+        ) {
+            fprintf(
+                stderr,
+                "Semantic Error: duplicate declaration of '%s'\n",
+                name
+            );
             exit(1);
         }
-        curr = curr->next;
+
+        curr=curr->next;
     }
 
-    char *unique = make_temporary();
+    char *unique=make_temporary();
 
     map_add(
         map,
         name,
         unique,
-        1, // from current scope
-        0 // no linkage
+        1,
+        0
     );
 
     return unique;
 }
 
-void resolve_declaration(VariableDeclaration *decl,IdentifierMap **map){
+void resolve_file_scope_variable_declaration(
+    VariableDeclaration *decl,
+    IdentifierMap **map
+) {
+    map_add(
+        map,
+        decl->name,
+        decl->name,
+        1,
+        1
+    );
+}
 
-    char *unique = resolve_local_name(decl->name,map);
+void resolve_local_variable_declaration(
+    VariableDeclaration *decl,
+    IdentifierMap **map
+) {
+    IdentifierMap *prev=map_find(*map,decl->name);
+
+    if (prev && prev->from_current_block) {
+        if (!(
+            prev->has_linkage &&
+            decl->storage_class==STORAGE_EXTERN
+        )) {
+            fprintf(
+                stderr,
+                "Semantic Error: conflicting local declarations of '%s'\n",
+                decl->name
+            );
+            exit(1);
+        }
+    }
+
+    if (decl->storage_class==STORAGE_EXTERN) {
+        map_add(
+            map,
+            decl->name,
+            decl->name,
+            1,
+            1
+        );
+
+        return;
+    }
+
+    char *unique=make_temporary();
+
+    map_add(
+        map,
+        decl->name,
+        unique,
+        1,
+        0
+    );
 
     if (decl->init) {
         resolve_expression(decl->init,*map);
@@ -2481,64 +2714,54 @@ void resolve_declaration(VariableDeclaration *decl,IdentifierMap **map){
     decl->name=strdup(unique);
 }
 
-void resolve_function_declaration(Function *fn ,IdentifierMap **map) {
+void resolve_function_declaration(
+    Function *fn,
+    IdentifierMap **map
+) {
     IdentifierMap *prev=map_find(*map,fn->name);
 
-    /*
-        if same scope aleardy have no-linkage delcaration for example:
-
-        int main(void) {
-            int foo=3;
-            int foo(void);
-        }
-
-        this is a conflict
-
-        but same scope many delcaration function is legal
-        int foo(void);
-        int foo(void);
-    */
-
-    if (prev && prev->from_current_block && !prev->has_linkage) {
-        fprintf(stderr, "Semantic Error: conflicting function declaration '%s'\n", fn->name);
+    if (
+        prev &&
+        prev->from_current_block &&
+        !prev->has_linkage
+    ) {
+        fprintf(
+            stderr,
+            "Semantic Error: conflicting function declaration '%s'\n",
+            fn->name
+        );
         exit(1);
     }
 
-    // function have external linkage,no change name
     map_add(
         map,
         fn->name,
         fn->name,
-        1, //current scope
-        1 //has linkage
+        1,
+        1
     );
-
-    /*
-        parameter into new inner scope
-        note: function name already in the outer map，so recursive call itself is legal
-    */
 
     IdentifierMap *inner_map=copy_identifier_map(*map);
 
-    for (int i=0;i<fn->param_count;i++) {
-        char *unique=resolve_local_name(fn->params[i],&inner_map);
-        
-        free(fn->params[i]);
-        fn->params[i] = strdup(unique);
-    }
-    /*
-        function body and function parametrs is same scope
-        so here can not copy inner_map
+    for(int i=0;i<fn->param_count;i++) {
+        char *unique=resolve_local_name(
+            fn->params[i],
+            &inner_map
+        );
 
-        int foo(int a){
-            int a=3; // this is error
-        }
-    */
+        free(fn->params[i]);
+        fn->params[i]=strdup(unique);
+    }
 
     if (fn->has_body) {
-        resolve_block_items(fn->body,fn->body_count,&inner_map);
+        resolve_block_items(
+            fn->body,
+            fn->body_count,
+            &inner_map
+        );
     }
 }
+
 
 void resolve_statement(Statement *stmt,IdentifierMap *map){
     if (stmt->type==STMT_RETURN || stmt->type==STMT_EXPRESSION){
@@ -2607,25 +2830,48 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
 }
 
 void resolve_block_items(BlockItem **items,int count,IdentifierMap **map){
-    for (int i=0;i<count;i++){
+    for(int i=0;i<count;i++){
         BlockItem *bi=items[i];
+
         if (bi->type==BI_DECL){
             if (bi->decl->type==DECL_VAR){
-                resolve_declaration(bi->decl->var,map);
-            }else{
+                resolve_local_variable_declaration(
+                    bi->decl->var,
+                    map
+                );
+            }
+            else {
                 Function *fn=bi->decl->fun;
 
                 if (fn->has_body){
-                    fprintf(stderr,"Semantic Error:nested function definition '%s'\n",
-                    fn->name);
+                    fprintf(
+                        stderr,
+                        "Semantic Error: nested function definition '%s'\n",
+                        fn->name
+                    );
                     exit(1);
                 }
 
-                resolve_function_declaration(fn,map);
+                if (fn->storage_class==STORAGE_STATIC){
+                    fprintf(
+                        stderr,
+                        "Semantic Error: block-scope function declaration '%s' cannot be static\n",
+                        fn->name
+                    );
+                    exit(1);
+                }
+
+                resolve_function_declaration(
+                    fn,
+                    map
+                );
             }
         }
         else if (bi->type==BI_STMT){
-            resolve_statement(bi->stmt,*map);
+            resolve_statement(
+                bi->stmt,
+                *map
+            );
         }
     }
 }
@@ -2887,45 +3133,48 @@ void collect_switch_cases_block_items(BlockItem **items,int count ,Statement *cu
     }
 }
 
-void validate_program_pass(Function *fn,IdentifierMap **map) {
-    if (!fn) {
+void validate_program_pass(Function *fn) {
+    if (!fn || !fn->has_body) {
         return;
     }
-
-    //label is function scope
-    //different must have own label map
 
     LabelMap *labels=NULL;
 
-    // pass1 :collect labels
     for(int i=0;i<fn->body_count;i++){
         BlockItem *bi=fn->body[i];
 
         if (bi->type==BI_STMT){
-            check_labels_statement(bi->stmt,&labels);
+            check_labels_statement(
+                bi->stmt,
+                &labels
+            );
         }
     }
-        
-    // pass2 : resolve function body as one top-level block
-    resolve_function_declaration(fn,map);
 
-    if (!fn->has_body){
-        return;
-    }
-
-    // pass3 : check goto
     for(int i=0;i<fn->body_count;i++){
         BlockItem *bi=fn->body[i];
+
         if (bi->type==BI_STMT){
-            check_goto_statement(bi->stmt,labels,NULL);
+            check_goto_statement(
+                bi->stmt,
+                labels,
+                NULL
+            );
         }
     }
 
-    //pass 4 : annotate break / continue /switch break targets
-    label_block_items(fn->body, fn->body_count, NULL,NULL);
+    label_block_items(
+        fn->body,
+        fn->body_count,
+        NULL,
+        NULL
+    );
 
-    //pass 5: collect case/default labels for every switch
-    collect_switch_cases_block_items(fn->body,fn->body_count,NULL);
+    collect_switch_cases_block_items(
+        fn->body,
+        fn->body_count,
+        NULL
+    );
 }
 
 void resolve_program(Program *prog){
@@ -2934,11 +3183,17 @@ void resolve_program(Program *prog){
     }
 
     IdentifierMap *map=NULL;
-    
+
     for(int i=0;i<prog->declaration_count;i++) {
         Declaration *decl=prog->declarations[i];
 
-        if (decl->type==DECL_FUN) {
+        if (decl->type==DECL_VAR) {
+            resolve_file_scope_variable_declaration(
+                decl->var,
+                &map
+            );
+        }
+        else {
             resolve_function_declaration(
                 decl->fun,
                 &map
@@ -2951,12 +3206,10 @@ void resolve_program(Program *prog){
 
         if (decl->type==DECL_FUN) {
             validate_program_pass(
-                decl->fun,
-                &map
+                decl->fun
             );
         }
     }
-
 }
 
 //support build operator
@@ -3322,8 +3575,14 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
         exit(1);
     }
 
-    for (int i=0;i<tacky->function_count;i++){
-        TackyFunction *tacky_fn=tacky->functions[i];
+    for (int i=0;i<tacky->top_level_count;i++){
+        TackyTopLevel *top_level=tacky->top_levels[i];
+
+        if (!top_level || top_level->type!=TACKY_TOP_FUNCTION) {
+            continue;
+        }
+
+        TackyFunction *tacky_fn=top_level->function;
         if (!tacky_fn){
             continue;
         }
@@ -3533,7 +3792,7 @@ void fix_and_allocate(AsmProg *asmp){
 void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_list);
 void gen_tacky_decl(VariableDeclaration *decl,TackyInstruction **inst_list);
 void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list);
-static TackyFunction *generate_tacky_function(Function *fn);
+static TackyFunction *generate_tacky_function(Function *fn,Symbol *symbols);
 static char *make_loop_target(const char *kind,const char *loop_id);
 static void emit_tacky_label(TackyInstruction **inst_list,const char *label);
 static void emit_tacky_jump(TackyInstruction **inst_list,const char *label);
@@ -4104,12 +4363,16 @@ static void emit_switch_dispatch(
 
 // let Declaration turn to TACKY (only have init value need to generate)
 void gen_tacky_decl(VariableDeclaration *decl,TackyInstruction **inst_list){
+    if (!decl || decl->storage_class!=STORAGE_NONE) {
+        return;
+    }
+
     if (decl->init){
         TackyVal *src=gen_tacky_exp(decl->init,inst_list);
         TackyInstruction *copy=calloc(1,sizeof(TackyInstruction));
         copy->type=TACKY_INST_COPY;
         copy->src=src;
-        copy->dst=tacky_val_var(decl->name); // let init value copy to variable name
+        copy->dst=tacky_val_var(decl->name);
         append_tacky_inst(inst_list,copy);
     }
 }
@@ -4129,7 +4392,7 @@ void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_l
     }
 }
 
-TackyFunction *generate_tacky_function(Function *fn) {
+TackyFunction *generate_tacky_function(Function *fn,Symbol *symbols) {
     if (!fn || !fn->has_body) {
         return NULL;
     }
@@ -4137,6 +4400,14 @@ TackyFunction *generate_tacky_function(Function *fn) {
     TackyFunction *t_fn= calloc(1,sizeof(TackyFunction));
 
     t_fn->name = strdup(fn->name);
+
+    Symbol *entry=symbol_find(symbols,fn->name);
+    if (!entry || entry->attr_type!=SYMBOL_ATTR_FUNCTION) {
+        fprintf(stderr,"TACKY Error: missing function symbol '%s'\n",fn->name);
+        exit(1);
+    }
+
+    t_fn->global = entry->global;
     t_fn->param_count = fn->param_count;
     t_fn->instructions = NULL;
 
@@ -4181,7 +4452,100 @@ TackyFunction *generate_tacky_function(Function *fn) {
     return t_fn;
 }
 
-TackyProgram *generate_tacky(Program *prog){
+static void append_tacky_top_level(
+    TackyProgram *program,
+    TackyTopLevel *top_level
+){
+    TackyTopLevel **new_items=realloc(
+        program->top_levels,
+        sizeof(TackyTopLevel*)*(size_t)(program->top_level_count+1)
+    );
+
+    if (!new_items) {
+        perror("realloc TACKY top levels");
+        exit(1);
+    }
+
+    program->top_levels=new_items;
+    program->top_levels[program->top_level_count++]=top_level;
+}
+
+static void append_tacky_function(
+    TackyProgram *program,
+    TackyFunction *function
+){
+    TackyTopLevel *top_level=calloc(1,sizeof(TackyTopLevel));
+    if (!top_level) {
+        perror("calloc TACKY function top level");
+        exit(1);
+    }
+
+    top_level->type=TACKY_TOP_FUNCTION;
+    top_level->function=function;
+    append_tacky_top_level(program,top_level);
+}
+
+static void append_tacky_static_variable(
+    TackyProgram *program,
+    const char *name,
+    int global,
+    int init
+){
+    TackyStaticVariable *variable=calloc(1,sizeof(TackyStaticVariable));
+    if (!variable) {
+        perror("calloc TACKY static variable");
+        exit(1);
+    }
+
+    variable->name=strdup(name);
+    variable->global=global;
+    variable->init=init;
+
+    TackyTopLevel *top_level=calloc(1,sizeof(TackyTopLevel));
+    if (!top_level) {
+        perror("calloc TACKY static top level");
+        exit(1);
+    }
+
+    top_level->type=TACKY_TOP_STATIC_VARIABLE;
+    top_level->static_variable=variable;
+    append_tacky_top_level(program,top_level);
+}
+
+static void convert_symbols_to_tacky(
+    Symbol *symbols,
+    TackyProgram *program
+){
+    for (Symbol *entry=symbols;entry;entry=entry->next) {
+        if (entry->attr_type!=SYMBOL_ATTR_STATIC) {
+            continue;
+        }
+
+        if (entry->init.type==INITIAL_NONE) {
+            continue;
+        }
+
+        int init=0;
+        if (entry->init.type==INITIAL_VALUE) {
+            init=entry->init.value;
+        }
+        else if (entry->init.type==INITIAL_TENTATIVE) {
+            init=0;
+        }
+        else {
+            continue;
+        }
+
+        append_tacky_static_variable(
+            program,
+            entry->name,
+            entry->global,
+            init
+        );
+    }
+}
+
+TackyProgram *generate_tacky(Program *prog,Symbol *symbols){
     if (!prog){
         return NULL;
     }
@@ -4205,26 +4569,19 @@ TackyProgram *generate_tacky(Program *prog){
             continue;
         }
 
-        TackyFunction *t_fn=generate_tacky_function(fn);
+        TackyFunction *t_fn=generate_tacky_function(fn,symbols);
         if (!t_fn){
             continue;
         }
 
-        TackyFunction **new_functions=realloc(
-            t_prog->functions,
-            sizeof(TackyFunction*)*(size_t)(t_prog->function_count+1)
-        );
-        if (!new_functions){
-            perror("realloc TACKY functions");
-            exit(1);
-        }
-
-        t_prog->functions=new_functions;
-        t_prog->functions[t_prog->function_count++]=t_fn;
+        append_tacky_function(t_prog,t_fn);
     }
+
+    convert_symbols_to_tacky(symbols,t_prog);
 
     return t_prog;
 }
+
 
 static const char *reg_name_64(AsmReg reg){
     static const char *names[]={
@@ -4668,14 +5025,14 @@ int main(int argc,char *argv[]){
     resolve_program(prog);
 
     //type checking
-    typecheck_program(prog);
+    Symbol *symbols=typecheck_program(prog);
 
     if (stage==3){ //--validate
         return 0;
     }
 
     //TACKY Generation
-    TackyProgram *tacky_prog=generate_tacky(prog);
+    TackyProgram *tacky_prog=generate_tacky(prog,symbols);
     if (stage==4){
         return 0;
     }
