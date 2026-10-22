@@ -4666,6 +4666,14 @@ static const char *reg_name_32(AsmReg reg){
     return names[reg];
 }
 
+static void emit_data_op(AsmOperand op,FILE *out){
+#ifdef __APPLE__
+    fprintf(out,"_%s(%%rip)",op.data_name);
+#else
+    fprintf(out,"%s(%%rip)",op.data_name);
+#endif
+}
+
 static const char *reg_name_8(AsmReg reg){
     static const char *names[]={
         "%al","%r10b","%dl","%r11b","%cl",
@@ -4684,6 +4692,9 @@ void emit_op(AsmOperand op,FILE *out){
     else if (op.type==AS_STACK){
         fprintf(out,"%d(%%rbp)",op.stack_offset);
     }
+    else if (op.type==AS_DATA){
+        emit_data_op(op,out);
+    }
     else{
         fprintf(stderr,"Emitter Error: unresolved operand\n");
         exit(1);
@@ -4700,6 +4711,9 @@ void emit_op_64bit(AsmOperand op,FILE *out){
     else if (op.type==AS_STACK){
         fprintf(out,"%d(%%rbp)",op.stack_offset);
     }
+    else if (op.type==AS_DATA){
+        emit_data_op(op,out);
+    }
     else{
         fprintf(stderr,"Emitter Error: unresolved 64-bit operand\n");
         exit(1);
@@ -4712,6 +4726,9 @@ void emit_op_8bit(AsmOperand op,FILE *out){
     }
     else if (op.type==AS_STACK){
         fprintf(out,"%d(%%rbp)",op.stack_offset);
+    }
+    else if (op.type==AS_DATA){
+        emit_data_op(op,out);
     }
     else{
         fprintf(stderr,"Emitter Error: invalid 8-bit operand\n");
@@ -4966,9 +4983,15 @@ static void emit_function(
     FILE *out
 ){
 #ifdef __APPLE__
-    fprintf(out,".globl _%s\n_%s:\n",fn->name,fn->name);
+    if (fn->global){
+        fprintf(out,".globl _%s\n",fn->name);
+    }
+    fprintf(out,".text\n_%s:\n",fn->name);
 #else
-    fprintf(out,".globl %s\n%s:\n",fn->name,fn->name);
+    if (fn->global){
+        fprintf(out,".globl %s\n",fn->name);
+    }
+    fprintf(out,".text\n%s:\n",fn->name);
 #endif
 
     fprintf(out,"    pushq   %%rbp\n");
@@ -4983,6 +5006,26 @@ static void emit_function(
     fprintf(out,"\n");
 }
 
+static void emit_static_variable(AsmStaticVariable *var,FILE *out){
+#ifdef __APPLE__
+    const char *prefix="_";
+#else
+    const char *prefix="";
+#endif
+
+    if (var->global){
+        fprintf(out,".globl %s%s\n",prefix,var->name);
+    }
+
+    if (var->init!=0){
+        fprintf(out,".data\n.balign 4\n%s%s:\n    .long %d\n",prefix,var->name,var->init);
+    }else{
+        fprintf(out,".bss\n.balign 4\n%s%s:\n    .zero 4\n",prefix,var->name);
+    }
+
+    fprintf(out,"\n");
+}
+
 void emit_asm_new(AsmProg *asmp,FILE *out){
     if (!asmp || !out){
         return;
@@ -4992,6 +5035,8 @@ void emit_asm_new(AsmProg *asmp,FILE *out){
         AsmTopLevel *top_level=asmp->top_levels[i];
         if (top_level->type==ASM_TOP_FUNCTION){
             emit_function(asmp,top_level->function,out);
+        }else{
+            emit_static_variable(top_level->static_variable,out);
         }
     }
 
