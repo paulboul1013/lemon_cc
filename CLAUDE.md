@@ -1,3 +1,3 @@
 ## Agent skills
 
-Factory config: `docs/agents/factory.md`.
+Plumb config: `docs/agents/plumb.md`.
