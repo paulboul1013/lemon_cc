@@ -520,7 +520,8 @@ typedef enum {
     AS_IMM, //immediate value
     AS_REG, // register
     AS_PSEUDO, //virtual register (tmp.0)
-    AS_STACK // stack address -4(%rbp), 16(%rbp), ...
+    AS_STACK, // stack address -4(%rbp), 16(%rbp), ...
+    AS_DATA // static storage, foo(%rip)
 } AsmOpType;
 
 typedef enum{
@@ -542,6 +543,7 @@ typedef struct {
         AsmReg reg;
         char *pseudo;
         int stack_offset;
+        char *data_name;
     };
 } AsmOperand;
 
@@ -557,13 +559,33 @@ typedef struct AsmInst {
 
 typedef struct {
     char *name;
+    int global;
     AsmInst *instructions;
     int stack_size; //  stack size belongs to each function
 } AsmFunc;
 
 typedef struct {
-    AsmFunc **functions;
-    int function_count;
+    char *name;
+    int global;
+    int init;
+} AsmStaticVariable;
+
+typedef enum {
+    ASM_TOP_FUNCTION,
+    ASM_TOP_STATIC_VARIABLE
+} AsmTopLevelType;
+
+typedef struct {
+    AsmTopLevelType type;
+    union {
+        AsmFunc *function;
+        AsmStaticVariable *static_variable;
+    };
+} AsmTopLevel;
+
+typedef struct {
+    AsmTopLevel **top_levels;
+    int top_level_count;
 } AsmProg;
 
 
@@ -3241,6 +3263,13 @@ AsmOperand as_stack(int offset){
     };
 }
 
+AsmOperand as_data(char *name){
+    return (AsmOperand){
+        AS_DATA,
+        .data_name=strdup(name)
+    };
+}
+
 AsmOperand convert_tacky_val(TackyVal *v){
     if (v->type==TACKY_VAL_CONSTANT){
         return as_imm(v->int_value);
@@ -3530,6 +3559,7 @@ static AsmFunc *convert_tacky_function(TackyFunction *tacky_fn){
     }
 
     asm_fn->name=strdup(tacky_fn->name);
+    asm_fn->global=tacky_fn->global;
     asm_fn->instructions=NULL;
     asm_fn->stack_size=0;
 
@@ -3566,7 +3596,7 @@ static AsmFunc *convert_tacky_function(TackyFunction *tacky_fn){
 }
 
 /*
-TACKY Program(function*) -> Assembly Program(function*)
+TACKY Program(top_level*) -> Assembly Program(top_level*)
 */
 AsmProg *tacky_to_asm(TackyProgram *tacky){
     AsmProg *asmp=calloc(1,sizeof(AsmProg));
@@ -3578,28 +3608,54 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
     for (int i=0;i<tacky->top_level_count;i++){
         TackyTopLevel *top_level=tacky->top_levels[i];
 
-        if (!top_level || top_level->type!=TACKY_TOP_FUNCTION) {
+        if (!top_level){
             continue;
         }
 
-        TackyFunction *tacky_fn=top_level->function;
-        if (!tacky_fn){
-            continue;
-        }
-
-        AsmFunc *asm_fn=convert_tacky_function(tacky_fn);
-
-        AsmFunc **new_functions=realloc(
-            asmp->functions,
-            sizeof(AsmFunc*)*(size_t)(asmp->function_count+1)
-        );
-        if (!new_functions){
-            perror("realloc assembly functions");
+        AsmTopLevel *asm_top=calloc(1,sizeof(AsmTopLevel));
+        if (!asm_top){
+            perror("calloc AsmTopLevel");
             exit(1);
         }
 
-        asmp->functions=new_functions;
-        asmp->functions[asmp->function_count++]=asm_fn;
+        if (top_level->type==TACKY_TOP_FUNCTION){
+            if (!top_level->function){
+                free(asm_top);
+                continue;
+            }
+            asm_top->type=ASM_TOP_FUNCTION;
+            asm_top->function=convert_tacky_function(top_level->function);
+        }else{
+            TackyStaticVariable *tacky_var=top_level->static_variable;
+            if (!tacky_var){
+                free(asm_top);
+                continue;
+            }
+
+            AsmStaticVariable *asm_var=calloc(1,sizeof(AsmStaticVariable));
+            if (!asm_var){
+                perror("calloc AsmStaticVariable");
+                exit(1);
+            }
+            asm_var->name=strdup(tacky_var->name);
+            asm_var->global=tacky_var->global;
+            asm_var->init=tacky_var->init;
+
+            asm_top->type=ASM_TOP_STATIC_VARIABLE;
+            asm_top->static_variable=asm_var;
+        }
+
+        AsmTopLevel **new_top_levels=realloc(
+            asmp->top_levels,
+            sizeof(AsmTopLevel*)*(size_t)(asmp->top_level_count+1)
+        );
+        if (!new_top_levels){
+            perror("realloc assembly top levels");
+            exit(1);
+        }
+
+        asmp->top_levels=new_top_levels;
+        asmp->top_levels[asmp->top_level_count++]=asm_top;
     }
 
     return asmp;
@@ -3781,9 +3837,10 @@ void fix_and_allocate(AsmProg *asmp){
         return;
     }
 
-    for (int i=0;i<asmp->function_count;i++){
-        if (asmp->functions[i]){
-            fix_and_allocate_function(asmp->functions[i]);
+    for (int i=0;i<asmp->top_level_count;i++){
+        AsmTopLevel *top_level=asmp->top_levels[i];
+        if (top_level->type==ASM_TOP_FUNCTION){
+            fix_and_allocate_function(top_level->function);
         }
     }
 }
@@ -4719,9 +4776,10 @@ static int asm_function_defined(AsmProg *asmp,const char *name){
         return 0;
     }
 
-    for (int i=0;i<asmp->function_count;i++){
-        AsmFunc *fn=asmp->functions[i];
-        if (fn && fn->name && strcmp(fn->name,name)==0){
+    for (int i=0;i<asmp->top_level_count;i++){
+        AsmTopLevel *top_level=asmp->top_levels[i];
+        if (top_level->type==ASM_TOP_FUNCTION &&
+            strcmp(top_level->function->name,name)==0){
             return 1;
         }
     }
@@ -4920,11 +4978,10 @@ void emit_asm_new(AsmProg *asmp,FILE *out){
         return;
     }
 
-    for (int i=0;i<asmp->function_count;i++){
-        AsmFunc *fn=asmp->functions[i];
-
-        if (fn){
-            emit_function(asmp,fn,out);
+    for (int i=0;i<asmp->top_level_count;i++){
+        AsmTopLevel *top_level=asmp->top_levels[i];
+        if (top_level->type==ASM_TOP_FUNCTION){
+            emit_function(asmp,top_level->function,out);
         }
     }
 
