@@ -3667,7 +3667,11 @@ typedef struct {
     int offset;
 } MapEntry;
 
-static void fix_and_allocate_function(AsmFunc *fn){
+static int is_memory_operand(AsmOperand op){
+    return op.type==AS_STACK || op.type==AS_DATA;
+}
+
+static void fix_and_allocate_function(AsmFunc *fn,Symbol *symbols){
     MapEntry map[1000];
     int map_size=0;
     int current_stack=-4;
@@ -3675,9 +3679,9 @@ static void fix_and_allocate_function(AsmFunc *fn){
     AsmInst *curr=fn->instructions;
 
     /*
-    Replace every pseudoregister in this function with its own stack slot.
-    This also handles pseudoregisters used by parameter copies and Push-related
-    helper instructions.
+    Replace every pseudoregister in this function with its own stack slot,
+    unless it names a variable with static storage duration, which becomes
+    a Data operand instead.
     */
     while (curr){
         AsmOperand *ops[2]={
@@ -3699,6 +3703,12 @@ static void fix_and_allocate_function(AsmFunc *fn){
                 }
 
                 if (!already_exists){
+                    Symbol *sym=symbol_find(symbols,ops[i]->pseudo);
+                    if (sym && sym->attr_type==SYMBOL_ATTR_STATIC){
+                        *ops[i]=as_data(ops[i]->pseudo);
+                        continue;
+                    }
+
                     if (map_size >= (int)(sizeof(map)/sizeof(map[0]))){
                         fprintf(stderr,"Codegen Error: too many pseudoregisters in function %s\n",fn->name);
                         exit(1);
@@ -3746,8 +3756,8 @@ static void fix_and_allocate_function(AsmFunc *fn){
     while (curr){
         if ((curr->type==AS_MOV ||
              (curr->type==AS_BINARY && curr->binary_op!=BINARY_MULT))
-            && curr->src.type==AS_STACK
-            && curr->dst.type==AS_STACK){
+            && is_memory_operand(curr->src)
+            && is_memory_operand(curr->dst)){
 
             AsmInst *new_op=calloc(1,sizeof(AsmInst));
             new_op->type=curr->type;
@@ -3762,7 +3772,7 @@ static void fix_and_allocate_function(AsmFunc *fn){
             curr=new_op;
         }
         else if (curr->type==AS_CMP){
-            if (curr->src.type==AS_STACK && curr->dst.type==AS_STACK){
+            if (is_memory_operand(curr->src) && is_memory_operand(curr->dst)){
                 AsmInst *new_cmp=calloc(1,sizeof(AsmInst));
                 new_cmp->type=AS_CMP;
                 new_cmp->src=as_reg(REG_R10D);
@@ -3804,7 +3814,7 @@ static void fix_and_allocate_function(AsmFunc *fn){
         }
         else if (curr->type==AS_BINARY &&
                  curr->binary_op==BINARY_MULT &&
-                 curr->dst.type==AS_STACK){
+                 is_memory_operand(curr->dst)){
 
             AsmInst *mov_back=calloc(1,sizeof(AsmInst));
             mov_back->type=AS_MOV;
@@ -3832,7 +3842,7 @@ static void fix_and_allocate_function(AsmFunc *fn){
     }
 }
 
-void fix_and_allocate(AsmProg *asmp){
+void fix_and_allocate(AsmProg *asmp,Symbol *symbols){
     if (!asmp){
         return;
     }
@@ -3840,7 +3850,7 @@ void fix_and_allocate(AsmProg *asmp){
     for (int i=0;i<asmp->top_level_count;i++){
         AsmTopLevel *top_level=asmp->top_levels[i];
         if (top_level->type==ASM_TOP_FUNCTION){
-            fix_and_allocate_function(top_level->function);
+            fix_and_allocate_function(top_level->function,symbols);
         }
     }
 }
@@ -5096,7 +5106,7 @@ int main(int argc,char *argv[]){
 
     //codegen
     AsmProg *asmp=tacky_to_asm(tacky_prog);
-    fix_and_allocate(asmp);
+    fix_and_allocate(asmp,symbols);
     if (stage==5){
         return 0;
     }
