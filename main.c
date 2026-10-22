@@ -3263,13 +3263,6 @@ AsmOperand as_stack(int offset){
     };
 }
 
-AsmOperand as_data(char *name){
-    return (AsmOperand){
-        AS_DATA,
-        .data_name=strdup(name)
-    };
-}
-
 AsmOperand convert_tacky_val(TackyVal *v){
     if (v->type==TACKY_VAL_CONSTANT){
         return as_imm(v->int_value);
@@ -3618,31 +3611,35 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
             exit(1);
         }
 
-        if (top_level->type==TACKY_TOP_FUNCTION){
-            if (!top_level->function){
-                free(asm_top);
-                continue;
-            }
-            asm_top->type=ASM_TOP_FUNCTION;
-            asm_top->function=convert_tacky_function(top_level->function);
-        }else{
-            TackyStaticVariable *tacky_var=top_level->static_variable;
-            if (!tacky_var){
-                free(asm_top);
-                continue;
-            }
+        switch (top_level->type){
+            case TACKY_TOP_FUNCTION:
+                if (!top_level->function){
+                    free(asm_top);
+                    continue;
+                }
+                asm_top->type=ASM_TOP_FUNCTION;
+                asm_top->function=convert_tacky_function(top_level->function);
+                break;
+            case TACKY_TOP_STATIC_VARIABLE: {
+                TackyStaticVariable *tacky_var=top_level->static_variable;
+                if (!tacky_var){
+                    free(asm_top);
+                    continue;
+                }
 
-            AsmStaticVariable *asm_var=calloc(1,sizeof(AsmStaticVariable));
-            if (!asm_var){
-                perror("calloc AsmStaticVariable");
-                exit(1);
-            }
-            asm_var->name=strdup(tacky_var->name);
-            asm_var->global=tacky_var->global;
-            asm_var->init=tacky_var->init;
+                AsmStaticVariable *asm_var=calloc(1,sizeof(AsmStaticVariable));
+                if (!asm_var){
+                    perror("calloc AsmStaticVariable");
+                    exit(1);
+                }
+                asm_var->name=strdup(tacky_var->name);
+                asm_var->global=tacky_var->global;
+                asm_var->init=tacky_var->init;
 
-            asm_top->type=ASM_TOP_STATIC_VARIABLE;
-            asm_top->static_variable=asm_var;
+                asm_top->type=ASM_TOP_STATIC_VARIABLE;
+                asm_top->static_variable=asm_var;
+                break;
+            }
         }
 
         AsmTopLevel **new_top_levels=realloc(
@@ -3705,7 +3702,8 @@ static void fix_and_allocate_function(AsmFunc *fn,Symbol *symbols){
                 if (!already_exists){
                     Symbol *sym=symbol_find(symbols,ops[i]->pseudo);
                     if (sym && sym->attr_type==SYMBOL_ATTR_STATIC){
-                        *ops[i]=as_data(ops[i]->pseudo);
+                        ops[i]->type=AS_DATA;
+                        ops[i]->data_name=ops[i]->pseudo;
                         continue;
                     }
 
@@ -4666,12 +4664,14 @@ static const char *reg_name_32(AsmReg reg){
     return names[reg];
 }
 
-static void emit_data_op(AsmOperand op,FILE *out){
 #ifdef __APPLE__
-    fprintf(out,"_%s(%%rip)",op.data_name);
+#define SYMBOL_PREFIX "_"
 #else
-    fprintf(out,"%s(%%rip)",op.data_name);
+#define SYMBOL_PREFIX ""
 #endif
+
+static void emit_data_op(AsmOperand op,FILE *out){
+    fprintf(out,SYMBOL_PREFIX "%s(%%rip)",op.data_name);
 }
 
 static const char *reg_name_8(AsmReg reg){
@@ -4982,17 +4982,10 @@ static void emit_function(
     AsmFunc *fn,
     FILE *out
 ){
-#ifdef __APPLE__
     if (fn->global){
-        fprintf(out,".globl _%s\n",fn->name);
+        fprintf(out,".globl " SYMBOL_PREFIX "%s\n",fn->name);
     }
-    fprintf(out,".text\n_%s:\n",fn->name);
-#else
-    if (fn->global){
-        fprintf(out,".globl %s\n",fn->name);
-    }
-    fprintf(out,".text\n%s:\n",fn->name);
-#endif
+    fprintf(out,".text\n" SYMBOL_PREFIX "%s:\n",fn->name);
 
     fprintf(out,"    pushq   %%rbp\n");
     fprintf(out,"    movq    %%rsp, %%rbp\n");
@@ -5007,20 +5000,14 @@ static void emit_function(
 }
 
 static void emit_static_variable(AsmStaticVariable *var,FILE *out){
-#ifdef __APPLE__
-    const char *prefix="_";
-#else
-    const char *prefix="";
-#endif
-
     if (var->global){
-        fprintf(out,".globl %s%s\n",prefix,var->name);
+        fprintf(out,".globl " SYMBOL_PREFIX "%s\n",var->name);
     }
 
     if (var->init!=0){
-        fprintf(out,".data\n.balign 4\n%s%s:\n    .long %d\n",prefix,var->name,var->init);
+        fprintf(out,".data\n.balign 4\n" SYMBOL_PREFIX "%s:\n    .long %d\n",var->name,var->init);
     }else{
-        fprintf(out,".bss\n.balign 4\n%s%s:\n    .zero 4\n",prefix,var->name);
+        fprintf(out,".bss\n.balign 4\n" SYMBOL_PREFIX "%s:\n    .zero 4\n",var->name);
     }
 
     fprintf(out,"\n");
@@ -5033,10 +5020,13 @@ void emit_asm_new(AsmProg *asmp,FILE *out){
 
     for (int i=0;i<asmp->top_level_count;i++){
         AsmTopLevel *top_level=asmp->top_levels[i];
-        if (top_level->type==ASM_TOP_FUNCTION){
-            emit_function(asmp,top_level->function,out);
-        }else{
-            emit_static_variable(top_level->static_variable,out);
+        switch (top_level->type){
+            case ASM_TOP_FUNCTION:
+                emit_function(asmp,top_level->function,out);
+                break;
+            case ASM_TOP_STATIC_VARIABLE:
+                emit_static_variable(top_level->static_variable,out);
+                break;
         }
     }
 
