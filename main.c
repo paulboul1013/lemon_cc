@@ -578,11 +578,10 @@ typedef enum {
 //Asm AST Node
 typedef enum {
     AS_MOV,
+    AS_MOVSX, // sign extend longword to quadword
     AS_NEG,
     AS_NOT,
     AS_RET,
-    AS_ALLOCATE_STACK,
-    AS_DEALLOCATE_STACK, //  addq $n, %rsp after a call
     AS_PUSH,             //  push an argument
     AS_CALL,             //  call function
     AS_BINARY, //for add,sub,mult
@@ -605,22 +604,29 @@ typedef enum {
     AS_DATA // static storage, foo(%rip)
 } AsmOpType;
 
+//emission picks the 8/32/64-bit name from the operand size
 typedef enum{
-    REG_EAX,
-    REG_R10D, //for mem to mem source fix
-    REG_EDX,  //for idiv and third argument
-    REG_R11D, //for imul fix
-    REG_ECX,  //for shift and fourth argument
-    REG_EDI,  //  first argument
-    REG_ESI,  //  second argument
-    REG_R8D,  //  fifth argument
-    REG_R9D   //  sixth argument
+    REG_AX,
+    REG_CX,  //for shift and fourth argument
+    REG_DX,  //for idiv and third argument
+    REG_DI,  //  first argument
+    REG_SI,  //  second argument
+    REG_R8,  //  fifth argument
+    REG_R9,  //  sixth argument
+    REG_R10, //for source operand fix-up
+    REG_R11, //for destination operand fix-up
+    REG_SP
 } AsmReg;
+
+typedef enum {
+    ASM_LONGWORD,
+    ASM_QUADWORD
+} AsmType;
 
 typedef struct {
     AsmOpType type;
     union {
-        int imm;
+        long imm;
         AsmReg reg;
         char *pseudo;
         int stack_offset;
@@ -630,6 +636,7 @@ typedef struct {
 
 typedef struct AsmInst {
     AsmInstType type;
+    AsmType asm_type; //operand size of Mov/Unary/Binary/Cmp/Idiv/Cdq
     BinaryOpType binary_op;
     CondCode cond;
     AsmOperand src;
@@ -648,7 +655,8 @@ typedef struct {
 typedef struct {
     char *name;
     int global;
-    int init;
+    int alignment;
+    StaticInit init;
 } AsmStaticVariable;
 
 typedef enum {
@@ -664,9 +672,25 @@ typedef struct {
     };
 } AsmTopLevel;
 
+//backend symbol table entry: ObjEntry(asm_type, is_static) | FunEntry(defined)
+typedef enum {
+    ASM_SYMBOL_OBJ,
+    ASM_SYMBOL_FUN
+} AsmSymbolKind;
+
+typedef struct AsmSymbol {
+    char *name;
+    AsmSymbolKind kind;
+    AsmType asm_type; //ObjEntry
+    int is_static;    //ObjEntry
+    int defined;      //FunEntry
+    struct AsmSymbol *next;
+} AsmSymbol;
+
 typedef struct {
     AsmTopLevel **top_levels;
     int top_level_count;
+    AsmSymbol *symbols;
 } AsmProg;
 
 
@@ -3562,7 +3586,7 @@ void resolve_program(Program *prog){
 }
 
 //support build operator
-AsmOperand as_imm(int i){
+AsmOperand as_imm(long i){
     return (AsmOperand){
         AS_IMM,
         .imm=i
@@ -3592,10 +3616,34 @@ AsmOperand as_stack(int offset){
 
 AsmOperand convert_tacky_val(TackyVal *v){
     if (v->type==TACKY_VAL_CONSTANT){
-        return as_imm((int)v->constant.value);
+        return as_imm(v->constant.value);
     }
 
     return as_pseudo(v->var_name);
+}
+
+AsmType type_to_asm_type(Type *t){
+    return t->kind==TYPE_LONG ? ASM_QUADWORD : ASM_LONGWORD;
+}
+
+int type_alignment(Type *t){
+    return t->kind==TYPE_LONG ? 8 : 4;
+}
+
+static AsmType variable_asm_type(Symbol *symbols,const char *name){
+    Symbol *entry=symbol_find(symbols,name);
+    if (!entry){
+        fprintf(stderr,"Codegen Error: missing symbol '%s'\n",name);
+        exit(1);
+    }
+    return type_to_asm_type(entry->type);
+}
+
+static AsmType tacky_val_asm_type(TackyVal *v,Symbol *symbols){
+    if (v->type==TACKY_VAL_CONSTANT){
+        return v->constant.type==CONST_LONG ? ASM_QUADWORD : ASM_LONGWORD;
+    }
+    return variable_asm_type(symbols,v->var_name);
 }
 
 //helper function: let TACKY operator turn it to Asm condition code
@@ -3611,9 +3659,9 @@ CondCode binary_to_cond(BinaryOpType op){
     }
 }
 
-void append_asm(
-    AsmInst **head,
+AsmInst *make_asm(
     AsmInstType type,
+    AsmType asm_type,
     BinaryOpType op,
     CondCode cond,
     AsmOperand src,
@@ -3622,12 +3670,27 @@ void append_asm(
 ){
     AsmInst *new_inst=calloc(1,sizeof(AsmInst));
     new_inst->type=type;
+    new_inst->asm_type=asm_type;
     new_inst->binary_op=op;
     new_inst->cond=cond;
     new_inst->src=src;
     new_inst->dst=dst;
     new_inst->label=label ? strdup(label):NULL;
     new_inst->next=NULL;
+    return new_inst;
+}
+
+void append_asm(
+    AsmInst **head,
+    AsmInstType type,
+    AsmType asm_type,
+    BinaryOpType op,
+    CondCode cond,
+    AsmOperand src,
+    AsmOperand dst,
+    char *label
+){
+    AsmInst *new_inst=make_asm(type,asm_type,op,cond,src,dst,label);
 
     if (*head==NULL){
         *head=new_inst;
@@ -3640,22 +3703,24 @@ void append_asm(
     }
 }
 
+static const AsmOperand NO_OPERAND={0};
+
 /*
 System V integer argument registers:
-1 -> EDI
-2 -> ESI
-3 -> EDX
-4 -> ECX
-5 -> R8D
-6 -> R9D
+1 -> DI
+2 -> SI
+3 -> DX
+4 -> CX
+5 -> R8
+6 -> R9
 */
 static const AsmReg ARG_REGISTERS[6]={
-    REG_EDI,
-    REG_ESI,
-    REG_EDX,
-    REG_ECX,
-    REG_R8D,
-    REG_R9D
+    REG_DI,
+    REG_SI,
+    REG_DX,
+    REG_CX,
+    REG_R8,
+    REG_R9
 };
 
 /*
@@ -3663,16 +3728,17 @@ Convert:
     FunCall(fun_name, args, dst)
 
 into:
-    optional AllocateStack(8)
-    Mov(arg1, EDI) ... Mov(arg6, R9D)
+    optional Binary(Sub, Quadword, Imm(8), Reg(SP))
+    Mov(arg1, DI) ... Mov(arg6, R9)
     Push(stack arguments in reverse order)
     Call(fun_name)
-    optional DeallocateStack(...)
-    Mov(EAX, dst)
+    optional Binary(Add, Quadword, Imm(bytes), Reg(SP))
+    Mov(AX, dst)
 */
 static void convert_function_call(
     TackyInstruction *call,
-    AsmInst **head
+    AsmInst **head,
+    Symbol *symbols
 ){
     int register_arg_count=call->arg_count < 6 ? call->arg_count : 6;
     int stack_arg_count=call->arg_count > 6 ? call->arg_count-6 : 0;
@@ -3681,15 +3747,7 @@ static void convert_function_call(
     int stack_padding=(stack_arg_count % 2) ? 8 : 0;
 
     if (stack_padding){
-        append_asm(
-            head,
-            AS_ALLOCATE_STACK,
-            0,
-            0,
-            as_imm(stack_padding),
-            (AsmOperand){0},
-            NULL
-        );
+        append_asm(head,AS_BINARY,ASM_QUADWORD,BINARY_SUB,0,as_imm(stack_padding),as_reg(REG_SP),NULL);
     }
 
     //First six integer arguments go into registers.
@@ -3697,6 +3755,7 @@ static void convert_function_call(
         append_asm(
             head,
             AS_MOV,
+            tacky_val_asm_type(call->args[i],symbols),
             0,
             0,
             convert_tacky_val(call->args[i]),
@@ -3708,75 +3767,35 @@ static void convert_function_call(
     //Remaining arguments are pushed right-to-left.
     for (int i=call->arg_count-1;i>=6;i--){
         AsmOperand arg=convert_tacky_val(call->args[i]);
+        AsmType arg_type=tacky_val_asm_type(call->args[i],symbols);
 
-        if (arg.type==AS_IMM || arg.type==AS_REG){
-            append_asm(
-                head,
-                AS_PUSH,
-                0,
-                0,
-                arg,
-                (AsmOperand){0},
-                NULL
-            );
+        if (arg.type==AS_IMM || arg.type==AS_REG || arg_type==ASM_QUADWORD){
+            append_asm(head,AS_PUSH,ASM_QUADWORD,0,0,arg,NO_OPERAND,NULL);
         }else{
             /*
-            A pseudo will eventually be a 4-byte memory operand.
-            Do not push 8 bytes directly from that memory location.
-            Copy it to EAX first, then push the full RAX register later
-            during code emission.
+            pushq would read 8 bytes from a 4-byte memory operand,
+            so copy it into EAX and push the full RAX register instead.
             */
-            append_asm(
-                head,
-                AS_MOV,
-                0,
-                0,
-                arg,
-                as_reg(REG_EAX),
-                NULL
-            );
-            append_asm(
-                head,
-                AS_PUSH,
-                0,
-                0,
-                as_reg(REG_EAX),
-                (AsmOperand){0},
-                NULL
-            );
+            append_asm(head,AS_MOV,ASM_LONGWORD,0,0,arg,as_reg(REG_AX),NULL);
+            append_asm(head,AS_PUSH,ASM_QUADWORD,0,0,as_reg(REG_AX),NO_OPERAND,NULL);
         }
     }
 
-    append_asm(
-        head,
-        AS_CALL,
-        0,
-        0,
-        (AsmOperand){0},
-        (AsmOperand){0},
-        call->fun_name
-    );
+    append_asm(head,AS_CALL,0,0,0,NO_OPERAND,NO_OPERAND,call->fun_name);
 
     int bytes_to_remove=stack_arg_count*8 + stack_padding;
     if (bytes_to_remove){
-        append_asm(
-            head,
-            AS_DEALLOCATE_STACK,
-            0,
-            0,
-            as_imm(bytes_to_remove),
-            (AsmOperand){0},
-            NULL
-        );
+        append_asm(head,AS_BINARY,ASM_QUADWORD,BINARY_ADD,0,as_imm(bytes_to_remove),as_reg(REG_SP),NULL);
     }
 
-    //Integer return value is in EAX.
+    //Integer return value is in AX.
     append_asm(
         head,
         AS_MOV,
+        tacky_val_asm_type(call->dst,symbols),
         0,
         0,
-        as_reg(REG_EAX),
+        as_reg(REG_AX),
         convert_tacky_val(call->dst),
         NULL
     );
@@ -3784,88 +3803,95 @@ static void convert_function_call(
 
 static void convert_tacky_instruction(
     TackyInstruction *curr,
-    AsmInst **head
+    AsmInst **head,
+    Symbol *symbols
 ){
     switch (curr->type){
         case TACKY_INST_RETURN:
-            append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src),as_reg(REG_EAX),NULL);
-            append_asm(head,AS_RET,0,0,(AsmOperand){0},(AsmOperand){0},NULL);
+            append_asm(head,AS_MOV,tacky_val_asm_type(curr->src,symbols),0,0,convert_tacky_val(curr->src),as_reg(REG_AX),NULL);
+            append_asm(head,AS_RET,0,0,0,NO_OPERAND,NO_OPERAND,NULL);
+            break;
+
+        case TACKY_INST_SIGN_EXTEND:
+            append_asm(head,AS_MOVSX,ASM_QUADWORD,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+            break;
+
+        //copying the low 4 bytes drops the upper half
+        case TACKY_INST_TRUNCATE:
+            append_asm(head,AS_MOV,ASM_LONGWORD,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
             break;
 
         case TACKY_INST_COPY:
-            append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+            append_asm(head,AS_MOV,tacky_val_asm_type(curr->src,symbols),0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
             break;
 
         case TACKY_INST_JUMP:
-            append_asm(head,AS_JMP,0,0,(AsmOperand){0},(AsmOperand){0},curr->label_name);
+            append_asm(head,AS_JMP,0,0,0,NO_OPERAND,NO_OPERAND,curr->label_name);
             break;
 
         case TACKY_INST_LABEL:
-            append_asm(head,AS_LABEL,0,0,(AsmOperand){0},(AsmOperand){0},curr->label_name);
+            append_asm(head,AS_LABEL,0,0,0,NO_OPERAND,NO_OPERAND,curr->label_name);
             break;
 
         case TACKY_INST_JZ:
-            append_asm(head,AS_CMP,0,0,as_imm(0),convert_tacky_val(curr->src),NULL);
-            append_asm(head,AS_JMP_CC,0,COND_E,(AsmOperand){0},(AsmOperand){0},curr->label_name);
+        case TACKY_INST_JNZ: {
+            CondCode cond=(curr->type==TACKY_INST_JZ) ? COND_E : COND_NE;
+            append_asm(head,AS_CMP,tacky_val_asm_type(curr->src,symbols),0,0,as_imm(0),convert_tacky_val(curr->src),NULL);
+            append_asm(head,AS_JMP_CC,0,0,cond,NO_OPERAND,NO_OPERAND,curr->label_name);
             break;
-
-        case TACKY_INST_JNZ:
-            append_asm(head,AS_CMP,0,0,as_imm(0),convert_tacky_val(curr->src),NULL);
-            append_asm(head,AS_JMP_CC,0,COND_NE,(AsmOperand){0},(AsmOperand){0},curr->label_name);
-            break;
+        }
 
         case TACKY_INST_UNARY:{
+            AsmType src_type=tacky_val_asm_type(curr->src,symbols);
+
             if (curr->unary_op==UNARY_NOT){
-                append_asm(head,AS_CMP,0,0,as_imm(0),convert_tacky_val(curr->src),NULL);
-                append_asm(head,AS_MOV,0,0,as_imm(0),convert_tacky_val(curr->dst),NULL);
-                append_asm(head,AS_SET_CC,0,COND_E,(AsmOperand){0},convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_CMP,src_type,0,0,as_imm(0),convert_tacky_val(curr->src),NULL);
+                append_asm(head,AS_MOV,tacky_val_asm_type(curr->dst,symbols),0,0,as_imm(0),convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_SET_CC,0,0,COND_E,NO_OPERAND,convert_tacky_val(curr->dst),NULL);
             }else{
-                append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
                 AsmInstType type=(curr->unary_op==UNARY_NEGATION)?AS_NEG:AS_NOT;
-                append_asm(head,type,0,0,(AsmOperand){0},convert_tacky_val(curr->dst),NULL);
+                append_asm(head,type,src_type,0,0,NO_OPERAND,convert_tacky_val(curr->dst),NULL);
             }
             break;
         }
 
         case TACKY_INST_BINARY:{
-            if (curr->binary_op==BINARY_DIV || curr->binary_op==BINARY_REM){
-                append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src),as_reg(REG_EAX),NULL);
-                append_asm(head,AS_CDQ,0,0,(AsmOperand){0},(AsmOperand){0},NULL);
-                append_asm(head,AS_IDIV,0,0,convert_tacky_val(curr->src2),(AsmOperand){0},NULL);
+            AsmType src_type=tacky_val_asm_type(curr->src,symbols);
 
-                AsmReg res_reg=(curr->binary_op==BINARY_DIV) ? REG_EAX:REG_EDX;
-                append_asm(head,AS_MOV,0,0,as_reg(res_reg),convert_tacky_val(curr->dst),NULL);
+            if (curr->binary_op==BINARY_DIV || curr->binary_op==BINARY_REM){
+                append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),as_reg(REG_AX),NULL);
+                append_asm(head,AS_CDQ,src_type,0,0,NO_OPERAND,NO_OPERAND,NULL);
+                append_asm(head,AS_IDIV,src_type,0,0,convert_tacky_val(curr->src2),NO_OPERAND,NULL);
+
+                AsmReg res_reg=(curr->binary_op==BINARY_DIV) ? REG_AX:REG_DX;
+                append_asm(head,AS_MOV,src_type,0,0,as_reg(res_reg),convert_tacky_val(curr->dst),NULL);
             }
             else if (curr->binary_op==BINARY_LSHIFT || curr->binary_op==BINARY_RSHIFT){
                 if (curr->src2->type==TACKY_VAL_CONSTANT){
-                    append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
-                    append_asm(head,AS_BINARY,curr->binary_op,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst),NULL);
+                    append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+                    append_asm(head,AS_BINARY,src_type,curr->binary_op,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst),NULL);
                 }else{
-                    append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src2),as_reg(REG_ECX),NULL);
-                    append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
-                    append_asm(head,AS_BINARY,curr->binary_op,0,as_reg(REG_ECX),convert_tacky_val(curr->dst),NULL);
+                    append_asm(head,AS_MOV,tacky_val_asm_type(curr->src2,symbols),0,0,convert_tacky_val(curr->src2),as_reg(REG_CX),NULL);
+                    append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+                    append_asm(head,AS_BINARY,src_type,curr->binary_op,0,as_reg(REG_CX),convert_tacky_val(curr->dst),NULL);
                 }
             }
             else if (curr->binary_op>=BINARY_EQ && curr->binary_op<=BINARY_GTE){
-                append_asm(head,AS_CMP,0,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->src),NULL);
-                append_asm(head,AS_MOV,0,0,as_imm(0),convert_tacky_val(curr->dst),NULL);
-                append_asm(head,AS_SET_CC,0,binary_to_cond(curr->binary_op),(AsmOperand){0},convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_CMP,src_type,0,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->src),NULL);
+                append_asm(head,AS_MOV,tacky_val_asm_type(curr->dst,symbols),0,0,as_imm(0),convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_SET_CC,0,0,binary_to_cond(curr->binary_op),NO_OPERAND,convert_tacky_val(curr->dst),NULL);
             }
             else{
-                append_asm(head,AS_MOV,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
-                append_asm(head,AS_BINARY,curr->binary_op,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_BINARY,src_type,curr->binary_op,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst),NULL);
             }
             break;
         }
 
         case TACKY_INST_FUN_CALL:
-            convert_function_call(curr,head);
+            convert_function_call(curr,head,symbols);
             break;
-
-        case TACKY_INST_SIGN_EXTEND:
-        case TACKY_INST_TRUNCATE:
-            fprintf(stderr,"Codegen Error: long conversions are not supported yet\n");
-            exit(1);
     }
 }
 
@@ -3876,7 +3902,7 @@ At function entry, copy parameters out of their ABI-defined locations
 into pseudoregisters.  Pseudoregister replacement will later give them
 ordinary stack slots, just like local variables.
 */
-static AsmFunc *convert_tacky_function(TackyFunction *tacky_fn){
+static AsmFunc *convert_tacky_function(TackyFunction *tacky_fn,Symbol *symbols){
     AsmFunc *asm_fn=calloc(1,sizeof(AsmFunc));
     if (!asm_fn){
         perror("calloc AsmFunc");
@@ -3903,6 +3929,7 @@ static AsmFunc *convert_tacky_function(TackyFunction *tacky_fn){
         append_asm(
             head,
             AS_MOV,
+            variable_asm_type(symbols,tacky_fn->params[i]),
             0,
             0,
             src,
@@ -3914,16 +3941,53 @@ static AsmFunc *convert_tacky_function(TackyFunction *tacky_fn){
     for (TackyInstruction *curr=tacky_fn->instructions;
          curr!=NULL;
          curr=curr->next){
-        convert_tacky_instruction(curr,head);
+        convert_tacky_instruction(curr,head,symbols);
     }
 
     return asm_fn;
 }
 
+static AsmSymbol *build_backend_symbols(Symbol *symbols){
+    AsmSymbol *backend=NULL;
+
+    for (Symbol *entry=symbols;entry;entry=entry->next){
+        AsmSymbol *asm_entry=calloc(1,sizeof(AsmSymbol));
+        if (!asm_entry){
+            perror("calloc AsmSymbol");
+            exit(1);
+        }
+
+        asm_entry->name=strdup(entry->name);
+        if (entry->type->kind==TYPE_FUNCTION){
+            asm_entry->kind=ASM_SYMBOL_FUN;
+            asm_entry->defined=entry->defined;
+        }else{
+            asm_entry->kind=ASM_SYMBOL_OBJ;
+            asm_entry->asm_type=type_to_asm_type(entry->type);
+            asm_entry->is_static=(entry->attr_type==SYMBOL_ATTR_STATIC);
+        }
+
+        asm_entry->next=backend;
+        backend=asm_entry;
+    }
+
+    return backend;
+}
+
+static AsmSymbol *asm_symbol_find(AsmSymbol *symbols,const char *name){
+    while (symbols){
+        if (strcmp(symbols->name,name)==0){
+            return symbols;
+        }
+        symbols=symbols->next;
+    }
+    return NULL;
+}
+
 /*
 TACKY Program(top_level*) -> Assembly Program(top_level*)
 */
-AsmProg *tacky_to_asm(TackyProgram *tacky){
+AsmProg *tacky_to_asm(TackyProgram *tacky,Symbol *symbols){
     AsmProg *asmp=calloc(1,sizeof(AsmProg));
     if (!asmp){
         perror("calloc AsmProg");
@@ -3950,7 +4014,7 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
                     continue;
                 }
                 asm_top->type=ASM_TOP_FUNCTION;
-                asm_top->function=convert_tacky_function(top_level->function);
+                asm_top->function=convert_tacky_function(top_level->function,symbols);
                 break;
             case TACKY_TOP_STATIC_VARIABLE: {
                 TackyStaticVariable *tacky_var=top_level->static_variable;
@@ -3966,7 +4030,8 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
                 }
                 asm_var->name=strdup(tacky_var->name);
                 asm_var->global=tacky_var->global;
-                asm_var->init=(int)tacky_var->init.value;
+                asm_var->alignment=type_alignment(tacky_var->type);
+                asm_var->init=tacky_var->init;
 
                 asm_top->type=ASM_TOP_STATIC_VARIABLE;
                 asm_top->static_variable=asm_var;
@@ -3987,6 +4052,8 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
         asmp->top_levels[asmp->top_level_count++]=asm_top;
     }
 
+    asmp->symbols=build_backend_symbols(symbols);
+
     return asmp;
 }
 
@@ -4000,179 +4067,207 @@ static int is_memory_operand(AsmOperand op){
     return op.type==AS_STACK || op.type==AS_DATA;
 }
 
-static void fix_and_allocate_function(AsmFunc *fn,Symbol *symbols){
+static int is_large_imm(AsmOperand op){
+    return op.type==AS_IMM && (op.imm < -2147483648L || op.imm > 2147483647L);
+}
+
+static void replace_pseudos(AsmFunc *fn,AsmSymbol *symbols){
     MapEntry map[1000];
     int map_size=0;
-    int current_stack=-4;
-
-    AsmInst *curr=fn->instructions;
+    int stack_bytes=0;
 
     /*
     Replace every pseudoregister in this function with its own stack slot,
     unless it names a variable with static storage duration, which becomes
     a Data operand instead.
     */
-    while (curr){
+    for (AsmInst *curr=fn->instructions;curr;curr=curr->next){
         AsmOperand *ops[2]={
             &curr->src,
             &curr->dst
         };
 
         for (int i=0;i<2;i++){
-            if (ops[i]->type==AS_PSEUDO){
-                int found_offset=0;
-                int already_exists=0;
-
-                for (int j=0;j<map_size;j++){
-                    if (strcmp(map[j].name,ops[i]->pseudo)==0){
-                        found_offset=map[j].offset;
-                        already_exists=1;
-                        break;
-                    }
-                }
-
-                if (!already_exists){
-                    Symbol *sym=symbol_find(symbols,ops[i]->pseudo);
-                    if (sym && sym->attr_type==SYMBOL_ATTR_STATIC){
-                        ops[i]->type=AS_DATA;
-                        ops[i]->data_name=ops[i]->pseudo;
-                        continue;
-                    }
-
-                    if (map_size >= (int)(sizeof(map)/sizeof(map[0]))){
-                        fprintf(stderr,"Codegen Error: too many pseudoregisters in function %s\n",fn->name);
-                        exit(1);
-                    }
-
-                    map[map_size].name=strdup(ops[i]->pseudo);
-                    map[map_size].offset=current_stack;
-                    found_offset=current_stack;
-                    current_stack-=4;
-                    map_size++;
-                }
-
-                ops[i]->type=AS_STACK;
-                ops[i]->stack_offset=found_offset;
+            if (ops[i]->type!=AS_PSEUDO){
+                continue;
             }
+
+            int found_offset=0;
+            int already_exists=0;
+
+            for (int j=0;j<map_size;j++){
+                if (strcmp(map[j].name,ops[i]->pseudo)==0){
+                    found_offset=map[j].offset;
+                    already_exists=1;
+                    break;
+                }
+            }
+
+            if (!already_exists){
+                AsmSymbol *sym=asm_symbol_find(symbols,ops[i]->pseudo);
+                if (!sym || sym->kind!=ASM_SYMBOL_OBJ){
+                    fprintf(stderr,"Codegen Error: unknown pseudoregister '%s'\n",ops[i]->pseudo);
+                    exit(1);
+                }
+
+                if (sym->is_static){
+                    ops[i]->type=AS_DATA;
+                    ops[i]->data_name=ops[i]->pseudo;
+                    continue;
+                }
+
+                if (map_size >= (int)(sizeof(map)/sizeof(map[0]))){
+                    fprintf(stderr,"Codegen Error: too many pseudoregisters in function %s\n",fn->name);
+                    exit(1);
+                }
+
+                if (sym->asm_type==ASM_QUADWORD){
+                    stack_bytes=((stack_bytes+8+7)/8)*8;
+                }else{
+                    stack_bytes+=4;
+                }
+
+                map[map_size].name=strdup(ops[i]->pseudo);
+                map[map_size].offset=-stack_bytes;
+                found_offset=-stack_bytes;
+                map_size++;
+            }
+
+            ops[i]->type=AS_STACK;
+            ops[i]->stack_offset=found_offset;
         }
-
-        curr=curr->next;
     }
-
-    int raw_stack_size=-(current_stack+4);
 
     /*
     Each function gets its own stack size, rounded up to a
     multiple of 16 so calls made from this function remain aligned.
     */
-    int aligned_stack_size=0;
-    if (raw_stack_size>0){
-        aligned_stack_size=((raw_stack_size+15)/16)*16;
-    }
-    fn->stack_size=aligned_stack_size;
+    fn->stack_size=((stack_bytes+15)/16)*16;
+}
 
-    if (aligned_stack_size>0){
-        AsmInst *allocate=calloc(1,sizeof(AsmInst));
-        allocate->type=AS_ALLOCATE_STACK;
-        allocate->src=as_imm(aligned_stack_size);
-        allocate->next=fn->instructions;
-        fn->instructions=allocate;
+static void push_inst(AsmInst ***tail,AsmInst *inst){
+    **tail=inst;
+    *tail=&inst->next;
+}
+
+/*
+Rewrite one instruction into a valid sequence and append it at *tail.
+R10 fixes source operands and R11 fixes destination operands.
+*/
+static void fix_instruction(AsmInst *inst,AsmInst ***tail){
+
+    AsmType t=inst->asm_type;
+
+    switch (inst->type){
+        case AS_MOV:
+            //movl would truncate an 8-byte immediate anyway; do it here to avoid assembler warnings
+            if (t==ASM_LONGWORD && inst->src.type==AS_IMM){
+                inst->src.imm=(int)inst->src.imm;
+            }
+
+            if ((is_memory_operand(inst->src) && is_memory_operand(inst->dst)) ||
+                (is_large_imm(inst->src) && is_memory_operand(inst->dst))){
+                push_inst(tail,make_asm(AS_MOV,t,0,0,inst->src,as_reg(REG_R10),NULL));
+                inst->src=as_reg(REG_R10);
+            }
+            break;
+
+        case AS_MOVSX:
+            if (inst->src.type==AS_IMM){
+                push_inst(tail,make_asm(AS_MOV,ASM_LONGWORD,0,0,inst->src,as_reg(REG_R10),NULL));
+                inst->src=as_reg(REG_R10);
+            }
+
+            if (is_memory_operand(inst->dst)){
+                AsmOperand dst=inst->dst;
+                push_inst(tail,make_asm(AS_MOVSX,ASM_QUADWORD,0,0,inst->src,as_reg(REG_R11),NULL));
+                inst->type=AS_MOV;
+                inst->src=as_reg(REG_R11);
+                inst->dst=dst;
+            }
+            break;
+
+        case AS_BINARY:
+            if (inst->binary_op==BINARY_LSHIFT || inst->binary_op==BINARY_RSHIFT){
+                break;
+            }
+
+            if (is_large_imm(inst->src) ||
+                (inst->binary_op!=BINARY_MULT &&
+                 is_memory_operand(inst->src) &&
+                 is_memory_operand(inst->dst))){
+                push_inst(tail,make_asm(AS_MOV,t,0,0,inst->src,as_reg(REG_R10),NULL));
+                inst->src=as_reg(REG_R10);
+            }
+
+            //imul cannot write to memory
+            if (inst->binary_op==BINARY_MULT && is_memory_operand(inst->dst)){
+                AsmOperand dst=inst->dst;
+                push_inst(tail,make_asm(AS_MOV,t,0,0,dst,as_reg(REG_R11),NULL));
+                push_inst(tail,make_asm(AS_BINARY,t,BINARY_MULT,0,inst->src,as_reg(REG_R11),NULL));
+                inst->type=AS_MOV;
+                inst->src=as_reg(REG_R11);
+                inst->dst=dst;
+            }
+            break;
+
+        case AS_CMP:
+            if (is_large_imm(inst->src) ||
+                (is_memory_operand(inst->src) && is_memory_operand(inst->dst))){
+                push_inst(tail,make_asm(AS_MOV,t,0,0,inst->src,as_reg(REG_R10),NULL));
+                inst->src=as_reg(REG_R10);
+            }
+
+            if (inst->dst.type==AS_IMM){
+                push_inst(tail,make_asm(AS_MOV,t,0,0,inst->dst,as_reg(REG_R11),NULL));
+                inst->dst=as_reg(REG_R11);
+            }
+            break;
+
+        case AS_IDIV:
+            if (inst->src.type==AS_IMM){
+                push_inst(tail,make_asm(AS_MOV,t,0,0,inst->src,as_reg(REG_R10),NULL));
+                inst->src=as_reg(REG_R10);
+            }
+            break;
+
+        case AS_PUSH:
+            if (is_large_imm(inst->src)){
+                push_inst(tail,make_asm(AS_MOV,ASM_QUADWORD,0,0,inst->src,as_reg(REG_R10),NULL));
+                inst->src=as_reg(REG_R10);
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    push_inst(tail,inst);
+}
+
+static void fix_and_allocate_function(AsmFunc *fn,AsmSymbol *symbols){
+    replace_pseudos(fn,symbols);
+
+    AsmInst *instructions=fn->instructions;
+    fn->instructions=NULL;
+    AsmInst **tail=&fn->instructions;
+
+    if (fn->stack_size>0){
+        push_inst(&tail,make_asm(AS_BINARY,ASM_QUADWORD,BINARY_SUB,0,as_imm(fn->stack_size),as_reg(REG_SP),NULL));
     }
 
     /*
     Apply instruction fix-up independently to every function.
     */
-    curr=fn->instructions;
-    while (curr){
-        if ((curr->type==AS_MOV ||
-             (curr->type==AS_BINARY && curr->binary_op!=BINARY_MULT))
-            && is_memory_operand(curr->src)
-            && is_memory_operand(curr->dst)){
-
-            AsmInst *new_op=calloc(1,sizeof(AsmInst));
-            new_op->type=curr->type;
-            new_op->binary_op=curr->binary_op;
-            new_op->src=as_reg(REG_R10D);
-            new_op->dst=curr->dst;
-            new_op->next=curr->next;
-
-            curr->type=AS_MOV;
-            curr->dst=as_reg(REG_R10D);
-            curr->next=new_op;
-            curr=new_op;
-        }
-        else if (curr->type==AS_CMP){
-            if (is_memory_operand(curr->src) && is_memory_operand(curr->dst)){
-                AsmInst *new_cmp=calloc(1,sizeof(AsmInst));
-                new_cmp->type=AS_CMP;
-                new_cmp->src=as_reg(REG_R10D);
-                new_cmp->dst=curr->dst;
-                new_cmp->next=curr->next;
-
-                curr->type=AS_MOV;
-                curr->dst=as_reg(REG_R10D);
-                curr->next=new_cmp;
-                curr=new_cmp;
-            }
-            else if (curr->dst.type==AS_IMM){
-                AsmOperand old_src=curr->src;
-                AsmOperand old_dst=curr->dst;
-
-                AsmInst *new_cmp=calloc(1,sizeof(AsmInst));
-                new_cmp->type=AS_CMP;
-                new_cmp->src=old_src;
-                new_cmp->dst=as_reg(REG_R11D);
-                new_cmp->next=curr->next;
-
-                curr->type=AS_MOV;
-                curr->src=old_dst;
-                curr->dst=as_reg(REG_R11D);
-                curr->next=new_cmp;
-                curr=new_cmp;
-            }
-        }
-        else if (curr->type==AS_IDIV && curr->src.type==AS_IMM){
-            AsmInst *new_idiv=calloc(1,sizeof(AsmInst));
-            new_idiv->type=AS_IDIV;
-            new_idiv->src=as_reg(REG_R10D);
-            new_idiv->next=curr->next;
-
-            curr->type=AS_MOV;
-            curr->dst=as_reg(REG_R10D);
-            curr->next=new_idiv;
-            curr=new_idiv;
-        }
-        else if (curr->type==AS_BINARY &&
-                 curr->binary_op==BINARY_MULT &&
-                 is_memory_operand(curr->dst)){
-
-            AsmInst *mov_back=calloc(1,sizeof(AsmInst));
-            mov_back->type=AS_MOV;
-            mov_back->src=as_reg(REG_R11D);
-            mov_back->dst=curr->dst;
-            mov_back->next=curr->next;
-
-            AsmInst *imul_op=calloc(1,sizeof(AsmInst));
-            imul_op->type=AS_BINARY;
-            imul_op->binary_op=BINARY_MULT;
-            imul_op->src=curr->src;
-            imul_op->dst=as_reg(REG_R11D);
-            imul_op->next=mov_back;
-
-            AsmOperand original_dst=curr->dst;
-            curr->type=AS_MOV;
-            curr->src=original_dst;
-            curr->dst=as_reg(REG_R11D);
-            curr->next=imul_op;
-
-            curr=mov_back;
-        }
-
-        curr=curr->next;
+    while (instructions){
+        AsmInst *next=instructions->next;
+        instructions->next=NULL;
+        fix_instruction(instructions,&tail);
+        instructions=next;
     }
 }
 
-void fix_and_allocate(AsmProg *asmp,Symbol *symbols){
+void fix_and_allocate(AsmProg *asmp){
     if (!asmp){
         return;
     }
@@ -4180,7 +4275,7 @@ void fix_and_allocate(AsmProg *asmp,Symbol *symbols){
     for (int i=0;i<asmp->top_level_count;i++){
         AsmTopLevel *top_level=asmp->top_levels[i];
         if (top_level->type==ASM_TOP_FUNCTION){
-            fix_and_allocate_function(top_level->function,symbols);
+            fix_and_allocate_function(top_level->function,asmp->symbols);
         }
     }
 }
@@ -5037,16 +5132,24 @@ TackyProgram *generate_tacky(Program *prog,Symbol **symbols){
 
 static const char *reg_name_64(AsmReg reg){
     static const char *names[]={
-        "%rax","%r10","%rdx","%r11","%rcx",
-        "%rdi","%rsi","%r8","%r9"
+        "%rax","%rcx","%rdx","%rdi","%rsi",
+        "%r8","%r9","%r10","%r11","%rsp"
     };
     return names[reg];
 }
 
 static const char *reg_name_32(AsmReg reg){
     static const char *names[]={
-        "%eax","%r10d","%edx","%r11d","%ecx",
-        "%edi","%esi","%r8d","%r9d"
+        "%eax","%ecx","%edx","%edi","%esi",
+        "%r8d","%r9d","%r10d","%r11d","%esp"
+    };
+    return names[reg];
+}
+
+static const char *reg_name_8(AsmReg reg){
+    static const char *names[]={
+        "%al","%cl","%dl","%dil","%sil",
+        "%r8b","%r9b","%r10b","%r11b","%spl"
     };
     return names[reg];
 }
@@ -5061,20 +5164,16 @@ static void emit_data_op(AsmOperand op,FILE *out){
     fprintf(out,SYMBOL_PREFIX "%s(%%rip)",op.data_name);
 }
 
-static const char *reg_name_8(AsmReg reg){
-    static const char *names[]={
-        "%al","%r10b","%dl","%r11b","%cl",
-        "%dil","%sil","%r8b","%r9b"
-    };
-    return names[reg];
-}
-
-void emit_op(AsmOperand op,FILE *out){
+//register names depend on operand size; 1 byte is for SetCC
+static void emit_sized_op(AsmOperand op,int bytes,FILE *out){
     if (op.type==AS_IMM){
-        fprintf(out,"$%d",op.imm);
+        fprintf(out,"$%ld",op.imm);
     }
     else if (op.type==AS_REG){
-        fprintf(out,"%s",reg_name_32(op.reg));
+        const char *name=bytes==8 ? reg_name_64(op.reg)
+                        : bytes==4 ? reg_name_32(op.reg)
+                        : reg_name_8(op.reg);
+        fprintf(out,"%s",name);
     }
     else if (op.type==AS_STACK){
         fprintf(out,"%d(%%rbp)",op.stack_offset);
@@ -5088,39 +5187,12 @@ void emit_op(AsmOperand op,FILE *out){
     }
 }
 
-void emit_op_64bit(AsmOperand op,FILE *out){
-    if (op.type==AS_IMM){
-        fprintf(out,"$%d",op.imm);
-    }
-    else if (op.type==AS_REG){
-        fprintf(out,"%s",reg_name_64(op.reg));
-    }
-    else if (op.type==AS_STACK){
-        fprintf(out,"%d(%%rbp)",op.stack_offset);
-    }
-    else if (op.type==AS_DATA){
-        emit_data_op(op,out);
-    }
-    else{
-        fprintf(stderr,"Emitter Error: unresolved 64-bit operand\n");
-        exit(1);
-    }
+void emit_op(AsmOperand op,AsmType t,FILE *out){
+    emit_sized_op(op,t==ASM_QUADWORD ? 8 : 4,out);
 }
 
-void emit_op_8bit(AsmOperand op,FILE *out){
-    if (op.type==AS_REG){
-        fprintf(out,"%s",reg_name_8(op.reg));
-    }
-    else if (op.type==AS_STACK){
-        fprintf(out,"%d(%%rbp)",op.stack_offset);
-    }
-    else if (op.type==AS_DATA){
-        emit_data_op(op,out);
-    }
-    else{
-        fprintf(stderr,"Emitter Error: invalid 8-bit operand\n");
-        exit(1);
-    }
+static char type_suffix(AsmType t){
+    return t==ASM_QUADWORD ? 'q' : 'l';
 }
 
 const char *cond_to_str(CondCode c){
@@ -5185,33 +5257,19 @@ static void gen_tacky_for_init(ForInit *init,TackyInstruction **inst_list){
     }
 }
 
-static int asm_function_defined(AsmProg *asmp,const char *name){
-    if (!asmp || !name){
-        return 0;
-    }
-
-    for (int i=0;i<asmp->top_level_count;i++){
-        AsmTopLevel *top_level=asmp->top_levels[i];
-        if (top_level->type==ASM_TOP_FUNCTION &&
-            strcmp(top_level->function->name,name)==0){
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
 static void emit_call_target(
     AsmProg *asmp,
     const char *name,
     FILE *out
 ){
 #ifdef __APPLE__
+    (void)asmp;
     fprintf(out,"_%s",name);
 #else
     fprintf(out,"%s",name);
 
-    if (!asm_function_defined(asmp,name)){
+    AsmSymbol *entry=asm_symbol_find(asmp->symbols,name);
+    if (!entry || !entry->defined){
         fprintf(out,"@PLT");
     }
 #endif
@@ -5222,18 +5280,13 @@ static void emit_instruction(
     AsmInst *curr,
     FILE *out
 ){
+    AsmType t=curr->asm_type;
+    char suffix=type_suffix(t);
+
     switch (curr->type){
-        case AS_ALLOCATE_STACK:
-            fprintf(out,"    subq    $%d, %%rsp\n",curr->src.imm);
-            break;
-
-        case AS_DEALLOCATE_STACK:
-            fprintf(out,"    addq    $%d, %%rsp\n",curr->src.imm);
-            break;
-
         case AS_PUSH:
             fprintf(out,"    pushq   ");
-            emit_op_64bit(curr->src,out);
+            emit_op(curr->src,ASM_QUADWORD,out);
             fprintf(out,"\n");
             break;
 
@@ -5244,22 +5297,30 @@ static void emit_instruction(
             break;
 
         case AS_MOV:
-            fprintf(out,"    movl    ");
-            emit_op(curr->src,out);
+            fprintf(out,"    mov%c    ",suffix);
+            emit_op(curr->src,t,out);
             fprintf(out,", ");
-            emit_op(curr->dst,out);
+            emit_op(curr->dst,t,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_MOVSX:
+            fprintf(out,"    movslq  ");
+            emit_op(curr->src,ASM_LONGWORD,out);
+            fprintf(out,", ");
+            emit_op(curr->dst,ASM_QUADWORD,out);
             fprintf(out,"\n");
             break;
 
         case AS_NEG:
-            fprintf(out,"    negl    ");
-            emit_op(curr->dst,out);
+            fprintf(out,"    neg%c    ",suffix);
+            emit_op(curr->dst,t,out);
             fprintf(out,"\n");
             break;
 
         case AS_NOT:
-            fprintf(out,"    notl    ");
-            emit_op(curr->dst,out);
+            fprintf(out,"    not%c    ",suffix);
+            emit_op(curr->dst,t,out);
             fprintf(out,"\n");
             break;
 
@@ -5274,68 +5335,68 @@ static void emit_instruction(
 
             switch (curr->binary_op){
                 case BINARY_ADD:
-                    op_str="addl";
+                    op_str="add";
                     break;
                 case BINARY_SUB:
-                    op_str="subl";
+                    op_str="sub";
                     break;
                 case BINARY_MULT:
-                    op_str="imull";
+                    op_str="imul";
                     break;
                 case BINARY_BITWISE_AND:
-                    op_str="andl";
+                    op_str="and";
                     break;
                 case BINARY_BITWISE_OR:
-                    op_str="orl";
+                    op_str="or";
                     break;
                 case BINARY_BITWISE_XOR:
-                    op_str="xorl";
+                    op_str="xor";
                     break;
                 case BINARY_LSHIFT:
-                    op_str="sall";
+                    op_str="sal";
                     break;
                 case BINARY_RSHIFT:
-                    op_str="sarl";
+                    op_str="sar";
                     break;
                 default:
                     fprintf(stderr,"Emitter Error: unsupported binary operator\n");
                     exit(1);
             }
 
-            fprintf(out,"    %s    ",op_str);
+            fprintf(out,"    %s%c    ",op_str,suffix);
 
             if (curr->binary_op==BINARY_LSHIFT ||
                 curr->binary_op==BINARY_RSHIFT){
                 if (curr->src.type==AS_IMM){
-                    emit_op(curr->src,out);
+                    emit_op(curr->src,t,out);
                 }else{
                     fprintf(out,"%%cl");
                 }
             }else{
-                emit_op(curr->src,out);
+                emit_op(curr->src,t,out);
             }
 
             fprintf(out,", ");
-            emit_op(curr->dst,out);
+            emit_op(curr->dst,t,out);
             fprintf(out,"\n");
             break;
         }
 
         case AS_IDIV:
-            fprintf(out,"    idivl   ");
-            emit_op(curr->src,out);
+            fprintf(out,"    idiv%c   ",suffix);
+            emit_op(curr->src,t,out);
             fprintf(out,"\n");
             break;
 
         case AS_CDQ:
-            fprintf(out,"    cdq\n");
+            fprintf(out,t==ASM_QUADWORD ? "    cqo\n" : "    cdq\n");
             break;
 
         case AS_CMP:
-            fprintf(out,"    cmpl    ");
-            emit_op(curr->src,out);
+            fprintf(out,"    cmp%c    ",suffix);
+            emit_op(curr->src,t,out);
             fprintf(out,", ");
-            emit_op(curr->dst,out);
+            emit_op(curr->dst,t,out);
             fprintf(out,"\n");
             break;
 
@@ -5354,7 +5415,7 @@ static void emit_instruction(
 
         case AS_SET_CC:
             fprintf(out,"    set%s   ",cond_to_str(curr->cond));
-            emit_op_8bit(curr->dst,out);
+            emit_sized_op(curr->dst,1,out);
             fprintf(out,"\n");
             break;
 
@@ -5391,10 +5452,14 @@ static void emit_static_variable(AsmStaticVariable *var,FILE *out){
         fprintf(out,".globl " SYMBOL_PREFIX "%s\n",var->name);
     }
 
-    if (var->init!=0){
-        fprintf(out,".data\n.balign 4\n" SYMBOL_PREFIX "%s:\n    .long %d\n",var->name,var->init);
+    int is_long=(var->init.type==INIT_LONG);
+
+    if (var->init.value!=0){
+        fprintf(out,".data\n.balign %d\n" SYMBOL_PREFIX "%s:\n",var->alignment,var->name);
+        fprintf(out,"    %s %ld\n",is_long ? ".quad" : ".long",var->init.value);
     }else{
-        fprintf(out,".bss\n.balign 4\n" SYMBOL_PREFIX "%s:\n    .zero 4\n",var->name);
+        fprintf(out,".bss\n.balign %d\n" SYMBOL_PREFIX "%s:\n",var->alignment,var->name);
+        fprintf(out,"    .zero %d\n",is_long ? 8 : 4);
     }
 
     fprintf(out,"\n");
@@ -5528,8 +5593,8 @@ int main(int argc,char *argv[]){
     }
 
     //codegen
-    AsmProg *asmp=tacky_to_asm(tacky_prog);
-    fix_and_allocate(asmp,symbols);
+    AsmProg *asmp=tacky_to_asm(tacky_prog,symbols);
+    fix_and_allocate(asmp);
     if (stage==5){
         return 0;
     }
