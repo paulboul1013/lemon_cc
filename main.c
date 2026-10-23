@@ -2828,7 +2828,15 @@ IdentifierMap *copy_identifier_map(IdentifierMap *map){
     return new_head;
 }
 
-void check_goto_statement(Statement *stmt,LabelMap *labels,IdentifierMap *vars){
+// C labels are function-scoped but .L symbols are file-scoped, so qualify each
+// label with its function; '.' can't appear in an identifier, so names stay unique
+static char *qualify_label(const char *fun_name,const char *label){
+    char *name=malloc(strlen(fun_name)+strlen(label)+2);
+    sprintf(name,"%s.%s",fun_name,label);
+    return name;
+}
+
+void check_goto_statement(Statement *stmt,LabelMap *labels,const char *fun_name){
     if (stmt->type==STMT_GOTO){
         //check label exist
         if (!label_exists(labels,stmt->label)){
@@ -2836,17 +2844,19 @@ void check_goto_statement(Statement *stmt,LabelMap *labels,IdentifierMap *vars){
             exit(1);
         }
 
+        stmt->label=qualify_label(fun_name,stmt->label);
     }
 
     else if (stmt->type==STMT_LABEL){
-        check_goto_statement(stmt->if_stmt.then_branch,labels,vars);
+        stmt->label=qualify_label(fun_name,stmt->label);
+        check_goto_statement(stmt->if_stmt.then_branch,labels,fun_name);
     }
 
     else if (stmt->type==STMT_IF){
-        check_goto_statement(stmt->if_stmt.then_branch,labels,vars);
+        check_goto_statement(stmt->if_stmt.then_branch,labels,fun_name);
 
         if (stmt->if_stmt.else_branch){
-            check_goto_statement(stmt->if_stmt.else_branch,labels,vars);
+            check_goto_statement(stmt->if_stmt.else_branch,labels,fun_name);
         }
     }
 
@@ -2854,28 +2864,28 @@ void check_goto_statement(Statement *stmt,LabelMap *labels,IdentifierMap *vars){
         for(int i=0;i<stmt->block_count;i++){
             BlockItem *bi=stmt->block_items[i];
             if (bi->type==BI_STMT){
-                check_goto_statement(bi->stmt,labels,vars);
+                check_goto_statement(bi->stmt,labels,fun_name);
             }
         }
     }
 
     else if (stmt->type==STMT_WHILE){
-        check_goto_statement(stmt->while_stmt.body,labels,vars);
+        check_goto_statement(stmt->while_stmt.body,labels,fun_name);
     }
     else if (stmt->type==STMT_DO_WHILE){
-        check_goto_statement(stmt->do_while_stmt.body,labels,vars);
+        check_goto_statement(stmt->do_while_stmt.body,labels,fun_name);
     }
     else if (stmt->type==STMT_FOR){
-        check_goto_statement(stmt->for_stmt.body,labels,vars);
+        check_goto_statement(stmt->for_stmt.body,labels,fun_name);
     }
     else if (stmt->type==STMT_SWITCH){
-        check_goto_statement(stmt->switch_stmt.body,labels,vars);
+        check_goto_statement(stmt->switch_stmt.body,labels,fun_name);
     }
     else if (stmt->type==STMT_CASE){
-        check_goto_statement(stmt->case_stmt.body,labels,vars);
+        check_goto_statement(stmt->case_stmt.body,labels,fun_name);
     }
     else if (stmt->type==STMT_DEFAULT){
-        check_goto_statement(stmt->default_stmt.body,labels,vars);
+        check_goto_statement(stmt->default_stmt.body,labels,fun_name);
     }
 }
 
@@ -3514,7 +3524,7 @@ void validate_program_pass(Function *fn) {
             check_goto_statement(
                 bi->stmt,
                 labels,
-                NULL
+                fn->name
             );
         }
     }
