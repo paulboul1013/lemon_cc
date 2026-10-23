@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
 
 //define Token type
 typedef  enum{
@@ -1509,7 +1510,7 @@ Exp **parse_argument_list(int *out_count) {
 //            | "--" <factor>
 // <int> fits in int -> ConstInt, otherwise ConstLong; <long> -> ConstLong
 Const parse_constant(Token t){
-    const unsigned long long_max=9223372036854775807UL;
+    const unsigned long long_max=LONG_MAX;
     unsigned long v=0;
 
     for (const char *p=t.value;*p;p++){
@@ -1523,7 +1524,7 @@ Const parse_constant(Token t){
 
     Const c;
     c.value=(long)v;
-    c.type=(t.type==TOK_CONSTANT && v<=2147483647UL) ? CONST_INT : CONST_LONG;
+    c.type=(t.type==TOK_CONSTANT && v<=INT_MAX) ? CONST_INT : CONST_LONG;
     return c;
 }
 
@@ -2070,6 +2071,29 @@ void convert_to(Exp **slot,Type *t) {
     *slot=cast;
 }
 
+static void check_variable_redeclaration(
+    Symbol *old_symbol,
+    VariableDeclaration *decl
+) {
+    if (old_symbol->type->kind==TYPE_FUNCTION) {
+        fprintf(
+            stderr,
+            "Type Error: function '%s' redeclared as variable\n",
+            decl->name
+        );
+        exit(1);
+    }
+
+    if (!type_equal(old_symbol->type,decl->var_type)) {
+        fprintf(
+            stderr,
+            "Type Error: conflicting types for variable '%s'\n",
+            decl->name
+        );
+        exit(1);
+    }
+}
+
 static int is_shift_op(BinaryOpType op) {
     return op==BINARY_LSHIFT || op==BINARY_RSHIFT;
 }
@@ -2272,23 +2296,7 @@ void typecheck_file_scope_variable_declaration(
     Symbol *old_symbol=symbol_find(*symbols,decl->name);
 
     if (old_symbol) {
-        if (old_symbol->type->kind==TYPE_FUNCTION) {
-            fprintf(
-                stderr,
-                "Type Error: function '%s' redeclared as variable\n",
-                decl->name
-            );
-            exit(1);
-        }
-
-        if (!type_equal(old_symbol->type,decl->var_type)) {
-            fprintf(
-                stderr,
-                "Type Error: conflicting types for variable '%s'\n",
-                decl->name
-            );
-            exit(1);
-        }
+        check_variable_redeclaration(old_symbol,decl);
 
         if (old_symbol->attr_type!=SYMBOL_ATTR_STATIC) {
             fprintf(
@@ -2362,23 +2370,7 @@ void typecheck_local_variable_declaration(
         Symbol *old_symbol=symbol_find(*symbols,decl->name);
 
         if (old_symbol) {
-            if (old_symbol->type->kind==TYPE_FUNCTION) {
-                fprintf(
-                    stderr,
-                    "Type Error: function '%s' redeclared as variable\n",
-                    decl->name
-                );
-                exit(1);
-            }
-
-            if (!type_equal(old_symbol->type,decl->var_type)) {
-                fprintf(
-                    stderr,
-                    "Type Error: conflicting types for variable '%s'\n",
-                    decl->name
-                );
-                exit(1);
-            }
+            check_variable_redeclaration(old_symbol,decl);
 
             return;
         }
@@ -3867,7 +3859,7 @@ static void convert_tacky_instruction(
                 AsmReg res_reg=(curr->binary_op==BINARY_DIV) ? REG_AX:REG_DX;
                 append_asm(head,AS_MOV,src_type,0,0,as_reg(res_reg),convert_tacky_val(curr->dst),NULL);
             }
-            else if (curr->binary_op==BINARY_LSHIFT || curr->binary_op==BINARY_RSHIFT){
+            else if (is_shift_op(curr->binary_op)){
                 if (curr->src2->type==TACKY_VAL_CONSTANT){
                     append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
                     append_asm(head,AS_BINARY,src_type,curr->binary_op,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst),NULL);
@@ -3877,7 +3869,7 @@ static void convert_tacky_instruction(
                     append_asm(head,AS_BINARY,src_type,curr->binary_op,0,as_reg(REG_CX),convert_tacky_val(curr->dst),NULL);
                 }
             }
-            else if (curr->binary_op>=BINARY_EQ && curr->binary_op<=BINARY_GTE){
+            else if (is_comparison_op(curr->binary_op)){
                 append_asm(head,AS_CMP,src_type,0,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->src),NULL);
                 append_asm(head,AS_MOV,tacky_val_asm_type(curr->dst,symbols),0,0,as_imm(0),convert_tacky_val(curr->dst),NULL);
                 append_asm(head,AS_SET_CC,0,0,binary_to_cond(curr->binary_op),NO_OPERAND,convert_tacky_val(curr->dst),NULL);
@@ -4068,7 +4060,7 @@ static int is_memory_operand(AsmOperand op){
 }
 
 static int is_large_imm(AsmOperand op){
-    return op.type==AS_IMM && (op.imm < -2147483648L || op.imm > 2147483647L);
+    return op.type==AS_IMM && (op.imm < INT_MIN || op.imm > INT_MAX);
 }
 
 static void replace_pseudos(AsmFunc *fn,AsmSymbol *symbols){
@@ -4188,7 +4180,7 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
             break;
 
         case AS_BINARY:
-            if (inst->binary_op==BINARY_LSHIFT || inst->binary_op==BINARY_RSHIFT){
+            if (is_shift_op(inst->binary_op)){
                 break;
             }
 
