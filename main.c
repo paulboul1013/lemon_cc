@@ -1966,6 +1966,7 @@ void typecheck_local_variable_declaration(VariableDeclaration *decl,Symbol **sym
 void typecheck_statement(Statement *stmt,Symbol **symbols);
 void typecheck_expression(Exp *exp,Symbol **symbols);
 void typecheck_for_init(ForInit *init,Symbol **symbols);
+static int eval_const_expr(Exp *e,long *out);
 
 //return type of the function whose body is being type checked
 static Type *current_return_type=NULL;
@@ -2263,6 +2264,19 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
     }
 }
 
+// static initializers may be any constant expression; fold it at compile time
+static int eval_static_initializer(Exp *init,Symbol **symbols,Const *out) {
+    typecheck_expression(init,symbols);
+
+    long value;
+    if (!eval_const_expr(init,&value)) {
+        return 0;
+    }
+
+    *out=make_const(init->exp_type,value);
+    return 1;
+}
+
 void typecheck_file_scope_variable_declaration(
     VariableDeclaration *decl,
     Symbol **symbols
@@ -2270,7 +2284,8 @@ void typecheck_file_scope_variable_declaration(
     InitialValue initial_value;
 
     if (decl->init) {
-        if (decl->init->type!=EXP_CONSTANT) {
+        Const value;
+        if (!eval_static_initializer(decl->init,symbols,&value)) {
             fprintf(
                 stderr,
                 "Type Error: non-constant initializer for file-scope variable '%s'\n",
@@ -2281,7 +2296,7 @@ void typecheck_file_scope_variable_declaration(
 
         initial_value=make_initial_value(
             INITIAL_VALUE,
-            const_to_static_init(decl->init->constant,decl->var_type)
+            const_to_static_init(value,decl->var_type)
         );
     }
     else if (decl->storage_class==STORAGE_EXTERN) {
@@ -2389,7 +2404,8 @@ void typecheck_local_variable_declaration(
         InitialValue initial_value;
 
         if (decl->init) {
-            if (decl->init->type!=EXP_CONSTANT) {
+            Const value;
+            if (!eval_static_initializer(decl->init,symbols,&value)) {
                 fprintf(
                     stderr,
                     "Type Error: non-constant initializer on local static variable '%s'\n",
@@ -2400,7 +2416,7 @@ void typecheck_local_variable_declaration(
 
             initial_value=make_initial_value(
                 INITIAL_VALUE,
-                const_to_static_init(decl->init->constant,decl->var_type)
+                const_to_static_init(value,decl->var_type)
             );
         }
         else {
@@ -3299,29 +3315,27 @@ void label_statement(Statement *stmt,char *current_break_label,char *current_con
 }
 
 //eval case/default expression
-static int eval_const_expr(Exp *e,long *out){
-    if (!e) {
-        return 0;
-    }
-
+/*
+Fold an already type-checked constant expression. Arithmetic runs in long
+(wrapping through unsigned to avoid host overflow), then every int-typed
+node is truncated to int, so results match what gcc computes, e.g.
+(1 << 31) is INT_MIN rather than 2^31.
+*/
+static int eval_const_value(Exp *e,long *out){
     switch(e->type){
         case EXP_CONSTANT:
             *out=e->constant.value;
             return 1;
 
-        case EXP_CAST: {
-            long v;
-            if (!eval_const_expr(e->cast.exp,&v)) return 0;
-            *out=(e->cast.target_type->kind==TYPE_INT) ? (int)v : v;
-            return 1;
-        }
+        case EXP_CAST:
+            return eval_const_expr(e->cast.exp,out);
 
         case EXP_UNARY: {
             long v;
             if (!eval_const_expr(e->unary.exp,&v)) return 0;
 
             switch (e->unary.op){
-                case UNARY_NEGATION: *out=-v; return 1;
+                case UNARY_NEGATION: *out=(long)(0UL-(unsigned long)v); return 1;
                 case UNARY_COMPLEMENT: *out=~v; return 1;
                 case UNARY_NOT: *out=!v; return 1;
             }
@@ -3334,15 +3348,24 @@ static int eval_const_expr(Exp *e,long *out){
             if (!eval_const_expr(e->binary.left,&l)) return 0;
             if (!eval_const_expr(e->binary.right,&r)) return 0;
 
-            switch (e->binary.op){
-                case BINARY_ADD : *out=l+r; return 1;
-                case BINARY_SUB: *out=l-r; return 1;
-                case BINARY_MULT: *out=l*r; return 1;
-                case BINARY_DIV: if (r==0) return 0; *out=l/r; return 1;
-                case BINARY_REM: if (r==0) return 0; *out=l%r; return 1;
+            unsigned long ul=(unsigned long)l;
+            unsigned long ur=(unsigned long)r;
 
-                case BINARY_LSHIFT: *out=l<<r; return 1;
-                case BINARY_RSHIFT: *out=l>>r; return 1;
+            switch (e->binary.op){
+                case BINARY_ADD : *out=(long)(ul+ur); return 1;
+                case BINARY_SUB: *out=(long)(ul-ur); return 1;
+                case BINARY_MULT: *out=(long)(ul*ur); return 1;
+                case BINARY_DIV:
+                    if (r==0) return 0;
+                    *out=(r==-1) ? (long)(0UL-ul) : l/r;
+                    return 1;
+                case BINARY_REM:
+                    if (r==0) return 0;
+                    *out=(r==-1) ? 0 : l%r;
+                    return 1;
+
+                case BINARY_LSHIFT: *out=(long)(ul<<(r&63)); return 1;
+                case BINARY_RSHIFT: *out=l>>(r&63); return 1;
                 
                 case BINARY_BITWISE_AND: *out=l&r; return 1;
                 case BINARY_BITWISE_OR: *out=l|r; return 1;
@@ -3372,6 +3395,17 @@ static int eval_const_expr(Exp *e,long *out){
         default:
             return 0;
     }
+}
+
+static int eval_const_expr(Exp *e,long *out){
+    if (!e || !eval_const_value(e,out)) {
+        return 0;
+    }
+
+    if (e->exp_type->kind==TYPE_INT) {
+        *out=(int)*out;
+    }
+    return 1;
 }
 
 static int switch_case_exists(SwitchCaseInfo *cases,long value){
