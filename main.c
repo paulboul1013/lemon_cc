@@ -5,7 +5,7 @@
 
 //define Token type
 typedef  enum{
-    TOK_INT, TOK_VOID, TOK_RETURN,
+    TOK_INT, TOK_LONG, TOK_VOID, TOK_RETURN,
     TOK_STATIC, TOK_EXTERN,
 
     TOK_IF,
@@ -22,7 +22,7 @@ typedef  enum{
     TOK_CASE,
     TOK_DEFAULT,
 
-    TOK_IDENTIFIER, TOK_CONSTANT,
+    TOK_IDENTIFIER, TOK_CONSTANT, TOK_LONG_CONSTANT,
     TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
     TOK_SEMICOLON, 
     TOK_COMMA,
@@ -716,6 +716,7 @@ void add_token(TokenType type,const char *val){
 
 TokenType check_keyword(const char *s){
     if (strcmp(s,"int")==0) return TOK_INT;
+    if (strcmp(s,"long")==0) return TOK_LONG;
     if (strcmp(s,"void")==0) return TOK_VOID;
     if (strcmp(s,"return")==0) return TOK_RETURN;
     if (strcmp(s,"static")==0) return TOK_STATIC;
@@ -790,18 +791,24 @@ void lex(const char *input){
         if (isdigit(*p)){
             const char *start=p;
             while (isdigit(*p)) p++;
+            int len=p-start;
+
+            TokenType const_type=TOK_CONSTANT;
+            if (*p=='l' || *p=='L'){
+                const_type=TOK_LONG_CONSTANT;
+                p++;
+            }
 
             //123abc can't pass，need to 123_abc will pass
-            if (isalpha(*p) || *p=='_'){
+            if (isalnum(*p) || *p=='_'){
                 fprintf(stderr, "Lexer Error: Invalid identifier starting with digit at '%c'\n", *p);
                 exit(1);
             }
 
-            int len=p-start;
             char *buf=malloc(len+1);
             strncpy(buf,start,len);
             buf[len]='\0';
-            add_token(TOK_CONSTANT,buf);
+            add_token(const_type,buf);
             free(buf);
             continue;
         }
