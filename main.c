@@ -679,13 +679,15 @@ typedef enum {
 typedef struct {
     TackyValType type;
     union {
-        int int_value;
+        Const constant;
         char *var_name;
     };
 } TackyVal;
 
 typedef enum {
     TACKY_INST_RETURN,
+    TACKY_INST_SIGN_EXTEND,
+    TACKY_INST_TRUNCATE,
     TACKY_INST_UNARY,
     TACKY_INST_BINARY,
     TACKY_INST_COPY,
@@ -723,7 +725,8 @@ typedef struct {
 typedef struct {
     char *name;
     int global;
-    int init;
+    Type *type;
+    StaticInit init;
 } TackyStaticVariable;
 
 typedef enum {
@@ -761,10 +764,17 @@ char *make_temporary(){
     return name;
 }
 
-TackyVal *tacky_val_constant(int val){
+Const make_const(Type *t,long value){
+    Const c;
+    c.type=(t->kind==TYPE_LONG) ? CONST_LONG : CONST_INT;
+    c.value=value;
+    return c;
+}
+
+TackyVal *tacky_val_constant(Const c){
     TackyVal *v=malloc(sizeof(TackyVal));
     v->type=TACKY_VAL_CONSTANT;
-    v->int_value=val;
+    v->constant=c;
     return v;
 }
 
@@ -3582,7 +3592,7 @@ AsmOperand as_stack(int offset){
 
 AsmOperand convert_tacky_val(TackyVal *v){
     if (v->type==TACKY_VAL_CONSTANT){
-        return as_imm(v->int_value);
+        return as_imm((int)v->constant.value);
     }
 
     return as_pseudo(v->var_name);
@@ -3851,6 +3861,11 @@ static void convert_tacky_instruction(
         case TACKY_INST_FUN_CALL:
             convert_function_call(curr,head);
             break;
+
+        case TACKY_INST_SIGN_EXTEND:
+        case TACKY_INST_TRUNCATE:
+            fprintf(stderr,"Codegen Error: long conversions are not supported yet\n");
+            exit(1);
     }
 }
 
@@ -3951,7 +3966,7 @@ AsmProg *tacky_to_asm(TackyProgram *tacky){
                 }
                 asm_var->name=strdup(tacky_var->name);
                 asm_var->global=tacky_var->global;
-                asm_var->init=tacky_var->init;
+                asm_var->init=(int)tacky_var->init.value;
 
                 asm_top->type=ASM_TOP_STATIC_VARIABLE;
                 asm_top->static_variable=asm_var;
@@ -4184,10 +4199,54 @@ static void gen_tacky_for_init(ForInit *init,TackyInstruction **inst_list);
 static void emit_switch_dispatch(
     TackyInstruction **inst_list,
     TackyVal *control,
+    Type *control_type,
     SwitchCaseInfo *cases,
     const char *default_label,
     const char *break_label
 );
+
+//frontend symbol table; TACKY generation records every temporary's type here
+static Symbol **tacky_symbols=NULL;
+
+TackyVal *make_tacky_variable(Type *type){
+    char *name=make_temporary();
+    symbol_add_local(tacky_symbols,name,type);
+    return tacky_val_var(name);
+}
+
+static void emit_tacky_conversion(
+    TackyInstruction **inst_list,
+    TackyInstType type,
+    TackyVal *src,
+    TackyVal *dst
+){
+    TackyInstruction *inst=calloc(1,sizeof(TackyInstruction));
+    inst->type=type;
+    inst->src=src;
+    inst->dst=dst;
+    append_tacky_inst(inst_list,inst);
+}
+
+//convert val from one type to another; no instruction when the types match
+static TackyVal *emit_tacky_cast(
+    TackyInstruction **inst_list,
+    TackyVal *val,
+    Type *from,
+    Type *to
+){
+    if (type_equal(from,to)){
+        return val;
+    }
+
+    TackyVal *dst=make_tacky_variable(to);
+    emit_tacky_conversion(
+        inst_list,
+        to->kind==TYPE_LONG ? TACKY_INST_SIGN_EXTEND : TACKY_INST_TRUNCATE,
+        val,
+        dst
+    );
+    return dst;
+}
 
 // Generate TACKY IR for <expression>
 //
@@ -4203,7 +4262,11 @@ static void emit_switch_dispatch(
 //   short-circuit logical operators (&&, ||)
 TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     if (e->type==EXP_CONSTANT){
-        return tacky_val_constant((int)e->constant.value);
+        return tacky_val_constant(e->constant);
+    }
+    else if (e->type==EXP_CAST){
+        TackyVal *inner=gen_tacky_exp(e->cast.exp,inst_list);
+        return emit_tacky_cast(inst_list,inner,e->cast.exp->exp_type,e->cast.target_type);
     }
     else if (e->type==EXP_FUNCTION_CALL) {
         int arg_count= e->function_call.arg_count;
@@ -4224,7 +4287,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
             );
         }
 
-        TackyVal *dst = tacky_val_var(make_temporary());
+        TackyVal *dst = make_tacky_variable(e->exp_type);
 
         TackyInstruction *call = calloc(1,sizeof(TackyInstruction));
 
@@ -4241,7 +4304,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     else if (e->type==EXP_CONDITIONAL){
         char *false_label=make_label("cond_false");  
         char *end_label=make_label("cond_end");
-        TackyVal *dst=tacky_val_var(make_temporary());
+        TackyVal *dst=make_tacky_variable(e->exp_type);
 
         //1. calculate condition
         TackyVal *cond=gen_tacky_exp(e->conditional.condition,inst_list);
@@ -4295,12 +4358,16 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         TackyVal *rhs_val=gen_tacky_exp(e->compound.rvalue,inst_list);
         TackyVal *lhs_val=tacky_val_var(e->compound.lvalue->var_name);
 
+        //the type checker converted the rvalue to the type the operation runs in
+        Type *lhs_type=e->compound.lvalue->exp_type;
+        Type *op_type=e->compound.rvalue->exp_type;
+
         //calculate a+b
-        TackyVal *tmp=tacky_val_var(make_temporary());
+        TackyVal *tmp=make_tacky_variable(op_type);
         TackyInstruction *bin=calloc(1,sizeof(TackyInstruction));
         bin->type=TACKY_INST_BINARY;
         bin->binary_op=e->compound.op;
-        bin->src=lhs_val;
+        bin->src=emit_tacky_cast(inst_list,lhs_val,lhs_type,op_type);
         bin->src2=rhs_val;
         bin->dst=tmp;
         append_tacky_inst(inst_list,bin);
@@ -4308,7 +4375,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         //store resultd into a
         TackyInstruction *cp=calloc(1,sizeof(TackyInstruction));
         cp->type=TACKY_INST_COPY;
-        cp->src=tmp;
+        cp->src=emit_tacky_cast(inst_list,tmp,op_type,lhs_type);
         cp->dst=lhs_val;
         append_tacky_inst(inst_list,cp);
         
@@ -4317,14 +4384,15 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     //  ++ / --
     else if (e->type==EXP_PREFIX_OP || e->type==EXP_POSTFIX_OP){
         TackyVal *lhs_val=tacky_val_var(e->inc_dec.lvalue->var_name);
-        TackyVal *one_val=tacky_val_constant(1);
+        Type *lhs_type=e->inc_dec.lvalue->exp_type;
+        TackyVal *one_val=tacky_val_constant(make_const(lhs_type,1));
         BinaryOpType op=e->inc_dec.is_increment ? BINARY_ADD :BINARY_SUB;
 
         TackyVal *old_val=NULL;
         
         //if is a++ (postfix)，need to backup old value，because the expression want old value
         if (e->type==EXP_POSTFIX_OP){
-            old_val=tacky_val_var(make_temporary());
+            old_val=make_tacky_variable(lhs_type);
             TackyInstruction *save_old=calloc(1,sizeof(TackyInstruction));
             save_old->type=TACKY_INST_COPY;
             save_old->src=lhs_val;
@@ -4333,7 +4401,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         }
 
         // calculate a+1 or a-1
-        TackyVal *tmp=tacky_val_var(make_temporary());
+        TackyVal *tmp=make_tacky_variable(lhs_type);
         TackyInstruction *bin=calloc(1,sizeof(TackyInstruction));
         bin->type=TACKY_INST_BINARY;
         bin->binary_op=op;
@@ -4374,8 +4442,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         TackyVal *src=gen_tacky_exp(e->unary.exp,inst_list);
         
         //build a temporal variable for dest
-        char *t_name=make_temporary();
-        TackyVal *dst=tacky_val_var(t_name);
+        TackyVal *dst=make_tacky_variable(e->exp_type);
 
         //emit unary instruction and add list
         TackyInstruction *inst=calloc(1, sizeof(TackyInstruction));
@@ -4395,7 +4462,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         if (e->binary.op==BINARY_LOGICAL_AND){
             char *false_label=make_label("and_false");
             char *end_label=make_label("and_end");
-            TackyVal *dst=tacky_val_var(make_temporary());
+            TackyVal *dst=make_tacky_variable(type_int());
 
             // calculate left exp
             TackyVal *v1=gen_tacky_exp(e->binary.left,inst_list);
@@ -4418,7 +4485,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
             // if execute here，it's mean v1,v2 result is non-zero
             TackyInstruction *cp1=calloc(1,sizeof(TackyInstruction));
             cp1->type=TACKY_INST_COPY;
-            cp1->src=tacky_val_constant(1);
+            cp1->src=tacky_val_constant(make_const(type_int(),1));
             cp1->dst=dst;
             append_tacky_inst(inst_list,cp1);
             
@@ -4435,7 +4502,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
 
             TackyInstruction *cp0=calloc(1,sizeof(TackyInstruction));
             cp0->type=TACKY_INST_COPY;
-            cp0->src=tacky_val_constant(0);
+            cp0->src=tacky_val_constant(make_const(type_int(),0));
             cp0->dst=dst;
             append_tacky_inst(inst_list,cp0);
 
@@ -4452,7 +4519,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         if (e->binary.op==BINARY_LOGICAL_OR){
             char *true_label=make_label("or_true");
             char *end_label=make_label("or_end");
-            TackyVal *dst=tacky_val_var(make_temporary());
+            TackyVal *dst=make_tacky_variable(type_int());
             
             TackyVal *v1=gen_tacky_exp(e->binary.left,inst_list);
             // if v1 not zero ，jump true label
@@ -4473,7 +4540,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
             // both result all 0
             TackyInstruction *cp0=calloc(1,sizeof(TackyInstruction));
             cp0->type=TACKY_INST_COPY;
-            cp0->src=tacky_val_constant(0);
+            cp0->src=tacky_val_constant(make_const(type_int(),0));
             cp0->dst=dst;
             append_tacky_inst(inst_list,cp0);
 
@@ -4490,7 +4557,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
 
             TackyInstruction *cp1=calloc(1,sizeof(TackyInstruction));
             cp1->type=TACKY_INST_COPY;
-            cp1->src=tacky_val_constant(1);
+            cp1->src=tacky_val_constant(make_const(type_int(),1));
             cp1->dst=dst;
             append_tacky_inst(inst_list,cp1);
 
@@ -4511,8 +4578,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         TackyVal *v2=gen_tacky_exp(e->binary.right,inst_list);
 
         //build temporal variable to save result
-        char *tmp=make_temporary();
-        TackyVal *dst=tacky_val_var(tmp);
+        TackyVal *dst=make_tacky_variable(e->exp_type);
 
         //build and emit binary instruction
         TackyInstruction *inst=calloc(1, sizeof(TackyInstruction));
@@ -4695,6 +4761,7 @@ void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
         emit_switch_dispatch(
             inst_list,
             control,
+            stmt->switch_stmt.control->exp_type,
             stmt->switch_stmt.cases,
             stmt->switch_stmt.default_label,
             break_label
@@ -4717,18 +4784,19 @@ void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
 static void emit_switch_dispatch(
     TackyInstruction **inst_list,
     TackyVal *control,
+    Type *control_type,
     SwitchCaseInfo *cases,
     const char *default_label,
     const char *break_label
 ){
     for(SwitchCaseInfo *c=cases;c;c=c->next){
-        TackyVal *is_match=tacky_val_var(make_temporary());
+        TackyVal *is_match=make_tacky_variable(type_int());
         
         TackyInstruction *cmp=calloc(1,sizeof(TackyInstruction));
         cmp->type=TACKY_INST_BINARY;
         cmp->binary_op=BINARY_EQ;
         cmp->src=control;
-        cmp->src2=tacky_val_constant(c->value);
+        cmp->src2=tacky_val_constant(make_const(control_type,c->value));
         cmp->dst=is_match;
         append_tacky_inst(inst_list,cmp);
 
@@ -4824,7 +4892,7 @@ TackyFunction *generate_tacky_function(Function *fn,Symbol *symbols) {
     TackyInstruction *final_inst = calloc(1,sizeof(TackyInstruction));
 
     final_inst->type = TACKY_INST_RETURN;
-    final_inst->src = tacky_val_constant(0);
+    final_inst->src = tacky_val_constant(make_const(type_int(),0));
 
     append_tacky_inst(
         &t_fn->instructions,
@@ -4871,7 +4939,8 @@ static void append_tacky_static_variable(
     TackyProgram *program,
     const char *name,
     int global,
-    int init
+    Type *type,
+    StaticInit init
 ){
     TackyStaticVariable *variable=calloc(1,sizeof(TackyStaticVariable));
     if (!variable) {
@@ -4881,6 +4950,7 @@ static void append_tacky_static_variable(
 
     variable->name=strdup(name);
     variable->global=global;
+    variable->type=type;
     variable->init=init;
 
     TackyTopLevel *top_level=calloc(1,sizeof(TackyTopLevel));
@@ -4907,30 +4977,30 @@ static void convert_symbols_to_tacky(
             continue;
         }
 
-        int init=0;
+        StaticInit init;
         if (entry->init.type==INITIAL_VALUE) {
-            init=(int)entry->init.value.value;
-        }
-        else if (entry->init.type==INITIAL_TENTATIVE) {
-            init=0;
+            init=entry->init.value;
         }
         else {
-            continue;
+            init=zero_static_init(entry->type);
         }
 
         append_tacky_static_variable(
             program,
             entry->name,
             entry->global,
+            entry->type,
             init
         );
     }
 }
 
-TackyProgram *generate_tacky(Program *prog,Symbol *symbols){
+TackyProgram *generate_tacky(Program *prog,Symbol **symbols){
     if (!prog){
         return NULL;
     }
+
+    tacky_symbols=symbols;
 
     TackyProgram *t_prog=calloc(1,sizeof(TackyProgram));
     if (!t_prog){
@@ -4951,7 +5021,7 @@ TackyProgram *generate_tacky(Program *prog,Symbol *symbols){
             continue;
         }
 
-        TackyFunction *t_fn=generate_tacky_function(fn,symbols);
+        TackyFunction *t_fn=generate_tacky_function(fn,*symbols);
         if (!t_fn){
             continue;
         }
@@ -4959,7 +5029,7 @@ TackyProgram *generate_tacky(Program *prog,Symbol *symbols){
         append_tacky_function(t_prog,t_fn);
     }
 
-    convert_symbols_to_tacky(symbols,t_prog);
+    convert_symbols_to_tacky(*symbols,t_prog);
 
     return t_prog;
 }
@@ -5452,7 +5522,7 @@ int main(int argc,char *argv[]){
     }
 
     //TACKY Generation
-    TackyProgram *tacky_prog=generate_tacky(prog,symbols);
+    TackyProgram *tacky_prog=generate_tacky(prog,&symbols);
     if (stage==4){
         return 0;
     }
