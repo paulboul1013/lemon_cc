@@ -82,7 +82,62 @@ typedef struct {
 }Token;
 
 typedef enum {
+    TYPE_INT,
+    TYPE_LONG,
+    TYPE_FUNCTION
+} TypeKind;
+
+typedef struct Type {
+    TypeKind kind;
+    struct Type **params; //for TYPE_FUNCTION
+    int param_count;
+    struct Type *ret;
+} Type;
+
+Type *type_int(void){
+    static Type t={TYPE_INT,NULL,0,NULL};
+    return &t;
+}
+
+Type *type_long(void){
+    static Type t={TYPE_LONG,NULL,0,NULL};
+    return &t;
+}
+
+Type *make_function_type(Type **params,int param_count,Type *ret){
+    Type *t=calloc(1,sizeof(Type));
+    t->kind=TYPE_FUNCTION;
+    t->params=params;
+    t->param_count=param_count;
+    t->ret=ret;
+    return t;
+}
+
+int type_equal(Type *a,Type *b){
+    if (a->kind!=b->kind) return 0;
+    if (a->kind!=TYPE_FUNCTION) return 1;
+
+    if (a->param_count!=b->param_count) return 0;
+    if (!type_equal(a->ret,b->ret)) return 0;
+    for (int i=0;i<a->param_count;i++){
+        if (!type_equal(a->params[i],b->params[i])) return 0;
+    }
+    return 1;
+}
+
+typedef enum {
+    CONST_INT,
+    CONST_LONG
+} ConstType;
+
+typedef struct {
+    ConstType type;
+    long value; //CONST_INT values always fit in int
+} Const;
+
+typedef enum {
     EXP_CONSTANT,
+    EXP_CAST,
     EXP_UNARY,
     EXP_BINARY,
     EXP_VAR,
@@ -111,9 +166,15 @@ typedef enum {
 
 typedef struct Exp {
     ExpType type;
+    Type *exp_type; //set by the type checker
     union {
-        int int_value; //for EXP_CONSTANT
+        Const constant; //for EXP_CONSTANT
         char *var_name; //for EXP_VAR
+        struct { //for EXP_CAST
+            Type *target_type;
+            struct Exp *exp;
+        } cast;
+
         struct { //for EXP_UNARY
             UnaryOpType op;
             struct Exp *exp;
@@ -191,6 +252,7 @@ typedef enum {
 typedef struct {
     char *name;
     Exp *init; //optional
+    Type *var_type;
     StorageClass storage_class;
 } VariableDeclaration;
 
@@ -308,6 +370,7 @@ typedef struct Function {
     int body_count;
 
     int has_body; //1= function definition, 0 = function declaration
+    Type *fun_type;
     StorageClass storage_class;
 } Function;
 
@@ -321,16 +384,24 @@ typedef struct {
 
 //Exp helper function
 //build constant node
-Exp *make_int_exp(int i){
-    Exp *e=malloc(sizeof(Exp));
+Exp *make_constant_exp(Const c){
+    Exp *e=calloc(1,sizeof(Exp));
     e->type=EXP_CONSTANT;
-    e->int_value=i;
+    e->constant=c;
+    return e;
+}
+
+Exp *make_cast_exp(Type *target_type,Exp *inner){
+    Exp *e=calloc(1,sizeof(Exp));
+    e->type=EXP_CAST;
+    e->cast.target_type=target_type;
+    e->cast.exp=inner;
     return e;
 }
 
 //build unary node
 Exp *make_unary_exp(UnaryOpType op,Exp *inner){
-    Exp *e=malloc(sizeof(Exp));
+    Exp *e=calloc(1,sizeof(Exp));
     e->type=EXP_UNARY;
     e->unary.op=op;
     e->unary.exp=inner;
@@ -338,7 +409,7 @@ Exp *make_unary_exp(UnaryOpType op,Exp *inner){
 }
 
 Exp *make_binary_exp(BinaryOpType op,Exp *left,Exp *right){
-    Exp *e=malloc(sizeof(Exp));
+    Exp *e=calloc(1,sizeof(Exp));
     e->type=EXP_BINARY;
     e->binary.op=op;
     e->binary.left=left;
@@ -348,14 +419,14 @@ Exp *make_binary_exp(BinaryOpType op,Exp *left,Exp *right){
 
 //var AST node
 Exp *make_var_exp(char *name){
-    Exp *e=malloc(sizeof(Exp));
+    Exp *e=calloc(1,sizeof(Exp));
     e->type=EXP_VAR;
     e->var_name=strdup(name);
     return e;
 }
 
 Exp *make_assign_exp(Exp *left,Exp *right){
-    Exp *e=malloc(sizeof(Exp));
+    Exp *e=calloc(1,sizeof(Exp));
     e->type=EXP_ASSIGN;
     e->assign.lvalue=left;
     e->assign.rvalue=right;
@@ -363,7 +434,7 @@ Exp *make_assign_exp(Exp *left,Exp *right){
 }
 
 Exp *make_compound_assign_exp(BinaryOpType op,Exp *left,Exp *right){
-    Exp *e=malloc(sizeof(Exp));
+    Exp *e=calloc(1,sizeof(Exp));
     e->type=EXP_COMPOUND_ASSIGN;
     e->compound.op=op;
     e->compound.lvalue=left;
@@ -372,7 +443,7 @@ Exp *make_compound_assign_exp(BinaryOpType op,Exp *left,Exp *right){
 }
 
 Exp *make_inc_dec_exp(ExpType type,int is_increment,Exp *lvalue){
-    Exp *e=malloc(sizeof(Exp));
+    Exp *e=calloc(1,sizeof(Exp));
     e->type=type;
     e->inc_dec.lvalue=lvalue;
     e->inc_dec.is_increment=is_increment;
@@ -380,7 +451,7 @@ Exp *make_inc_dec_exp(ExpType type,int is_increment,Exp *lvalue){
 }
 
 Exp *make_function_call_exp(char *name, Exp **args,int arg_count){
-    Exp *e=malloc(sizeof(Exp));
+    Exp *e=calloc(1,sizeof(Exp));
     e->type=EXP_FUNCTION_CALL;
     e->function_call.name=strdup(name);
     e->function_call.args=args;
@@ -1025,9 +1096,44 @@ void resolve_for_init(ForInit *init,IdentifierMap **map){
     }
 }
 
+int is_type_specifier(TokenType type){
+    return type==TOK_INT || type==TOK_LONG;
+}
+
 int is_declaration_start(void) {
     TokenType type=peek().type;
-    return type==TOK_INT || type==TOK_STATIC || type==TOK_EXTERN;
+    return is_type_specifier(type) || type==TOK_STATIC || type==TOK_EXTERN;
+}
+
+// int | long | long int | int long
+Type *parse_type(TokenType *types,int count){
+    if (count==1 && types[0]==TOK_INT){
+        return type_int();
+    }
+
+    if ((count==1 && types[0]==TOK_LONG) ||
+        (count==2 && types[0]!=types[1])){
+        return type_long();
+    }
+
+    fprintf(stderr,"Parse Error: invalid type specifier\n");
+    exit(1);
+}
+
+// { <type-specifier> }+
+Type *parse_type_specifiers(void){
+    TokenType types[2];
+    int count=0;
+
+    while (is_type_specifier(peek().type)){
+        if (count==2){
+            fprintf(stderr,"Parse Error: invalid type specifier\n");
+            exit(1);
+        }
+        types[count++]=take().type;
+    }
+
+    return parse_type(types,count);
 }
 
 BlockItem *parse_block_item() {
@@ -1068,9 +1174,12 @@ Statement *parse_block(){
     return s;
 }
 
-char **parse_param_list(int *out_count) {
+char **parse_param_list(int *out_count,Type ***out_types) {
     char **params=NULL;
+    Type **types=NULL;
     int count=0;
+
+    *out_types=NULL;
 
     if (peek().type == TOK_VOID) {
         take();
@@ -1078,13 +1187,13 @@ char **parse_param_list(int *out_count) {
         return NULL;
     }
 
-    if (peek().type!=TOK_INT) {
+    if (!is_type_specifier(peek().type)) {
         fprintf(stderr,"Parse Error: expected parameter list\n");
         exit(1);
     }
 
     while (1) {
-        expect(TOK_INT);
+        Type *param_type=parse_type_specifiers();
 
         Token id = take();
         if (id.type!=TOK_IDENTIFIER) {
@@ -1093,6 +1202,8 @@ char **parse_param_list(int *out_count) {
         }
 
         params=realloc(params,sizeof(char*) * (count+1));
+        types=realloc(types,sizeof(Type*) * (count+1));
+        types[count]=param_type;
         params[count++]=strdup(id.value);
 
         if (peek().type==TOK_COMMA) {
@@ -1104,6 +1215,7 @@ char **parse_param_list(int *out_count) {
     }
 
     *out_count=count;
+    *out_types=types;
     return params;
 }
 
@@ -1287,7 +1399,7 @@ Exp *parse_exp(int min_prec){
 
             Exp *right=parse_exp(prec+1);
 
-            Exp *node=malloc(sizeof(Exp));
+            Exp *node=calloc(1,sizeof(Exp));
             node->type=EXP_CONDITIONAL;
             node->conditional.condition=left;
             node->conditional.true_expr=middle;
@@ -1351,13 +1463,40 @@ Exp **parse_argument_list(int *out_count) {
 //            | <factor> "--"
 //            | "++" <factor>
 //            | "--" <factor>
+// <int> fits in int -> ConstInt, otherwise ConstLong; <long> -> ConstLong
+Const parse_constant(Token t){
+    const unsigned long long_max=9223372036854775807UL;
+    unsigned long v=0;
+
+    for (const char *p=t.value;*p;p++){
+        unsigned long digit=(unsigned long)(*p-'0');
+        if (v > (long_max-digit)/10){
+            fprintf(stderr,"Parse Error: constant %s is too large to represent as an int or long\n",t.value);
+            exit(1);
+        }
+        v=v*10+digit;
+    }
+
+    Const c;
+    c.value=(long)v;
+    c.type=(t.type==TOK_CONSTANT && v<=2147483647UL) ? CONST_INT : CONST_LONG;
+    return c;
+}
+
 Exp *parse_factor(){
     Token t=peek();
     Exp *inner = NULL;
 
-    if (t.type==TOK_CONSTANT){
+    if (t.type==TOK_CONSTANT || t.type==TOK_LONG_CONSTANT){
         take();
-        return make_int_exp(atoi(t.value));
+        return make_constant_exp(parse_constant(t));
+    }
+    // "(" { <type-specifier> }+ ")" <factor>
+    else if (t.type==TOK_LPAREN && is_type_specifier(token_list[token_pos+1].type)){
+        take();
+        Type *target_type=parse_type_specifiers();
+        expect(TOK_RPAREN);
+        return make_cast_exp(target_type,parse_factor());
     }
     // prefix ++ / --
     else if (t.type==TOK_INCREMENT || t.type==TOK_DECREMENT){
@@ -1559,11 +1698,12 @@ Statement *parse_if_statment(){
 }
 
 typedef struct {
+    Type *type;
     StorageClass storage_class;
 } ParsedSpecifiers;
 
 int is_specifier_token(TokenType type){
-    return type==TOK_INT || type==TOK_STATIC || type==TOK_EXTERN;
+    return is_type_specifier(type) || type==TOK_STATIC || type==TOK_EXTERN;
 }
 
 ParsedSpecifiers parse_type_and_storage_class(){
@@ -1580,13 +1720,14 @@ ParsedSpecifiers parse_type_and_storage_class(){
         specifiers[specifier_count++]=tok.type;
     }
 
+    TokenType *types=malloc(sizeof(TokenType)*(specifier_count+1));
     int type_count=0;
     int storage_count=0;
     StorageClass storage=STORAGE_NONE;
 
     for(int i=0;i<specifier_count;i++){
-        if (specifiers[i]==TOK_INT){
-            type_count++;
+        if (is_type_specifier(specifiers[i])){
+            types[type_count++]=specifiers[i];
         }else if (specifiers[i]==TOK_STATIC){
             storage_count++;
             storage=STORAGE_STATIC;
@@ -1598,10 +1739,8 @@ ParsedSpecifiers parse_type_and_storage_class(){
 
     free(specifiers);
 
-    if (type_count!=1){
-        fprintf(stderr,"Parse Error: invalid type specifier\n");
-        exit(1);
-    }
+    Type *type=parse_type(types,type_count);
+    free(types);
 
     if (storage_count>1){
         fprintf(stderr,"Parse Error: invalid storage class\n");
@@ -1609,18 +1748,21 @@ ParsedSpecifiers parse_type_and_storage_class(){
     }
 
     ParsedSpecifiers result;
+    result.type=type;
     result.storage_class=storage;
     return result;
 }
 
 Function *parse_function_after_name(
     const char *name,
+    Type *ret_type,
     StorageClass storage_class
 ){
     expect(TOK_LPAREN);
 
     int param_count=0;
-    char **params=parse_param_list(&param_count);
+    Type **param_types=NULL;
+    char **params=parse_param_list(&param_count,&param_types);
 
     expect(TOK_RPAREN);
 
@@ -1631,6 +1773,7 @@ Function *parse_function_after_name(
     f->body=NULL;
     f->body_count=0;
     f->has_body=0;
+    f->fun_type=make_function_type(param_types,param_count,ret_type);
     f->storage_class=storage_class;
 
     if (peek().type==TOK_SEMICOLON){
@@ -1681,6 +1824,7 @@ Declaration *parse_declaration(){
         decl->type=DECL_FUN;
         decl->fun=parse_function_after_name(
             id.value,
+            specs.type,
             specs.storage_class
         );
         return decl;
@@ -1688,6 +1832,7 @@ Declaration *parse_declaration(){
 
     VariableDeclaration *var=calloc(1,sizeof(VariableDeclaration));
     var->name=strdup(id.value);
+    var->var_type=specs.type;
     var->storage_class=specs.storage_class;
 
     if (peek().type==TOK_ASSIGN){
@@ -1857,6 +2002,10 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
         case EXP_CONSTANT:
             return;
 
+        case EXP_CAST:
+            typecheck_expression(exp->cast.exp,symbols);
+            return;
+
         case EXP_VAR: {
             Symbol *entry=symbol_find(*symbols,exp->var_name);
 
@@ -1966,7 +2115,7 @@ void typecheck_file_scope_variable_declaration(
 
         initial_value=make_initial_value(
             INITIAL_VALUE,
-            decl->init->int_value
+            (int)decl->init->constant.value
         );
     }
     else if (decl->storage_class==STORAGE_EXTERN) {
@@ -2097,7 +2246,7 @@ void typecheck_local_variable_declaration(
 
             initial_value=make_initial_value(
                 INITIAL_VALUE,
-                decl->init->int_value
+                (int)decl->init->constant.value
             );
         }
         else {
@@ -2580,6 +2729,10 @@ void resolve_expression(Exp *e,IdentifierMap *map){
         case EXP_CONSTANT:
             break;
 
+        case EXP_CAST:
+            resolve_expression(e->cast.exp,map);
+            break;
+
         case EXP_COMPOUND_ASSIGN:
             if (e->compound.lvalue->type!=EXP_VAR){
                 fprintf(stderr, "Semantic Error: Invalid lvalue in compound assignment\n");
@@ -2980,7 +3133,7 @@ static int eval_const_expr(Exp *e,int *out){
 
     switch(e->type){
         case EXP_CONSTANT:
-            *out=e->int_value;
+            *out=(int)e->constant.value;
             return 1;
 
         case EXP_UNARY: {
@@ -3893,7 +4046,7 @@ static void emit_switch_dispatch(
 //   short-circuit logical operators (&&, ||)
 TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     if (e->type==EXP_CONSTANT){
-        return tacky_val_constant(e->int_value);
+        return tacky_val_constant((int)e->constant.value);
     }
     else if (e->type==EXP_FUNCTION_CALL) {
         int arg_count= e->function_call.arg_count;
