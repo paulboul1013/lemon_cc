@@ -136,6 +136,16 @@ typedef struct {
 } Const;
 
 typedef enum {
+    INIT_INT,
+    INIT_LONG
+} StaticInitType;
+
+typedef struct {
+    StaticInitType type;
+    long value;
+} StaticInit;
+
+typedef enum {
     EXP_CONSTANT,
     EXP_CAST,
     EXP_UNARY,
@@ -288,7 +298,7 @@ typedef enum {
 } BlockItemType;
 
 typedef struct SwitchCaseInfo{
-    int value;
+    long value;
     char *label;
     struct SwitchCaseInfo *next;
 }SwitchCaseInfo;
@@ -338,7 +348,7 @@ typedef struct Statement{
 
     struct {
         Exp *value_exp; //origin case expresion
-        int value;      // semantic pass calculate constant value
+        long value;     // converted to the switch control's type after type checking
         struct Statement *body;
         char *case_label; // TACKY or asm use inner label
     } case_stmt;
@@ -1883,11 +1893,6 @@ int label_exists(LabelMap *map,const char *name){
 
 
 typedef enum {
-    SYMBOL_INT,
-    SYMBOL_FUNCTION
-} Symbol_Type;
-
-typedef enum {
     SYMBOL_ATTR_FUNCTION,
     SYMBOL_ATTR_STATIC,
     SYMBOL_ATTR_LOCAL
@@ -1901,14 +1906,12 @@ typedef enum {
 
 typedef struct {
     InitialValueType type;
-    int value;
+    StaticInit value;
 } InitialValue;
 
 typedef struct Symbol {
     char *name;
-    Symbol_Type type;
-
-    int param_count;
+    Type *type;
 
     SymbolAttrType attr_type;
 
@@ -1929,6 +1932,9 @@ void typecheck_statement(Statement *stmt,Symbol **symbols);
 void typecheck_expression(Exp *exp,Symbol **symbols);
 void typecheck_for_init(ForInit *init,Symbol **symbols);
 
+//return type of the function whose body is being type checked
+static Type *current_return_type=NULL;
+
 Symbol *symbol_find(Symbol *symbols,const char *name) {
     while(symbols) {
         if (strcmp(symbols->name,name)==0){
@@ -1940,14 +1946,33 @@ Symbol *symbol_find(Symbol *symbols,const char *name) {
     return NULL;
 }
 
-InitialValue make_initial_value(InitialValueType type,int value) {
+InitialValue make_initial_value(InitialValueType type,StaticInit value) {
     InitialValue init;
     init.type=type;
     init.value=value;
     return init;
 }
 
-Symbol *symbol_add(Symbol **symbols,const char *name,Symbol_Type type) {
+//convert a constant to a static initializer of type t, truncating like a C cast
+StaticInit const_to_static_init(Const c,Type *t) {
+    StaticInit init;
+    if (t->kind==TYPE_LONG) {
+        init.type=INIT_LONG;
+        init.value=c.value;
+    }
+    else {
+        init.type=INIT_INT;
+        init.value=(int)c.value;
+    }
+    return init;
+}
+
+StaticInit zero_static_init(Type *t) {
+    Const zero={CONST_INT,0};
+    return const_to_static_init(zero,t);
+}
+
+Symbol *symbol_add(Symbol **symbols,const char *name,Type *type) {
     Symbol *entry=calloc(1,sizeof(Symbol));
     if (!entry){
         perror("calloc Symbol");
@@ -1962,18 +1987,19 @@ Symbol *symbol_add(Symbol **symbols,const char *name,Symbol_Type type) {
     return entry;
 }
 
-void symbol_add_local_int(Symbol **symbols,const char *name) {
-    Symbol *entry=symbol_add(symbols,name,SYMBOL_INT);
+void symbol_add_local(Symbol **symbols,const char *name,Type *type) {
+    Symbol *entry=symbol_add(symbols,name,type);
     entry->attr_type=SYMBOL_ATTR_LOCAL;
 }
 
-void symbol_add_static_int(
+void symbol_add_static(
     Symbol **symbols,
     const char *name,
+    Type *type,
     InitialValue init,
     int global
 ) {
-    Symbol *entry=symbol_add(symbols,name,SYMBOL_INT);
+    Symbol *entry=symbol_add(symbols,name,type);
     entry->attr_type=SYMBOL_ATTR_STATIC;
     entry->init=init;
     entry->global=global;
@@ -1982,15 +2008,40 @@ void symbol_add_static_int(
 void symbol_add_function(
     Symbol **symbols,
     const char *name,
-    int param_count,
+    Type *type,
     int defined,
     int global
 ) {
-    Symbol *entry=symbol_add(symbols,name,SYMBOL_FUNCTION);
-    entry->param_count=param_count;
+    Symbol *entry=symbol_add(symbols,name,type);
     entry->attr_type=SYMBOL_ATTR_FUNCTION;
     entry->defined=defined;
     entry->global=global;
+}
+
+Type *get_common_type(Type *t1,Type *t2) {
+    if (type_equal(t1,t2)) {
+        return t1;
+    }
+    return type_long();
+}
+
+//wrap *slot in a cast to t unless it already has type t
+void convert_to(Exp **slot,Type *t) {
+    if (type_equal((*slot)->exp_type,t)) {
+        return;
+    }
+
+    Exp *cast=make_cast_exp(t,*slot);
+    cast->exp_type=t;
+    *slot=cast;
+}
+
+static int is_shift_op(BinaryOpType op) {
+    return op==BINARY_LSHIFT || op==BINARY_RSHIFT;
+}
+
+static int is_comparison_op(BinaryOpType op) {
+    return op>=BINARY_EQ && op<=BINARY_GTE;
 }
 
 void typecheck_expression(Exp *exp,Symbol **symbols) {
@@ -2000,10 +2051,12 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
     switch(exp->type) {
         case EXP_CONSTANT:
+            exp->exp_type=(exp->constant.type==CONST_LONG) ? type_long() : type_int();
             return;
 
         case EXP_CAST:
             typecheck_expression(exp->cast.exp,symbols);
+            exp->exp_type=exp->cast.target_type;
             return;
 
         case EXP_VAR: {
@@ -2014,7 +2067,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
                 exit(1);
             }
 
-            if (entry->type!=SYMBOL_INT) {
+            if (entry->type->kind==TYPE_FUNCTION) {
                 fprintf(
                     stderr,
                     "Type Error: function '%s' used as variable\n",
@@ -2023,6 +2076,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
                 exit(1);
             }
 
+            exp->exp_type=entry->type;
             return;
         }
 
@@ -2038,7 +2092,9 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
                 exit(1);
             }
 
-            if (entry->type!=SYMBOL_FUNCTION) {
+            Type *fun_type=entry->type;
+
+            if (fun_type->kind!=TYPE_FUNCTION) {
                 fprintf(
                     stderr,
                     "Type Error: called object '%s' is not a function\n",
@@ -2047,12 +2103,12 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
                 exit(1);
             }
 
-            if (entry->param_count!=exp->function_call.arg_count) {
+            if (fun_type->param_count!=exp->function_call.arg_count) {
                 fprintf(
                     stderr,
                     "Type Error: function '%s' expects %d arguments but got %d\n",
                     exp->function_call.name,
-                    entry->param_count,
+                    fun_type->param_count,
                     exp->function_call.arg_count
                 );
                 exit(1);
@@ -2060,40 +2116,92 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
             for(int i=0;i<exp->function_call.arg_count;i++){
                 typecheck_expression(exp->function_call.args[i],symbols);
+                convert_to(&exp->function_call.args[i],fun_type->params[i]);
             }
 
+            exp->exp_type=fun_type->ret;
             return;
         }
 
         case EXP_UNARY:
             typecheck_expression(exp->unary.exp,symbols);
+            exp->exp_type=(exp->unary.op==UNARY_NOT) ? type_int() : exp->unary.exp->exp_type;
             return;
 
-        case EXP_BINARY:
+        case EXP_BINARY: {
+            BinaryOpType op=exp->binary.op;
             typecheck_expression(exp->binary.left,symbols);
             typecheck_expression(exp->binary.right,symbols);
+
+            if (op==BINARY_LOGICAL_AND || op==BINARY_LOGICAL_OR) {
+                exp->exp_type=type_int();
+                return;
+            }
+
+            //a shift has its left operand's type; no usual arithmetic conversions
+            if (is_shift_op(op)) {
+                Type *left_type=exp->binary.left->exp_type;
+                convert_to(&exp->binary.right,left_type);
+                exp->exp_type=left_type;
+                return;
+            }
+
+            Type *common_type=get_common_type(
+                exp->binary.left->exp_type,
+                exp->binary.right->exp_type
+            );
+            convert_to(&exp->binary.left,common_type);
+            convert_to(&exp->binary.right,common_type);
+
+            exp->exp_type=is_comparison_op(op) ? type_int() : common_type;
             return;
+        }
 
         case EXP_ASSIGN:
             typecheck_expression(exp->assign.lvalue,symbols);
             typecheck_expression(exp->assign.rvalue,symbols);
+            convert_to(&exp->assign.rvalue,exp->assign.lvalue->exp_type);
+            exp->exp_type=exp->assign.lvalue->exp_type;
             return;
 
-        case EXP_COMPOUND_ASSIGN:
+        /*
+        a op= b computes in the common type of a and b (in a's type for shifts);
+        TACKY generation reads that type from the converted rvalue.
+        */
+        case EXP_COMPOUND_ASSIGN: {
             typecheck_expression(exp->compound.lvalue,symbols);
             typecheck_expression(exp->compound.rvalue,symbols);
+
+            Type *left_type=exp->compound.lvalue->exp_type;
+            Type *op_type=is_shift_op(exp->compound.op)
+                ? left_type
+                : get_common_type(left_type,exp->compound.rvalue->exp_type);
+
+            convert_to(&exp->compound.rvalue,op_type);
+            exp->exp_type=left_type;
             return;
+        }
 
         case EXP_PREFIX_OP:
         case EXP_POSTFIX_OP:
             typecheck_expression(exp->inc_dec.lvalue,symbols);
+            exp->exp_type=exp->inc_dec.lvalue->exp_type;
             return;
 
-        case EXP_CONDITIONAL:
+        case EXP_CONDITIONAL: {
             typecheck_expression(exp->conditional.condition,symbols);
             typecheck_expression(exp->conditional.true_expr,symbols);
             typecheck_expression(exp->conditional.false_expr,symbols);
+
+            Type *common_type=get_common_type(
+                exp->conditional.true_expr->exp_type,
+                exp->conditional.false_expr->exp_type
+            );
+            convert_to(&exp->conditional.true_expr,common_type);
+            convert_to(&exp->conditional.false_expr,common_type);
+            exp->exp_type=common_type;
             return;
+        }
     }
 }
 
@@ -2115,14 +2223,14 @@ void typecheck_file_scope_variable_declaration(
 
         initial_value=make_initial_value(
             INITIAL_VALUE,
-            (int)decl->init->constant.value
+            const_to_static_init(decl->init->constant,decl->var_type)
         );
     }
     else if (decl->storage_class==STORAGE_EXTERN) {
-        initial_value=make_initial_value(INITIAL_NONE,0);
+        initial_value=make_initial_value(INITIAL_NONE,zero_static_init(decl->var_type));
     }
     else {
-        initial_value=make_initial_value(INITIAL_TENTATIVE,0);
+        initial_value=make_initial_value(INITIAL_TENTATIVE,zero_static_init(decl->var_type));
     }
 
     int global=(decl->storage_class!=STORAGE_STATIC);
@@ -2130,10 +2238,19 @@ void typecheck_file_scope_variable_declaration(
     Symbol *old_symbol=symbol_find(*symbols,decl->name);
 
     if (old_symbol) {
-        if (old_symbol->type!=SYMBOL_INT) {
+        if (old_symbol->type->kind==TYPE_FUNCTION) {
             fprintf(
                 stderr,
                 "Type Error: function '%s' redeclared as variable\n",
+                decl->name
+            );
+            exit(1);
+        }
+
+        if (!type_equal(old_symbol->type,decl->var_type)) {
+            fprintf(
+                stderr,
+                "Type Error: conflicting types for variable '%s'\n",
                 decl->name
             );
             exit(1);
@@ -2185,9 +2302,10 @@ void typecheck_file_scope_variable_declaration(
         return;
     }
 
-    symbol_add_static_int(
+    symbol_add_static(
         symbols,
         decl->name,
+        decl->var_type,
         initial_value,
         global
     );
@@ -2210,7 +2328,7 @@ void typecheck_local_variable_declaration(
         Symbol *old_symbol=symbol_find(*symbols,decl->name);
 
         if (old_symbol) {
-            if (old_symbol->type!=SYMBOL_INT) {
+            if (old_symbol->type->kind==TYPE_FUNCTION) {
                 fprintf(
                     stderr,
                     "Type Error: function '%s' redeclared as variable\n",
@@ -2219,13 +2337,23 @@ void typecheck_local_variable_declaration(
                 exit(1);
             }
 
+            if (!type_equal(old_symbol->type,decl->var_type)) {
+                fprintf(
+                    stderr,
+                    "Type Error: conflicting types for variable '%s'\n",
+                    decl->name
+                );
+                exit(1);
+            }
+
             return;
         }
 
-        symbol_add_static_int(
+        symbol_add_static(
             symbols,
             decl->name,
-            make_initial_value(INITIAL_NONE,0),
+            decl->var_type,
+            make_initial_value(INITIAL_NONE,zero_static_init(decl->var_type)),
             1
         );
         return;
@@ -2246,26 +2374,28 @@ void typecheck_local_variable_declaration(
 
             initial_value=make_initial_value(
                 INITIAL_VALUE,
-                (int)decl->init->constant.value
+                const_to_static_init(decl->init->constant,decl->var_type)
             );
         }
         else {
-            initial_value=make_initial_value(INITIAL_VALUE,0);
+            initial_value=make_initial_value(INITIAL_VALUE,zero_static_init(decl->var_type));
         }
 
-        symbol_add_static_int(
+        symbol_add_static(
             symbols,
             decl->name,
+            decl->var_type,
             initial_value,
             0
         );
         return;
     }
 
-    symbol_add_local_int(symbols,decl->name);
+    symbol_add_local(symbols,decl->name,decl->var_type);
 
     if (decl->init) {
         typecheck_expression(decl->init,symbols);
+        convert_to(&decl->init,decl->var_type);
     }
 }
 
@@ -2302,6 +2432,10 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
 
     switch(stmt->type) {
         case STMT_RETURN:
+            typecheck_expression(stmt->exp,symbols);
+            convert_to(&stmt->exp,current_return_type);
+            return;
+
         case STMT_EXPRESSION:
             if (stmt->exp) {
                 typecheck_expression(stmt->exp,symbols);
@@ -2459,7 +2593,7 @@ void typecheck_function_declaration(
     Symbol *old_symbol=symbol_find(*symbols,fn->name);
 
     if (old_symbol) {
-        if (old_symbol->type!=SYMBOL_FUNCTION) {
+        if (old_symbol->type->kind!=TYPE_FUNCTION) {
             fprintf(
                 stderr,
                 "Type Error: '%s' redeclared as function\n",
@@ -2468,7 +2602,7 @@ void typecheck_function_declaration(
             exit(1);
         }
 
-        if (old_symbol->param_count!=fn->param_count) {
+        if (!type_equal(old_symbol->type,fn->fun_type)) {
             fprintf(
                 stderr,
                 "Type Error: incompatible declarations of function '%s'\n",
@@ -2509,7 +2643,7 @@ void typecheck_function_declaration(
         symbol_add_function(
             symbols,
             fn->name,
-            fn->param_count,
+            fn->fun_type,
             has_body,
             global
         );
@@ -2520,11 +2654,14 @@ void typecheck_function_declaration(
     }
 
     for(int i=0;i<fn->param_count;i++) {
-        symbol_add_local_int(
+        symbol_add_local(
             symbols,
-            fn->params[i]
+            fn->params[i],
+            fn->fun_type->params[i]
         );
     }
+
+    current_return_type=fn->fun_type->ret;
 
     typecheck_block_items(
         fn->body,
@@ -3126,18 +3263,25 @@ void label_statement(Statement *stmt,char *current_break_label,char *current_con
 }
 
 //eval case/default expression
-static int eval_const_expr(Exp *e,int *out){
+static int eval_const_expr(Exp *e,long *out){
     if (!e) {
         return 0;
     }
 
     switch(e->type){
         case EXP_CONSTANT:
-            *out=(int)e->constant.value;
+            *out=e->constant.value;
             return 1;
 
+        case EXP_CAST: {
+            long v;
+            if (!eval_const_expr(e->cast.exp,&v)) return 0;
+            *out=(e->cast.target_type->kind==TYPE_INT) ? (int)v : v;
+            return 1;
+        }
+
         case EXP_UNARY: {
-            int v;
+            long v;
             if (!eval_const_expr(e->unary.exp,&v)) return 0;
 
             switch (e->unary.op){
@@ -3150,7 +3294,7 @@ static int eval_const_expr(Exp *e,int *out){
         }
 
         case EXP_BINARY:{
-            int l,r;
+            long l,r;
             if (!eval_const_expr(e->binary.left,&l)) return 0;
             if (!eval_const_expr(e->binary.right,&r)) return 0;
 
@@ -3183,7 +3327,7 @@ static int eval_const_expr(Exp *e,int *out){
         }
 
         case EXP_CONDITIONAL:{
-            int cond;
+            long cond;
             if (!eval_const_expr(e->conditional.condition,&cond)) return 0;
             if (cond) return eval_const_expr(e->conditional.true_expr,out);
             return eval_const_expr(e->conditional.false_expr,out);
@@ -3194,7 +3338,7 @@ static int eval_const_expr(Exp *e,int *out){
     }
 }
 
-static int switch_case_exists(SwitchCaseInfo *cases,int value){
+static int switch_case_exists(SwitchCaseInfo *cases,long value){
     while(cases){
         if (cases->value==value) return 1;
         cases=cases->next;
@@ -3202,7 +3346,7 @@ static int switch_case_exists(SwitchCaseInfo *cases,int value){
     return 0;
 }
 
-static void add_switch_case(Statement *switch_stmt,int value,const char *label){
+static void add_switch_case(Statement *switch_stmt,long value,const char *label){
     SwitchCaseInfo *node=calloc(1,sizeof(SwitchCaseInfo));
     node->value=value;
     node->label=strdup(label);
@@ -3236,10 +3380,14 @@ void collect_switch_cases_statement(Statement *stmt,Statement *current_switch){
                 exit(1);
             }
 
-            int value;
+            long value;
             if (!eval_const_expr(stmt->case_stmt.value_exp,&value)){
                 fprintf(stderr, "Semantic Error: case label outside of switch\n");
                 exit(1);
+            }
+
+            if (current_switch->switch_stmt.control->exp_type->kind==TYPE_INT){
+                value=(int)value;
             }
 
             if (switch_case_exists(current_switch->switch_stmt.cases,value)){
@@ -3351,12 +3499,21 @@ void validate_program_pass(Function *fn) {
         NULL,
         NULL
     );
+}
 
-    collect_switch_cases_block_items(
-        fn->body,
-        fn->body_count,
-        NULL
-    );
+//case values are converted to the control's type, so this runs after type checking
+void collect_program_switch_cases(Program *prog){
+    for(int i=0;i<prog->declaration_count;i++) {
+        Declaration *decl=prog->declarations[i];
+
+        if (decl->type==DECL_FUN && decl->fun->has_body) {
+            collect_switch_cases_block_items(
+                decl->fun->body,
+                decl->fun->body_count,
+                NULL
+            );
+        }
+    }
 }
 
 void resolve_program(Program *prog){
@@ -4752,7 +4909,7 @@ static void convert_symbols_to_tacky(
 
         int init=0;
         if (entry->init.type==INITIAL_VALUE) {
-            init=entry->init.value;
+            init=(int)entry->init.value.value;
         }
         else if (entry->init.type==INITIAL_TENTATIVE) {
             init=0;
@@ -5288,6 +5445,7 @@ int main(int argc,char *argv[]){
 
     //type checking
     Symbol *symbols=typecheck_program(prog);
+    collect_program_switch_cases(prog);
 
     if (stage==3){ //--validate
         return 0;
