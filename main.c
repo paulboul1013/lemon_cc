@@ -3772,32 +3772,24 @@ int type_alignment(Type *t){
     return type_size(t);
 }
 
-static AsmType variable_asm_type(Symbol *symbols,const char *name){
+static Type *variable_type(Symbol *symbols,const char *name){
     Symbol *entry=symbol_find(symbols,name);
     if (!entry){
         fprintf(stderr,"Codegen Error: missing symbol '%s'\n",name);
         exit(1);
     }
-    return type_to_asm_type(entry->type);
+    return entry->type;
+}
+
+static Type *tacky_val_type(TackyVal *v,Symbol *symbols){
+    if (v->type==TACKY_VAL_CONSTANT){
+        return const_exp_type(v->constant);
+    }
+    return variable_type(symbols,v->var_name);
 }
 
 static AsmType tacky_val_asm_type(TackyVal *v,Symbol *symbols){
-    if (v->type==TACKY_VAL_CONSTANT){
-        return type_to_asm_type(const_exp_type(v->constant));
-    }
-    return variable_asm_type(symbols,v->var_name);
-}
-
-static int tacky_val_is_signed(TackyVal *v,Symbol *symbols){
-    if (v->type==TACKY_VAL_CONSTANT){
-        return type_is_signed(const_exp_type(v->constant));
-    }
-    Symbol *entry=symbol_find(symbols,v->var_name);
-    if (!entry){
-        fprintf(stderr,"Codegen Error: missing symbol '%s'\n",v->var_name);
-        exit(1);
-    }
-    return type_is_signed(entry->type);
+    return type_to_asm_type(tacky_val_type(v,symbols));
 }
 
 //helper function: let TACKY operator turn it to Asm condition code
@@ -4016,7 +4008,7 @@ static void convert_tacky_instruction(
 
         case TACKY_INST_BINARY:{
             AsmType src_type=tacky_val_asm_type(curr->src,symbols);
-            int is_signed=tacky_val_is_signed(curr->src,symbols);
+            int is_signed=type_is_signed(tacky_val_type(curr->src,symbols));
             BinaryOpType op=(curr->binary_op==BINARY_RSHIFT && !is_signed) ? BINARY_SHR : curr->binary_op;
 
             if (op==BINARY_DIV || op==BINARY_REM){
@@ -4094,7 +4086,7 @@ static AsmFunc *convert_tacky_function(TackyFunction *tacky_fn,Symbol *symbols){
         append_asm(
             head,
             AS_MOV,
-            variable_asm_type(symbols,tacky_fn->params[i]),
+            type_to_asm_type(variable_type(symbols,tacky_fn->params[i])),
             0,
             0,
             src,
