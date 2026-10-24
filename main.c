@@ -209,6 +209,7 @@ typedef enum {
     BINARY_BITWISE_AND, BINARY_BITWISE_OR, BINARY_BITWISE_XOR, // bit operation
     BINARY_LOGICAL_AND, BINARY_LOGICAL_OR, // logical operation
     BINARY_EQ, BINARY_NEQ, BINARY_LT, BINARY_LTE, BINARY_GT, BINARY_GTE,
+    BINARY_SHR, // asm only: logical right shift of an unsigned operand
 
 }BinaryOpType;
 
@@ -631,6 +632,7 @@ typedef enum {
     AS_CALL,             //  call function
     AS_BINARY, //for add,sub,mult
     AS_IDIV, //div and get remainder
+    AS_DIV, //unsigned div
     AS_CDQ, //sign extend EAX to EDX
     AS_CMP, //cmpl
     AS_JMP, // jmp
@@ -2181,7 +2183,7 @@ static void check_variable_redeclaration(
 }
 
 static int is_shift_op(BinaryOpType op) {
-    return op==BINARY_LSHIFT || op==BINARY_RSHIFT;
+    return op==BINARY_LSHIFT || op==BINARY_RSHIFT || op==BINARY_SHR;
 }
 
 static int is_comparison_op(BinaryOpType op) {
@@ -3473,6 +3475,7 @@ static int eval_const_value(Exp *e,long *out){
 
                 case BINARY_LSHIFT: *out=(long)(ul<<(r&63)); return 1;
                 case BINARY_RSHIFT: *out=l>>(r&63); return 1;
+                case BINARY_SHR: *out=(long)(ul>>(r&63)); return 1;
                 
                 case BINARY_BITWISE_AND: *out=l&r; return 1;
                 case BINARY_BITWISE_OR: *out=l|r; return 1;
@@ -3785,15 +3788,27 @@ static AsmType tacky_val_asm_type(TackyVal *v,Symbol *symbols){
     return variable_asm_type(symbols,v->var_name);
 }
 
+static int tacky_val_is_signed(TackyVal *v,Symbol *symbols){
+    if (v->type==TACKY_VAL_CONSTANT){
+        return type_is_signed(const_exp_type(v->constant));
+    }
+    Symbol *entry=symbol_find(symbols,v->var_name);
+    if (!entry){
+        fprintf(stderr,"Codegen Error: missing symbol '%s'\n",v->var_name);
+        exit(1);
+    }
+    return type_is_signed(entry->type);
+}
+
 //helper function: let TACKY operator turn it to Asm condition code
-CondCode binary_to_cond(BinaryOpType op){
+CondCode binary_to_cond(BinaryOpType op,int is_signed){
     switch(op){
         case BINARY_EQ: return COND_E;
         case BINARY_NEQ: return COND_NE;
-        case BINARY_LT: return COND_L;
-        case BINARY_LTE: return COND_LE;
-        case BINARY_GT:  return COND_G;
-        case BINARY_GTE: return COND_GE;
+        case BINARY_LT: return is_signed ? COND_L : COND_B;
+        case BINARY_LTE: return is_signed ? COND_LE : COND_BE;
+        case BINARY_GT:  return is_signed ? COND_G : COND_A;
+        case BINARY_GTE: return is_signed ? COND_GE : COND_AE;
         default: exit(1);
     }
 }
@@ -4001,33 +4016,40 @@ static void convert_tacky_instruction(
 
         case TACKY_INST_BINARY:{
             AsmType src_type=tacky_val_asm_type(curr->src,symbols);
+            int is_signed=tacky_val_is_signed(curr->src,symbols);
+            BinaryOpType op=(curr->binary_op==BINARY_RSHIFT && !is_signed) ? BINARY_SHR : curr->binary_op;
 
-            if (curr->binary_op==BINARY_DIV || curr->binary_op==BINARY_REM){
+            if (op==BINARY_DIV || op==BINARY_REM){
                 append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),as_reg(REG_AX),NULL);
-                append_asm(head,AS_CDQ,src_type,0,0,NO_OPERAND,NO_OPERAND,NULL);
-                append_asm(head,AS_IDIV,src_type,0,0,convert_tacky_val(curr->src2),NO_OPERAND,NULL);
+                if (is_signed){
+                    append_asm(head,AS_CDQ,src_type,0,0,NO_OPERAND,NO_OPERAND,NULL);
+                    append_asm(head,AS_IDIV,src_type,0,0,convert_tacky_val(curr->src2),NO_OPERAND,NULL);
+                }else{
+                    append_asm(head,AS_MOV,src_type,0,0,as_imm(0),as_reg(REG_DX),NULL);
+                    append_asm(head,AS_DIV,src_type,0,0,convert_tacky_val(curr->src2),NO_OPERAND,NULL);
+                }
 
-                AsmReg res_reg=(curr->binary_op==BINARY_DIV) ? REG_AX:REG_DX;
+                AsmReg res_reg=(op==BINARY_DIV) ? REG_AX:REG_DX;
                 append_asm(head,AS_MOV,src_type,0,0,as_reg(res_reg),convert_tacky_val(curr->dst),NULL);
             }
-            else if (is_shift_op(curr->binary_op)){
+            else if (is_shift_op(op)){
                 if (curr->src2->type==TACKY_VAL_CONSTANT){
                     append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
-                    append_asm(head,AS_BINARY,src_type,curr->binary_op,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst),NULL);
+                    append_asm(head,AS_BINARY,src_type,op,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst),NULL);
                 }else{
                     append_asm(head,AS_MOV,tacky_val_asm_type(curr->src2,symbols),0,0,convert_tacky_val(curr->src2),as_reg(REG_CX),NULL);
                     append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
-                    append_asm(head,AS_BINARY,src_type,curr->binary_op,0,as_reg(REG_CX),convert_tacky_val(curr->dst),NULL);
+                    append_asm(head,AS_BINARY,src_type,op,0,as_reg(REG_CX),convert_tacky_val(curr->dst),NULL);
                 }
             }
-            else if (is_comparison_op(curr->binary_op)){
+            else if (is_comparison_op(op)){
                 append_asm(head,AS_CMP,src_type,0,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->src),NULL);
                 append_asm(head,AS_MOV,tacky_val_asm_type(curr->dst,symbols),0,0,as_imm(0),convert_tacky_val(curr->dst),NULL);
-                append_asm(head,AS_SET_CC,0,0,binary_to_cond(curr->binary_op),NO_OPERAND,convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_SET_CC,0,0,binary_to_cond(op,is_signed),NO_OPERAND,convert_tacky_val(curr->dst),NULL);
             }
             else{
                 append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
-                append_asm(head,AS_BINARY,src_type,curr->binary_op,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_BINARY,src_type,op,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst),NULL);
             }
             break;
         }
@@ -4381,6 +4403,7 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
             break;
 
         case AS_IDIV:
+        case AS_DIV:
             if (inst->src.type==AS_IMM){
                 push_inst(tail,make_asm(AS_MOV,t,0,0,inst->src,as_reg(REG_R10),NULL));
                 inst->src=as_reg(REG_R10);
@@ -5362,6 +5385,10 @@ const char *cond_to_str(CondCode c){
         case COND_GE: return "ge";
         case COND_L: return "l";
         case COND_LE: return "le";
+        case COND_A: return "a";
+        case COND_AE: return "ae";
+        case COND_B: return "b";
+        case COND_BE: return "be";
         default: return "";
     }
 }
@@ -5522,6 +5549,9 @@ static void emit_instruction(
                 case BINARY_RSHIFT:
                     op_str="sar";
                     break;
+                case BINARY_SHR:
+                    op_str="shr";
+                    break;
                 default:
                     fprintf(stderr,"Emitter Error: unsupported binary operator\n");
                     exit(1);
@@ -5529,8 +5559,7 @@ static void emit_instruction(
 
             fprintf(out,"    %s%c    ",op_str,suffix);
 
-            if (curr->binary_op==BINARY_LSHIFT ||
-                curr->binary_op==BINARY_RSHIFT){
+            if (is_shift_op(curr->binary_op)){
                 if (curr->src.type==AS_IMM){
                     emit_op(curr->src,t,out);
                 }else{
@@ -5547,7 +5576,8 @@ static void emit_instruction(
         }
 
         case AS_IDIV:
-            fprintf(out,"    idiv%c   ",suffix);
+        case AS_DIV:
+            fprintf(out,curr->type==AS_IDIV ? "    idiv%c   " : "    div%c    ",suffix);
             emit_op(curr->src,t,out);
             fprintf(out,"\n");
             break;
