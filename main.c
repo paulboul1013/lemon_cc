@@ -4358,7 +4358,11 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
             break;
 
         case AS_BINARY:
+            //shift count immediates are 8 bits; mask like the CPU does for %cl
             if (is_shift_op(inst->binary_op)){
+                if (inst->src.type==AS_IMM){
+                    inst->src.imm&=(t==ASM_QUADWORD) ? 63 : 31;
+                }
                 break;
             }
 
