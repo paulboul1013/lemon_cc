@@ -6,7 +6,7 @@
 
 //define Token type
 typedef  enum{
-    TOK_INT, TOK_LONG, TOK_VOID, TOK_RETURN,
+    TOK_INT, TOK_LONG, TOK_SIGNED, TOK_UNSIGNED, TOK_VOID, TOK_RETURN,
     TOK_STATIC, TOK_EXTERN,
 
     TOK_IF,
@@ -24,6 +24,7 @@ typedef  enum{
     TOK_DEFAULT,
 
     TOK_IDENTIFIER, TOK_CONSTANT, TOK_LONG_CONSTANT,
+    TOK_UNSIGNED_CONSTANT, TOK_UNSIGNED_LONG_CONSTANT,
     TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
     TOK_SEMICOLON, 
     TOK_COMMA,
@@ -85,6 +86,8 @@ typedef struct {
 typedef enum {
     TYPE_INT,
     TYPE_LONG,
+    TYPE_UINT,
+    TYPE_ULONG,
     TYPE_FUNCTION
 } TypeKind;
 
@@ -103,6 +106,33 @@ Type *type_int(void){
 Type *type_long(void){
     static Type t={TYPE_LONG,NULL,0,NULL};
     return &t;
+}
+
+Type *type_uint(void){
+    static Type t={TYPE_UINT,NULL,0,NULL};
+    return &t;
+}
+
+Type *type_ulong(void){
+    static Type t={TYPE_ULONG,NULL,0,NULL};
+    return &t;
+}
+
+int type_size(Type *t){
+    return (t->kind==TYPE_LONG || t->kind==TYPE_ULONG) ? 8 : 4;
+}
+
+int type_is_signed(Type *t){
+    return t->kind==TYPE_INT || t->kind==TYPE_LONG;
+}
+
+//wrap v to the range of t, keeping the bit pattern in a long
+long convert_value(long v,Type *t){
+    switch (t->kind){
+        case TYPE_INT: return (int)v;
+        case TYPE_UINT: return (unsigned int)v;
+        default: return v;
+    }
 }
 
 Type *make_function_type(Type **params,int param_count,Type *ret){
@@ -128,17 +158,30 @@ int type_equal(Type *a,Type *b){
 
 typedef enum {
     CONST_INT,
-    CONST_LONG
+    CONST_LONG,
+    CONST_UINT,
+    CONST_ULONG
 } ConstType;
 
 typedef struct {
     ConstType type;
-    long value; //CONST_INT values always fit in int
+    long value; //bit pattern, already wrapped by convert_value
 } Const;
+
+Type *const_exp_type(Const c){
+    switch (c.type){
+        case CONST_LONG: return type_long();
+        case CONST_UINT: return type_uint();
+        case CONST_ULONG: return type_ulong();
+        default: return type_int();
+    }
+}
 
 typedef enum {
     INIT_INT,
-    INIT_LONG
+    INIT_LONG,
+    INIT_UINT,
+    INIT_ULONG
 } StaticInitType;
 
 typedef struct {
@@ -791,8 +834,13 @@ char *make_temporary(){
 
 Const make_const(Type *t,long value){
     Const c;
-    c.type=(t->kind==TYPE_LONG) ? CONST_LONG : CONST_INT;
-    c.value=value;
+    switch (t->kind){
+        case TYPE_LONG: c.type=CONST_LONG; break;
+        case TYPE_UINT: c.type=CONST_UINT; break;
+        case TYPE_ULONG: c.type=CONST_ULONG; break;
+        default: c.type=CONST_INT; break;
+    }
+    c.value=convert_value(value,t);
     return c;
 }
 
@@ -833,6 +881,8 @@ void add_token(TokenType type,const char *val){
 TokenType check_keyword(const char *s){
     if (strcmp(s,"int")==0) return TOK_INT;
     if (strcmp(s,"long")==0) return TOK_LONG;
+    if (strcmp(s,"signed")==0) return TOK_SIGNED;
+    if (strcmp(s,"unsigned")==0) return TOK_UNSIGNED;
     if (strcmp(s,"void")==0) return TOK_VOID;
     if (strcmp(s,"return")==0) return TOK_RETURN;
     if (strcmp(s,"static")==0) return TOK_STATIC;
@@ -909,14 +959,29 @@ void lex(const char *input){
             while (isdigit(*p)) p++;
             int len=p-start;
 
-            TokenType const_type=TOK_CONSTANT;
+            //suffix: l, u, ul or lu in any case
+            int is_long=0,is_unsigned=0;
             if (*p=='l' || *p=='L'){
-                const_type=TOK_LONG_CONSTANT;
+                is_long=1;
                 p++;
+                if (*p=='u' || *p=='U'){
+                    is_unsigned=1;
+                    p++;
+                }
+            }else if (*p=='u' || *p=='U'){
+                is_unsigned=1;
+                p++;
+                if (*p=='l' || *p=='L'){
+                    is_long=1;
+                    p++;
+                }
             }
+            TokenType const_type=is_unsigned
+                ? (is_long ? TOK_UNSIGNED_LONG_CONSTANT : TOK_UNSIGNED_CONSTANT)
+                : (is_long ? TOK_LONG_CONSTANT : TOK_CONSTANT);
 
             //123abc can't pass，need to 123_abc will pass
-            if (isalnum(*p) || *p=='_'){
+            if (isalnum(*p) || *p=='_' || *p=='.'){
                 fprintf(stderr, "Lexer Error: Invalid identifier starting with digit at '%c'\n", *p);
                 exit(1);
             }
@@ -1142,7 +1207,7 @@ void resolve_for_init(ForInit *init,IdentifierMap **map){
 }
 
 int is_type_specifier(TokenType type){
-    return type==TOK_INT || type==TOK_LONG;
+    return type==TOK_INT || type==TOK_LONG || type==TOK_SIGNED || type==TOK_UNSIGNED;
 }
 
 int is_declaration_start(void) {
@@ -1150,28 +1215,37 @@ int is_declaration_start(void) {
     return is_type_specifier(type) || type==TOK_STATIC || type==TOK_EXTERN;
 }
 
-// int | long | long int | int long
+// specifiers in any order, none repeated, not both signed and unsigned
 Type *parse_type(TokenType *types,int count){
-    if (count==1 && types[0]==TOK_INT){
-        return type_int();
+    int has_int=0,has_long=0,has_signed=0,has_unsigned=0;
+
+    for (int i=0;i<count;i++){
+        int *seen=types[i]==TOK_INT ? &has_int :
+                  types[i]==TOK_LONG ? &has_long :
+                  types[i]==TOK_SIGNED ? &has_signed : &has_unsigned;
+        if (*seen){
+            fprintf(stderr,"Parse Error: invalid type specifier\n");
+            exit(1);
+        }
+        *seen=1;
     }
 
-    if ((count==1 && types[0]==TOK_LONG) ||
-        (count==2 && types[0]!=types[1])){
-        return type_long();
+    if (count==0 || (has_signed && has_unsigned)){
+        fprintf(stderr,"Parse Error: invalid type specifier\n");
+        exit(1);
     }
 
-    fprintf(stderr,"Parse Error: invalid type specifier\n");
-    exit(1);
+    if (has_unsigned) return has_long ? type_ulong() : type_uint();
+    return has_long ? type_long() : type_int();
 }
 
 // { <type-specifier> }+
 Type *parse_type_specifiers(void){
-    TokenType types[2];
+    TokenType types[4];
     int count=0;
 
     while (is_type_specifier(peek().type)){
-        if (count==2){
+        if (count==4){
             fprintf(stderr,"Parse Error: invalid type specifier\n");
             exit(1);
         }
@@ -1509,14 +1583,16 @@ Exp **parse_argument_list(int *out_count) {
 //            | "++" <factor>
 //            | "--" <factor>
 // <int> fits in int -> ConstInt, otherwise ConstLong; <long> -> ConstLong
+// <uint> fits in unsigned int -> ConstUInt, otherwise ConstULong; <ulong> -> ConstULong
 Const parse_constant(Token t){
-    const unsigned long long_max=LONG_MAX;
+    int is_unsigned=(t.type==TOK_UNSIGNED_CONSTANT || t.type==TOK_UNSIGNED_LONG_CONSTANT);
+    const unsigned long max=is_unsigned ? ULONG_MAX : LONG_MAX;
     unsigned long v=0;
 
     for (const char *p=t.value;*p;p++){
         unsigned long digit=(unsigned long)(*p-'0');
-        if (v > (long_max-digit)/10){
-            fprintf(stderr,"Parse Error: constant %s is too large to represent as an int or long\n",t.value);
+        if (v > (max-digit)/10){
+            fprintf(stderr,"Parse Error: constant %s is too large to represent\n",t.value);
             exit(1);
         }
         v=v*10+digit;
@@ -1524,7 +1600,11 @@ Const parse_constant(Token t){
 
     Const c;
     c.value=(long)v;
-    c.type=(t.type==TOK_CONSTANT && v<=INT_MAX) ? CONST_INT : CONST_LONG;
+    if (is_unsigned){
+        c.type=(t.type==TOK_UNSIGNED_CONSTANT && v<=UINT_MAX) ? CONST_UINT : CONST_ULONG;
+    }else{
+        c.type=(t.type==TOK_CONSTANT && v<=INT_MAX) ? CONST_INT : CONST_LONG;
+    }
     return c;
 }
 
@@ -1532,7 +1612,8 @@ Exp *parse_factor(){
     Token t=peek();
     Exp *inner = NULL;
 
-    if (t.type==TOK_CONSTANT || t.type==TOK_LONG_CONSTANT){
+    if (t.type==TOK_CONSTANT || t.type==TOK_LONG_CONSTANT ||
+        t.type==TOK_UNSIGNED_CONSTANT || t.type==TOK_UNSIGNED_LONG_CONSTANT){
         take();
         return make_constant_exp(parse_constant(t));
     }
@@ -1992,14 +2073,13 @@ InitialValue make_initial_value(InitialValueType type,StaticInit value) {
 //convert a constant to a static initializer of type t, truncating like a C cast
 StaticInit const_to_static_init(Const c,Type *t) {
     StaticInit init;
-    if (t->kind==TYPE_LONG) {
-        init.type=INIT_LONG;
-        init.value=c.value;
+    switch (t->kind){
+        case TYPE_LONG: init.type=INIT_LONG; break;
+        case TYPE_UINT: init.type=INIT_UINT; break;
+        case TYPE_ULONG: init.type=INIT_ULONG; break;
+        default: init.type=INIT_INT; break;
     }
-    else {
-        init.type=INIT_INT;
-        init.value=(int)c.value;
-    }
+    init.value=convert_value(c.value,t);
     return init;
 }
 
@@ -2058,7 +2138,10 @@ Type *get_common_type(Type *t1,Type *t2) {
     if (type_equal(t1,t2)) {
         return t1;
     }
-    return type_long();
+    if (type_size(t1)==type_size(t2)) {
+        return type_is_signed(t1) ? t2 : t1;
+    }
+    return type_size(t1)>type_size(t2) ? t1 : t2;
 }
 
 //wrap *slot in a cast to t unless it already has type t
@@ -2110,7 +2193,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
     switch(exp->type) {
         case EXP_CONSTANT:
-            exp->exp_type=(exp->constant.type==CONST_LONG) ? type_long() : type_int();
+            exp->exp_type=const_exp_type(exp->constant);
             return;
 
         case EXP_CAST:
@@ -3318,9 +3401,11 @@ void label_statement(Statement *stmt,char *current_break_label,char *current_con
 //eval case/default expression
 /*
 Fold an already type-checked constant expression. Arithmetic runs in long
-(wrapping through unsigned to avoid host overflow), then every int-typed
-node is truncated to int, so results match what gcc computes, e.g.
-(1 << 31) is INT_MIN rather than 2^31.
+(wrapping through unsigned to avoid host overflow), then every node is
+wrapped to its own type, so results match what gcc computes, e.g.
+(1 << 31) is INT_MIN rather than 2^31. Operands of an unsigned type are
+already non-negative or raw bit patterns, so their division, shifts and
+comparisons run in unsigned long.
 */
 static int eval_const_value(Exp *e,long *out){
     switch(e->type){
@@ -3351,6 +3436,25 @@ static int eval_const_value(Exp *e,long *out){
 
             unsigned long ul=(unsigned long)l;
             unsigned long ur=(unsigned long)r;
+
+            if (!type_is_signed(e->binary.left->exp_type)){
+                switch (e->binary.op){
+                    case BINARY_DIV:
+                        if (ur==0) return 0;
+                        *out=(long)(ul/ur);
+                        return 1;
+                    case BINARY_REM:
+                        if (ur==0) return 0;
+                        *out=(long)(ul%ur);
+                        return 1;
+                    case BINARY_RSHIFT: *out=(long)(ul>>(r&63)); return 1;
+                    case BINARY_LT: *out=(ul<ur); return 1;
+                    case BINARY_LTE: *out=(ul<=ur); return 1;
+                    case BINARY_GT: *out=(ul>ur); return 1;
+                    case BINARY_GTE: *out=(ul>=ur); return 1;
+                    default: break;
+                }
+            }
 
             switch (e->binary.op){
                 case BINARY_ADD : *out=(long)(ul+ur); return 1;
@@ -3403,9 +3507,7 @@ static int eval_const_expr(Exp *e,long *out){
         return 0;
     }
 
-    if (e->exp_type->kind==TYPE_INT) {
-        *out=(int)*out;
-    }
+    *out=convert_value(*out,e->exp_type);
     return 1;
 }
 
@@ -3457,9 +3559,7 @@ void collect_switch_cases_statement(Statement *stmt,Statement *current_switch){
                 exit(1);
             }
 
-            if (current_switch->switch_stmt.control->exp_type->kind==TYPE_INT){
-                value=(int)value;
-            }
+            value=convert_value(value,current_switch->switch_stmt.control->exp_type);
 
             if (switch_case_exists(current_switch->switch_stmt.cases,value)){
                 fprintf(stderr, "Semantic Error: duplicate case value %ld\n",value);
