@@ -5836,7 +5836,7 @@ int main(int argc,char *argv[]){
 
         int res=system(cmd);
         remove(asm_path);
-        return res;
+        return res==0 ? 0 : 1;
     }
 
     char out_path[256];
@@ -5852,5 +5852,5 @@ int main(int argc,char *argv[]){
 
     remove(asm_path);
 
-    return res;
+    return res==0 ? 0 : 1;
 }
