@@ -1442,7 +1442,7 @@ Exp *parse_exp(int min_prec){
 
             expect(TOK_COLON);
 
-            Exp *right=parse_exp(prec+1);
+            Exp *right=parse_exp(prec);
 
             Exp *node=calloc(1,sizeof(Exp));
             node->type=EXP_CONDITIONAL;
