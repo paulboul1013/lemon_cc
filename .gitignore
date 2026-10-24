@@ -1,2 +1,5 @@
 docs/agents/plumb.md
 *.pdf
+main
+*.s
+*.o
