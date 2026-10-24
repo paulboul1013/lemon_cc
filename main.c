@@ -3191,6 +3191,7 @@ void resolve_statement(Statement *stmt,IdentifierMap *map){
         resolve_statement(stmt->switch_stmt.body,map);
     }
     else if (stmt->type==STMT_CASE){
+        resolve_expression(stmt->case_stmt.value_exp,map);
         resolve_statement(stmt->case_stmt.body,map);
     }
     else if (stmt->type==STMT_DEFAULT){
@@ -3452,7 +3453,7 @@ void collect_switch_cases_statement(Statement *stmt,Statement *current_switch){
 
             long value;
             if (!eval_const_expr(stmt->case_stmt.value_exp,&value)){
-                fprintf(stderr, "Semantic Error: case label outside of switch\n");
+                fprintf(stderr, "Semantic Error: case label is not an integer constant expression\n");
                 exit(1);
             }
 
@@ -3461,7 +3462,7 @@ void collect_switch_cases_statement(Statement *stmt,Statement *current_switch){
             }
 
             if (switch_case_exists(current_switch->switch_stmt.cases,value)){
-                fprintf(stderr, "Semantic Error: case label is not an integer constant expression\n");
+                fprintf(stderr, "Semantic Error: duplicate case value %ld\n",value);
                 exit(1);
             }
 
@@ -3480,7 +3481,7 @@ void collect_switch_cases_statement(Statement *stmt,Statement *current_switch){
             }
 
             if (current_switch->switch_stmt.default_label){
-                fprintf(stderr, "Semantic Error: default label outside of switch\n");
+                fprintf(stderr, "Semantic Error: multiple default labels in one switch\n");
                 exit(1);
             }
 
