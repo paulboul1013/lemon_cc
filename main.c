@@ -623,6 +623,7 @@ typedef enum {
 typedef enum {
     AS_MOV,
     AS_MOVSX, // sign extend longword to quadword
+    AS_MOVZX, // zero extend longword to quadword
     AS_NEG,
     AS_NOT,
     AS_RET,
@@ -755,6 +756,7 @@ typedef struct {
 typedef enum {
     TACKY_INST_RETURN,
     TACKY_INST_SIGN_EXTEND,
+    TACKY_INST_ZERO_EXTEND,
     TACKY_INST_TRUNCATE,
     TACKY_INST_UNARY,
     TACKY_INST_BINARY,
@@ -3760,11 +3762,11 @@ AsmOperand convert_tacky_val(TackyVal *v){
 }
 
 AsmType type_to_asm_type(Type *t){
-    return t->kind==TYPE_LONG ? ASM_QUADWORD : ASM_LONGWORD;
+    return type_size(t)==8 ? ASM_QUADWORD : ASM_LONGWORD;
 }
 
 int type_alignment(Type *t){
-    return t->kind==TYPE_LONG ? 8 : 4;
+    return type_size(t);
 }
 
 static AsmType variable_asm_type(Symbol *symbols,const char *name){
@@ -3778,7 +3780,7 @@ static AsmType variable_asm_type(Symbol *symbols,const char *name){
 
 static AsmType tacky_val_asm_type(TackyVal *v,Symbol *symbols){
     if (v->type==TACKY_VAL_CONSTANT){
-        return v->constant.type==CONST_LONG ? ASM_QUADWORD : ASM_LONGWORD;
+        return type_to_asm_type(const_exp_type(v->constant));
     }
     return variable_asm_type(symbols,v->var_name);
 }
@@ -3951,6 +3953,10 @@ static void convert_tacky_instruction(
 
         case TACKY_INST_SIGN_EXTEND:
             append_asm(head,AS_MOVSX,ASM_QUADWORD,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+            break;
+
+        case TACKY_INST_ZERO_EXTEND:
+            append_asm(head,AS_MOVZX,ASM_QUADWORD,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
             break;
 
         //copying the low 4 bytes drops the upper half
@@ -4324,6 +4330,19 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
             }
             break;
 
+        //movl into a register clears its upper 4 bytes
+        case AS_MOVZX:
+            if (inst->dst.type==AS_REG){
+                inst->type=AS_MOV;
+                inst->asm_type=ASM_LONGWORD;
+            }else{
+                push_inst(tail,make_asm(AS_MOV,ASM_LONGWORD,0,0,inst->src,as_reg(REG_R11),NULL));
+                inst->type=AS_MOV;
+                inst->asm_type=ASM_QUADWORD;
+                inst->src=as_reg(REG_R11);
+            }
+            break;
+
         case AS_BINARY:
             if (is_shift_op(inst->binary_op)){
                 break;
@@ -4471,12 +4490,15 @@ static TackyVal *emit_tacky_cast(
     }
 
     TackyVal *dst=make_tacky_variable(to);
-    emit_tacky_conversion(
-        inst_list,
-        to->kind==TYPE_LONG ? TACKY_INST_SIGN_EXTEND : TACKY_INST_TRUNCATE,
-        val,
-        dst
-    );
+    TackyInstType type;
+    if (type_size(from)==type_size(to)){
+        type=TACKY_INST_COPY;
+    }else if (type_size(from)>type_size(to)){
+        type=TACKY_INST_TRUNCATE;
+    }else{
+        type=type_is_signed(from) ? TACKY_INST_SIGN_EXTEND : TACKY_INST_ZERO_EXTEND;
+    }
+    emit_tacky_conversion(inst_list,type,val,dst);
     return dst;
 }
 
@@ -5449,6 +5471,11 @@ static void emit_instruction(
             fprintf(out,"\n");
             break;
 
+        //fix-up rewrites every MovZeroExtend into plain moves
+        case AS_MOVZX:
+            fprintf(stderr,"Emitter Error: unexpected MovZeroExtend\n");
+            exit(1);
+
         case AS_NEG:
             fprintf(out,"    neg%c    ",suffix);
             emit_op(curr->dst,t,out);
@@ -5589,7 +5616,7 @@ static void emit_static_variable(AsmStaticVariable *var,FILE *out){
         fprintf(out,".globl " SYMBOL_PREFIX "%s\n",var->name);
     }
 
-    int is_long=(var->init.type==INIT_LONG);
+    int is_long=(var->init.type==INIT_LONG || var->init.type==INIT_ULONG);
 
     if (var->init.value!=0){
         fprintf(out,".data\n.balign %d\n" SYMBOL_PREFIX "%s:\n",var->alignment,var->name);
