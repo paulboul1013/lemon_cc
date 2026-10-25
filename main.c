@@ -873,6 +873,16 @@ char *make_temporary(){
     return name;
 }
 
+//casting a double outside the target's range (or NaN) is UB in this compiler's own C
+static int double_fits(double d,Type *t){
+    switch (t->kind){
+        case TYPE_LONG: return d>=-9223372036854775808.0 && d<9223372036854775808.0;
+        case TYPE_UINT: return d>-1.0 && d<4294967296.0;
+        case TYPE_ULONG: return d>-1.0 && d<18446744073709551616.0;
+        default: return d>-2147483649.0 && d<2147483648.0;
+    }
+}
+
 //every compile-time conversion: integer wrap, int<->double, double->int truncates toward zero
 Const convert_const(Const c,Type *t){
     Const r;
@@ -885,6 +895,10 @@ Const convert_const(Const c,Type *t){
     }
 
     if (c.type==CONST_DOUBLE){
+        if (t->kind!=TYPE_DOUBLE && !double_fits(c.dvalue,t)){
+            fprintf(stderr,"Type Error: constant %g is out of range of its integer type\n",c.dvalue);
+            exit(1);
+        }
         switch (t->kind){
             case TYPE_DOUBLE: r.dvalue=c.dvalue; break;
             case TYPE_LONG: r.value=(long)c.dvalue; break;
@@ -1039,16 +1053,14 @@ void lex(const char *input){
 
             //integer suffix: l, u, ul or lu in any case
             int is_long=0,is_unsigned=0;
-            if (is_double){
-                //a floating constant takes no suffix; one fails the boundary check below
-            }else if (*p=='l' || *p=='L'){
+            if (!is_double && (*p=='l' || *p=='L')){
                 is_long=1;
                 p++;
                 if (*p=='u' || *p=='U'){
                     is_unsigned=1;
                     p++;
                 }
-            }else if (*p=='u' || *p=='U'){
+            }else if (!is_double && (*p=='u' || *p=='U')){
                 is_unsigned=1;
                 p++;
                 if (*p=='l' || *p=='L'){
@@ -4743,7 +4755,6 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
                 break;
             }
 
-
             //movl would truncate an 8-byte immediate anyway; do it here to avoid assembler warnings
             if (t==ASM_LONGWORD && inst->src.type==AS_IMM){
                 inst->src.imm=(int)inst->src.imm;
@@ -6181,6 +6192,12 @@ static void emit_function(
     fprintf(out,"\n");
 }
 
+static long double_bits(double d){
+    long bits;
+    memcpy(&bits,&d,sizeof(bits));
+    return bits;
+}
+
 static void emit_static_variable(AsmStaticVariable *var,FILE *out){
     if (var->global){
         fprintf(out,".globl " SYMBOL_PREFIX "%s\n",var->name);
@@ -6190,10 +6207,8 @@ static void emit_static_variable(AsmStaticVariable *var,FILE *out){
 
     //doubles always go in .data as their bit pattern, so -0.0 keeps its sign bit
     if (var->init.type==INIT_DOUBLE){
-        long bits;
-        memcpy(&bits,&var->init.dvalue,sizeof(bits));
         fprintf(out,".data\n.balign %d\n" SYMBOL_PREFIX "%s:\n",var->alignment,var->name);
-        fprintf(out,"    .quad %ld\n",bits);
+        fprintf(out,"    .quad %ld\n",double_bits(var->init.dvalue));
     }else if (var->init.value!=0){
         fprintf(out,".data\n.balign %d\n" SYMBOL_PREFIX "%s:\n",var->alignment,var->name);
         fprintf(out,"    %s %ld\n",is_long ? ".quad" : ".long",var->init.value);
@@ -6206,8 +6221,7 @@ static void emit_static_variable(AsmStaticVariable *var,FILE *out){
 }
 
 static void emit_static_constant(AsmStaticConstant *c,FILE *out){
-    long bits;
-    memcpy(&bits,&c->init.dvalue,sizeof(bits));
+    long bits=double_bits(c->init.dvalue);
 #ifdef __APPLE__
     fprintf(out,"%s\n.balign %d\n.L%s:\n",c->alignment==16 ? ".literal16" : ".literal8",c->alignment,c->name);
     fprintf(out,"    .quad %ld\n",bits);
