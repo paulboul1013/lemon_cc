@@ -632,7 +632,8 @@ BinaryOpType compound_token_to_binary_op(TokenType type){
 //condition code
 typedef enum {
     COND_E,COND_NE,COND_G,COND_GE,COND_L,COND_LE,
-    COND_A,COND_AE,COND_B,COND_BE
+    COND_A,COND_AE,COND_B,COND_BE,
+    COND_P,COND_NP //parity: set when comisd sees a NaN
 } CondCode;
 
 //Asm AST Node
@@ -650,6 +651,8 @@ typedef enum {
     AS_DIV, //unsigned div
     AS_CDQ, //sign extend EAX to EDX
     AS_CMP, //cmpl
+    AS_CVTTSD2SI, //double to signed integer; asm_type is the destination's
+    AS_CVTSI2SD, //signed integer to double; asm_type is the source's
     AS_JMP, // jmp
     AS_JMP_CC, // setCC
     AS_SET_CC, // label:
@@ -677,12 +680,17 @@ typedef enum{
     REG_R9,  //  sixth argument
     REG_R10, //for source operand fix-up
     REG_R11, //for destination operand fix-up
-    REG_SP
+    REG_SP,
+    REG_XMM0, REG_XMM1, REG_XMM2, REG_XMM3, //double arguments and return value
+    REG_XMM4, REG_XMM5, REG_XMM6, REG_XMM7,
+    REG_XMM14, //for double source operand fix-up
+    REG_XMM15  //for double destination operand fix-up
 } AsmReg;
 
 typedef enum {
     ASM_LONGWORD,
-    ASM_QUADWORD
+    ASM_QUADWORD,
+    ASM_DOUBLE
 } AsmType;
 
 typedef struct {
@@ -721,9 +729,17 @@ typedef struct {
     StaticInit init;
 } AsmStaticVariable;
 
+//read-only floating-point constant, emitted under a local label
+typedef struct {
+    char *name;
+    int alignment;
+    StaticInit init;
+} AsmStaticConstant;
+
 typedef enum {
     ASM_TOP_FUNCTION,
-    ASM_TOP_STATIC_VARIABLE
+    ASM_TOP_STATIC_VARIABLE,
+    ASM_TOP_STATIC_CONSTANT
 } AsmTopLevelType;
 
 typedef struct {
@@ -731,10 +747,11 @@ typedef struct {
     union {
         AsmFunc *function;
         AsmStaticVariable *static_variable;
+        AsmStaticConstant *static_constant;
     };
 } AsmTopLevel;
 
-//backend symbol table entry: ObjEntry(asm_type, is_static) | FunEntry(defined)
+//backend symbol table entry: ObjEntry(asm_type, is_static, is_constant) | FunEntry(defined)
 typedef enum {
     ASM_SYMBOL_OBJ,
     ASM_SYMBOL_FUN
@@ -745,6 +762,7 @@ typedef struct AsmSymbol {
     AsmSymbolKind kind;
     AsmType asm_type; //ObjEntry
     int is_static;    //ObjEntry
+    int is_constant;  //ObjEntry: a StaticConstant, emitted with a local label
     int defined;      //FunEntry
     struct AsmSymbol *next;
 } AsmSymbol;
@@ -3906,8 +3924,43 @@ AsmOperand as_stack(int offset){
     };
 }
 
+AsmOperand as_data(char *name){
+    return (AsmOperand){
+        AS_DATA,
+        .data_name=name
+    };
+}
+
+//StaticConstants collected while converting one program to assembly
+static AsmStaticConstant **double_constants=NULL;
+static int double_constant_count=0;
+
+//one constant per distinct (bit pattern, alignment), so 0.0 and -0.0 stay apart
+static AsmOperand double_constant(double d,int alignment){
+    for (int i=0;i<double_constant_count;i++){
+        AsmStaticConstant *c=double_constants[i];
+        if (c->alignment==alignment && memcmp(&c->init.dvalue,&d,sizeof(double))==0){
+            return as_data(c->name);
+        }
+    }
+
+    AsmStaticConstant *c=calloc(1,sizeof(AsmStaticConstant));
+    c->name=malloc(32);
+    sprintf(c->name,"double.%d",double_constant_count);
+    c->alignment=alignment;
+    c->init.type=INIT_DOUBLE;
+    c->init.dvalue=d;
+
+    double_constants=realloc(double_constants,sizeof(AsmStaticConstant*)*(double_constant_count+1));
+    double_constants[double_constant_count++]=c;
+    return as_data(c->name);
+}
+
 AsmOperand convert_tacky_val(TackyVal *v){
     if (v->type==TACKY_VAL_CONSTANT){
+        if (v->constant.type==CONST_DOUBLE){
+            return double_constant(v->constant.dvalue,8);
+        }
         return as_imm(v->constant.value);
     }
 
@@ -3915,6 +3968,7 @@ AsmOperand convert_tacky_val(TackyVal *v){
 }
 
 AsmType type_to_asm_type(Type *t){
+    if (t->kind==TYPE_DOUBLE) return ASM_DOUBLE;
     return type_size(t)==8 ? ASM_QUADWORD : ASM_LONGWORD;
 }
 
@@ -4019,82 +4073,223 @@ static const AsmReg ARG_REGISTERS[6]={
     REG_R9
 };
 
+//double arguments go in XMM0-XMM7
+static const AsmReg DOUBLE_ARG_REGISTERS[8]={
+    REG_XMM0, REG_XMM1, REG_XMM2, REG_XMM3,
+    REG_XMM4, REG_XMM5, REG_XMM6, REG_XMM7
+};
+
+typedef struct {
+    AsmType type;
+    AsmOperand operand;
+} TypedOperand;
+
+typedef struct {
+    TypedOperand int_args[6];
+    int int_count;
+    AsmOperand double_args[8];
+    int double_count;
+    TypedOperand *stack_args; //in source order: the first one sits at 16(%rbp)
+    int stack_count;
+} ClassifiedArgs;
+
+//split arguments (or parameters) into those passed in integer registers, XMM registers and on the stack
+static ClassifiedArgs classify_parameters(TackyVal **values,int count,Symbol *symbols){
+    ClassifiedArgs c={0};
+    c.stack_args=calloc(count>0 ? count : 1,sizeof(TypedOperand));
+
+    for (int i=0;i<count;i++){
+        TypedOperand arg={tacky_val_asm_type(values[i],symbols),convert_tacky_val(values[i])};
+
+        if (arg.type==ASM_DOUBLE && c.double_count<8){
+            c.double_args[c.double_count++]=arg.operand;
+        }else if (arg.type!=ASM_DOUBLE && c.int_count<6){
+            c.int_args[c.int_count++]=arg;
+        }else{
+            c.stack_args[c.stack_count++]=arg;
+        }
+    }
+    return c;
+}
+
 /*
 Convert:
     FunCall(fun_name, args, dst)
 
 into:
     optional Binary(Sub, Quadword, Imm(8), Reg(SP))
-    Mov(arg1, DI) ... Mov(arg6, R9)
+    Mov(int args -> DI ... R9), Mov(double args -> XMM0 ... XMM7)
     Push(stack arguments in reverse order)
     Call(fun_name)
     optional Binary(Add, Quadword, Imm(bytes), Reg(SP))
-    Mov(AX, dst)
+    Mov(AX or XMM0, dst)
 */
 static void convert_function_call(
     TackyInstruction *call,
     AsmInst **head,
     Symbol *symbols
 ){
-    int register_arg_count=call->arg_count < 6 ? call->arg_count : 6;
-    int stack_arg_count=call->arg_count > 6 ? call->arg_count-6 : 0;
+    ClassifiedArgs args=classify_parameters(call->args,call->arg_count,symbols);
 
     //Keep the stack 16-byte aligned before CALL.
-    int stack_padding=(stack_arg_count % 2) ? 8 : 0;
+    int stack_padding=(args.stack_count % 2) ? 8 : 0;
 
     if (stack_padding){
         append_asm(head,AS_BINARY,ASM_QUADWORD,BINARY_SUB,0,as_imm(stack_padding),as_reg(REG_SP),NULL);
     }
 
-    //First six integer arguments go into registers.
-    for (int i=0;i<register_arg_count;i++){
-        append_asm(
-            head,
-            AS_MOV,
-            tacky_val_asm_type(call->args[i],symbols),
-            0,
-            0,
-            convert_tacky_val(call->args[i]),
-            as_reg(ARG_REGISTERS[i]),
-            NULL
-        );
+    for (int i=0;i<args.int_count;i++){
+        append_asm(head,AS_MOV,args.int_args[i].type,0,0,args.int_args[i].operand,as_reg(ARG_REGISTERS[i]),NULL);
     }
 
-    //Remaining arguments are pushed right-to-left.
-    for (int i=call->arg_count-1;i>=6;i--){
-        AsmOperand arg=convert_tacky_val(call->args[i]);
-        AsmType arg_type=tacky_val_asm_type(call->args[i],symbols);
+    for (int i=0;i<args.double_count;i++){
+        append_asm(head,AS_MOV,ASM_DOUBLE,0,0,args.double_args[i],as_reg(DOUBLE_ARG_REGISTERS[i]),NULL);
+    }
 
-        if (arg.type==AS_IMM || arg.type==AS_REG || arg_type==ASM_QUADWORD){
+    //Stack arguments are pushed right-to-left.
+    for (int i=args.stack_count-1;i>=0;i--){
+        AsmOperand arg=args.stack_args[i].operand;
+        AsmType arg_type=args.stack_args[i].type;
+
+        if (arg.type==AS_IMM || arg.type==AS_REG || arg_type!=ASM_LONGWORD){
             append_asm(head,AS_PUSH,ASM_QUADWORD,0,0,arg,NO_OPERAND,NULL);
         }else{
             /*
             pushq would read 8 bytes from a 4-byte memory operand,
             so copy it into EAX and push the full RAX register instead.
             */
-            append_asm(head,AS_MOV,ASM_LONGWORD,0,0,arg,as_reg(REG_AX),NULL);
+            append_asm(head,AS_MOV,arg_type,0,0,arg,as_reg(REG_AX),NULL);
             append_asm(head,AS_PUSH,ASM_QUADWORD,0,0,as_reg(REG_AX),NO_OPERAND,NULL);
         }
     }
 
     append_asm(head,AS_CALL,0,0,0,NO_OPERAND,NO_OPERAND,call->fun_name);
 
-    int bytes_to_remove=stack_arg_count*8 + stack_padding;
+    int bytes_to_remove=args.stack_count*8 + stack_padding;
     if (bytes_to_remove){
         append_asm(head,AS_BINARY,ASM_QUADWORD,BINARY_ADD,0,as_imm(bytes_to_remove),as_reg(REG_SP),NULL);
     }
+    free(args.stack_args);
 
-    //Integer return value is in AX.
+    AsmType dst_type=tacky_val_asm_type(call->dst,symbols);
     append_asm(
         head,
         AS_MOV,
-        tacky_val_asm_type(call->dst,symbols),
+        dst_type,
         0,
         0,
-        as_reg(REG_AX),
+        as_reg(dst_type==ASM_DOUBLE ? REG_XMM0 : REG_AX),
         convert_tacky_val(call->dst),
         NULL
     );
+}
+
+//comisd val against 0.0 in XMM0; a NaN val sets PF (and ZF, CF)
+static void emit_double_zero_compare(AsmInst **head,AsmOperand val){
+    append_asm(head,AS_BINARY,ASM_DOUBLE,BINARY_BITWISE_XOR,0,as_reg(REG_XMM0),as_reg(REG_XMM0),NULL);
+    append_asm(head,AS_CMP,ASM_DOUBLE,0,0,val,as_reg(REG_XMM0),NULL);
+}
+
+/*
+After a comisd, set dst (already zeroed) to 1 when cond holds and the
+comparison was ordered. A NaN operand makes == false and != true.
+*/
+static void emit_nan_aware_setcc(AsmInst **head,CondCode cond,AsmType dst_type,AsmOperand dst){
+    char *end=make_label("fp_cmp_end");
+    if (cond==COND_E){
+        append_asm(head,AS_JMP_CC,0,0,COND_P,NO_OPERAND,NO_OPERAND,end);
+        append_asm(head,AS_SET_CC,0,0,COND_E,NO_OPERAND,dst,NULL);
+    }else{
+        append_asm(head,AS_SET_CC,0,0,COND_NE,NO_OPERAND,dst,NULL);
+        append_asm(head,AS_JMP_CC,0,0,COND_NP,NO_OPERAND,NO_OPERAND,end);
+        append_asm(head,AS_MOV,dst_type,0,0,as_imm(1),dst,NULL);
+    }
+    append_asm(head,AS_LABEL,0,0,0,NO_OPERAND,NO_OPERAND,end);
+}
+
+/*
+comisd sets CF on an unordered result, so A/AE are false for NaN while B/BE
+would be true: a < b is lowered as b > a by swapping the operands.
+*/
+static void convert_double_comparison(TackyInstruction *curr,AsmInst **head,Symbol *symbols){
+    BinaryOpType op=curr->binary_op;
+    AsmOperand a=convert_tacky_val(curr->src);
+    AsmOperand b=convert_tacky_val(curr->src2);
+    AsmOperand dst=convert_tacky_val(curr->dst);
+    AsmType dst_type=tacky_val_asm_type(curr->dst,symbols);
+
+    if (op==BINARY_LT || op==BINARY_LTE){
+        append_asm(head,AS_CMP,ASM_DOUBLE,0,0,a,b,NULL);
+    }else{
+        append_asm(head,AS_CMP,ASM_DOUBLE,0,0,b,a,NULL);
+    }
+    append_asm(head,AS_MOV,dst_type,0,0,as_imm(0),dst,NULL);
+
+    switch (op){
+        case BINARY_EQ: emit_nan_aware_setcc(head,COND_E,dst_type,dst); break;
+        case BINARY_NEQ: emit_nan_aware_setcc(head,COND_NE,dst_type,dst); break;
+        case BINARY_LT: case BINARY_GT:
+            append_asm(head,AS_SET_CC,0,0,COND_A,NO_OPERAND,dst,NULL);
+            break;
+        default:
+            append_asm(head,AS_SET_CC,0,0,COND_AE,NO_OPERAND,dst,NULL);
+            break;
+    }
+}
+
+static void convert_uint_to_double(TackyInstruction *curr,AsmInst **head,Symbol *symbols){
+    AsmOperand src=convert_tacky_val(curr->src);
+    AsmOperand dst=convert_tacky_val(curr->dst);
+
+    if (tacky_val_asm_type(curr->src,symbols)==ASM_LONGWORD){
+        append_asm(head,AS_MOVZX,ASM_QUADWORD,0,0,src,as_reg(REG_AX),NULL);
+        append_asm(head,AS_CVTSI2SD,ASM_QUADWORD,0,0,as_reg(REG_AX),dst,NULL);
+        return;
+    }
+
+    //above LONG_MAX: halve rounding to odd, convert, then double the result
+    char *out_of_range=make_label("ulong_to_double_big");
+    char *end=make_label("ulong_to_double_end");
+    append_asm(head,AS_CMP,ASM_QUADWORD,0,0,as_imm(0),src,NULL);
+    append_asm(head,AS_JMP_CC,0,0,COND_L,NO_OPERAND,NO_OPERAND,out_of_range);
+    append_asm(head,AS_CVTSI2SD,ASM_QUADWORD,0,0,src,dst,NULL);
+    append_asm(head,AS_JMP,0,0,0,NO_OPERAND,NO_OPERAND,end);
+    append_asm(head,AS_LABEL,0,0,0,NO_OPERAND,NO_OPERAND,out_of_range);
+    append_asm(head,AS_MOV,ASM_QUADWORD,0,0,src,as_reg(REG_AX),NULL);
+    append_asm(head,AS_MOV,ASM_QUADWORD,0,0,as_reg(REG_AX),as_reg(REG_DX),NULL);
+    append_asm(head,AS_BINARY,ASM_QUADWORD,BINARY_SHR,0,as_imm(1),as_reg(REG_DX),NULL);
+    append_asm(head,AS_BINARY,ASM_QUADWORD,BINARY_BITWISE_AND,0,as_imm(1),as_reg(REG_AX),NULL);
+    append_asm(head,AS_BINARY,ASM_QUADWORD,BINARY_BITWISE_OR,0,as_reg(REG_AX),as_reg(REG_DX),NULL);
+    append_asm(head,AS_CVTSI2SD,ASM_QUADWORD,0,0,as_reg(REG_DX),dst,NULL);
+    append_asm(head,AS_BINARY,ASM_DOUBLE,BINARY_ADD,0,dst,dst,NULL);
+    append_asm(head,AS_LABEL,0,0,0,NO_OPERAND,NO_OPERAND,end);
+}
+
+static void convert_double_to_uint(TackyInstruction *curr,AsmInst **head,Symbol *symbols){
+    AsmOperand src=convert_tacky_val(curr->src);
+    AsmOperand dst=convert_tacky_val(curr->dst);
+
+    if (tacky_val_asm_type(curr->dst,symbols)==ASM_LONGWORD){
+        append_asm(head,AS_CVTTSD2SI,ASM_QUADWORD,0,0,src,as_reg(REG_AX),NULL);
+        append_asm(head,AS_MOV,ASM_LONGWORD,0,0,as_reg(REG_AX),dst,NULL);
+        return;
+    }
+
+    //at or above 2^63: subtract 2^63 (exactly), convert, then add it back as an integer
+    AsmOperand upper_bound=double_constant(9223372036854775808.0,8);
+    char *out_of_range=make_label("double_to_ulong_big");
+    char *end=make_label("double_to_ulong_end");
+    append_asm(head,AS_CMP,ASM_DOUBLE,0,0,upper_bound,src,NULL);
+    append_asm(head,AS_JMP_CC,0,0,COND_AE,NO_OPERAND,NO_OPERAND,out_of_range);
+    append_asm(head,AS_CVTTSD2SI,ASM_QUADWORD,0,0,src,dst,NULL);
+    append_asm(head,AS_JMP,0,0,0,NO_OPERAND,NO_OPERAND,end);
+    append_asm(head,AS_LABEL,0,0,0,NO_OPERAND,NO_OPERAND,out_of_range);
+    append_asm(head,AS_MOV,ASM_DOUBLE,0,0,src,as_reg(REG_XMM1),NULL);
+    append_asm(head,AS_BINARY,ASM_DOUBLE,BINARY_SUB,0,upper_bound,as_reg(REG_XMM1),NULL);
+    append_asm(head,AS_CVTTSD2SI,ASM_QUADWORD,0,0,as_reg(REG_XMM1),dst,NULL);
+    append_asm(head,AS_MOV,ASM_QUADWORD,0,0,as_imm(LONG_MIN),as_reg(REG_DX),NULL);
+    append_asm(head,AS_BINARY,ASM_QUADWORD,BINARY_ADD,0,as_reg(REG_DX),dst,NULL);
+    append_asm(head,AS_LABEL,0,0,0,NO_OPERAND,NO_OPERAND,end);
 }
 
 static void convert_tacky_instruction(
@@ -4103,10 +4298,12 @@ static void convert_tacky_instruction(
     Symbol *symbols
 ){
     switch (curr->type){
-        case TACKY_INST_RETURN:
-            append_asm(head,AS_MOV,tacky_val_asm_type(curr->src,symbols),0,0,convert_tacky_val(curr->src),as_reg(REG_AX),NULL);
+        case TACKY_INST_RETURN: {
+            AsmType t=tacky_val_asm_type(curr->src,symbols);
+            append_asm(head,AS_MOV,t,0,0,convert_tacky_val(curr->src),as_reg(t==ASM_DOUBLE ? REG_XMM0 : REG_AX),NULL);
             append_asm(head,AS_RET,0,0,0,NO_OPERAND,NO_OPERAND,NULL);
             break;
+        }
 
         case TACKY_INST_SIGN_EXTEND:
             append_asm(head,AS_MOVSX,ASM_QUADWORD,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
@@ -4133,8 +4330,23 @@ static void convert_tacky_instruction(
             append_asm(head,AS_LABEL,0,0,0,NO_OPERAND,NO_OPERAND,curr->label_name);
             break;
 
+        //NaN is truthy: JumpIfZero must not jump on an unordered compare
         case TACKY_INST_JZ:
         case TACKY_INST_JNZ: {
+            if (tacky_val_asm_type(curr->src,symbols)==ASM_DOUBLE){
+                emit_double_zero_compare(head,convert_tacky_val(curr->src));
+                if (curr->type==TACKY_INST_JZ){
+                    char *end=make_label("fp_cmp_end");
+                    append_asm(head,AS_JMP_CC,0,0,COND_P,NO_OPERAND,NO_OPERAND,end);
+                    append_asm(head,AS_JMP_CC,0,0,COND_E,NO_OPERAND,NO_OPERAND,curr->label_name);
+                    append_asm(head,AS_LABEL,0,0,0,NO_OPERAND,NO_OPERAND,end);
+                }else{
+                    append_asm(head,AS_JMP_CC,0,0,COND_NE,NO_OPERAND,NO_OPERAND,curr->label_name);
+                    append_asm(head,AS_JMP_CC,0,0,COND_P,NO_OPERAND,NO_OPERAND,curr->label_name);
+                }
+                break;
+            }
+
             CondCode cond=(curr->type==TACKY_INST_JZ) ? COND_E : COND_NE;
             append_asm(head,AS_CMP,tacky_val_asm_type(curr->src,symbols),0,0,as_imm(0),convert_tacky_val(curr->src),NULL);
             append_asm(head,AS_JMP_CC,0,0,cond,NO_OPERAND,NO_OPERAND,curr->label_name);
@@ -4144,7 +4356,19 @@ static void convert_tacky_instruction(
         case TACKY_INST_UNARY:{
             AsmType src_type=tacky_val_asm_type(curr->src,symbols);
 
-            if (curr->unary_op==UNARY_NOT){
+            if (src_type==ASM_DOUBLE && curr->unary_op==UNARY_NOT){
+                AsmType dst_type=tacky_val_asm_type(curr->dst,symbols);
+                AsmOperand dst=convert_tacky_val(curr->dst);
+                emit_double_zero_compare(head,convert_tacky_val(curr->src));
+                append_asm(head,AS_MOV,dst_type,0,0,as_imm(0),dst,NULL);
+                emit_nan_aware_setcc(head,COND_E,dst_type,dst);
+            }
+            //flip the sign bit
+            else if (src_type==ASM_DOUBLE){
+                append_asm(head,AS_MOV,ASM_DOUBLE,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_BINARY,ASM_DOUBLE,BINARY_BITWISE_XOR,0,double_constant(-0.0,16),convert_tacky_val(curr->dst),NULL);
+            }
+            else if (curr->unary_op==UNARY_NOT){
                 append_asm(head,AS_CMP,src_type,0,0,as_imm(0),convert_tacky_val(curr->src),NULL);
                 append_asm(head,AS_MOV,tacky_val_asm_type(curr->dst,symbols),0,0,as_imm(0),convert_tacky_val(curr->dst),NULL);
                 append_asm(head,AS_SET_CC,0,0,COND_E,NO_OPERAND,convert_tacky_val(curr->dst),NULL);
@@ -4161,7 +4385,14 @@ static void convert_tacky_instruction(
             int is_signed=type_is_signed(tacky_val_type(curr->src,symbols));
             BinaryOpType op=(curr->binary_op==BINARY_RSHIFT && !is_signed) ? BINARY_SHR : curr->binary_op;
 
-            if (op==BINARY_DIV || op==BINARY_REM){
+            if (src_type==ASM_DOUBLE && is_comparison_op(op)){
+                convert_double_comparison(curr,head,symbols);
+            }
+            else if (src_type==ASM_DOUBLE){
+                append_asm(head,AS_MOV,ASM_DOUBLE,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+                append_asm(head,AS_BINARY,ASM_DOUBLE,op,0,convert_tacky_val(curr->src2),convert_tacky_val(curr->dst),NULL);
+            }
+            else if (op==BINARY_DIV || op==BINARY_REM){
                 append_asm(head,AS_MOV,src_type,0,0,convert_tacky_val(curr->src),as_reg(REG_AX),NULL);
                 if (is_signed){
                     append_asm(head,AS_CDQ,src_type,0,0,NO_OPERAND,NO_OPERAND,NULL);
@@ -4200,12 +4431,21 @@ static void convert_tacky_instruction(
             convert_function_call(curr,head,symbols);
             break;
 
-        case TACKY_INST_DOUBLE_TO_INT:
-        case TACKY_INST_DOUBLE_TO_UINT:
         case TACKY_INST_INT_TO_DOUBLE:
+            append_asm(head,AS_CVTSI2SD,tacky_val_asm_type(curr->src,symbols),0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+            break;
+
+        case TACKY_INST_DOUBLE_TO_INT:
+            append_asm(head,AS_CVTTSD2SI,tacky_val_asm_type(curr->dst,symbols),0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+            break;
+
         case TACKY_INST_UINT_TO_DOUBLE:
-            fprintf(stderr,"Codegen Error: double is not supported yet\n");
-            exit(1);
+            convert_uint_to_double(curr,head,symbols);
+            break;
+
+        case TACKY_INST_DOUBLE_TO_UINT:
+            convert_double_to_uint(curr,head,symbols);
+            break;
     }
 }
 
@@ -4230,27 +4470,24 @@ static AsmFunc *convert_tacky_function(TackyFunction *tacky_fn,Symbol *symbols){
 
     AsmInst **head=&asm_fn->instructions;
 
+    TackyVal **params=calloc(tacky_fn->param_count>0 ? tacky_fn->param_count : 1,sizeof(TackyVal*));
     for (int i=0;i<tacky_fn->param_count;i++){
-        AsmOperand src;
-
-        if (i<6){
-            src=as_reg(ARG_REGISTERS[i]);
-        }else{
-            //7th parameter is at 16(%rbp), then +8 bytes each.
-            src=as_stack(16 + 8*(i-6));
-        }
-
-        append_asm(
-            head,
-            AS_MOV,
-            type_to_asm_type(variable_type(symbols,tacky_fn->params[i])),
-            0,
-            0,
-            src,
-            as_pseudo(tacky_fn->params[i]),
-            NULL
-        );
+        params[i]=tacky_val_var(tacky_fn->params[i]);
     }
+    ClassifiedArgs args=classify_parameters(params,tacky_fn->param_count,symbols);
+
+    for (int i=0;i<args.int_count;i++){
+        append_asm(head,AS_MOV,args.int_args[i].type,0,0,as_reg(ARG_REGISTERS[i]),args.int_args[i].operand,NULL);
+    }
+
+    for (int i=0;i<args.double_count;i++){
+        append_asm(head,AS_MOV,ASM_DOUBLE,0,0,as_reg(DOUBLE_ARG_REGISTERS[i]),args.double_args[i],NULL);
+    }
+
+    for (int i=0;i<args.stack_count;i++){
+        append_asm(head,AS_MOV,args.stack_args[i].type,0,0,as_stack(16+8*i),args.stack_args[i].operand,NULL);
+    }
+    free(args.stack_args);
 
     for (TackyInstruction *curr=tacky_fn->instructions;
          curr!=NULL;
@@ -4301,12 +4538,29 @@ static AsmSymbol *asm_symbol_find(AsmSymbol *symbols,const char *name){
 /*
 TACKY Program(top_level*) -> Assembly Program(top_level*)
 */
+static void append_asm_top_level(AsmProg *asmp,AsmTopLevel *asm_top){
+    AsmTopLevel **new_top_levels=realloc(
+        asmp->top_levels,
+        sizeof(AsmTopLevel*)*(size_t)(asmp->top_level_count+1)
+    );
+    if (!new_top_levels){
+        perror("realloc assembly top levels");
+        exit(1);
+    }
+
+    asmp->top_levels=new_top_levels;
+    asmp->top_levels[asmp->top_level_count++]=asm_top;
+}
+
 AsmProg *tacky_to_asm(TackyProgram *tacky,Symbol *symbols){
     AsmProg *asmp=calloc(1,sizeof(AsmProg));
     if (!asmp){
         perror("calloc AsmProg");
         exit(1);
     }
+
+    double_constants=NULL;
+    double_constant_count=0;
 
     for (int i=0;i<tacky->top_level_count;i++){
         TackyTopLevel *top_level=tacky->top_levels[i];
@@ -4353,20 +4607,26 @@ AsmProg *tacky_to_asm(TackyProgram *tacky,Symbol *symbols){
             }
         }
 
-        AsmTopLevel **new_top_levels=realloc(
-            asmp->top_levels,
-            sizeof(AsmTopLevel*)*(size_t)(asmp->top_level_count+1)
-        );
-        if (!new_top_levels){
-            perror("realloc assembly top levels");
-            exit(1);
-        }
-
-        asmp->top_levels=new_top_levels;
-        asmp->top_levels[asmp->top_level_count++]=asm_top;
+        append_asm_top_level(asmp,asm_top);
     }
 
     asmp->symbols=build_backend_symbols(symbols);
+
+    for (int i=0;i<double_constant_count;i++){
+        AsmTopLevel *asm_top=calloc(1,sizeof(AsmTopLevel));
+        asm_top->type=ASM_TOP_STATIC_CONSTANT;
+        asm_top->static_constant=double_constants[i];
+        append_asm_top_level(asmp,asm_top);
+
+        AsmSymbol *entry=calloc(1,sizeof(AsmSymbol));
+        entry->name=strdup(double_constants[i]->name);
+        entry->kind=ASM_SYMBOL_OBJ;
+        entry->asm_type=ASM_DOUBLE;
+        entry->is_static=1;
+        entry->is_constant=1;
+        entry->next=asmp->symbols;
+        asmp->symbols=entry;
+    }
 
     return asmp;
 }
@@ -4435,7 +4695,7 @@ static void replace_pseudos(AsmFunc *fn,AsmSymbol *symbols){
                     exit(1);
                 }
 
-                if (sym->asm_type==ASM_QUADWORD){
+                if (sym->asm_type!=ASM_LONGWORD){
                     stack_bytes=((stack_bytes+8+7)/8)*8;
                 }else{
                     stack_bytes+=4;
@@ -4466,7 +4726,8 @@ static void push_inst(AsmInst ***tail,AsmInst *inst){
 
 /*
 Rewrite one instruction into a valid sequence and append it at *tail.
-R10 fixes source operands and R11 fixes destination operands.
+R10 fixes source operands and R11 fixes destination operands;
+XMM14 and XMM15 play the same roles for doubles.
 */
 static void fix_instruction(AsmInst *inst,AsmInst ***tail){
 
@@ -4474,6 +4735,15 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
 
     switch (inst->type){
         case AS_MOV:
+            if (t==ASM_DOUBLE){
+                if (is_memory_operand(inst->src) && is_memory_operand(inst->dst)){
+                    push_inst(tail,make_asm(AS_MOV,t,0,0,inst->src,as_reg(REG_XMM14),NULL));
+                    inst->src=as_reg(REG_XMM14);
+                }
+                break;
+            }
+
+
             //movl would truncate an 8-byte immediate anyway; do it here to avoid assembler warnings
             if (t==ASM_LONGWORD && inst->src.type==AS_IMM){
                 inst->src.imm=(int)inst->src.imm;
@@ -4514,7 +4784,46 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
             }
             break;
 
+        case AS_CVTTSD2SI:
+            if (inst->dst.type!=AS_REG){
+                AsmOperand dst=inst->dst;
+                push_inst(tail,make_asm(AS_CVTTSD2SI,t,0,0,inst->src,as_reg(REG_R11),NULL));
+                inst->type=AS_MOV;
+                inst->src=as_reg(REG_R11);
+                inst->dst=dst;
+            }
+            break;
+
+        case AS_CVTSI2SD:
+            if (inst->src.type==AS_IMM){
+                push_inst(tail,make_asm(AS_MOV,t,0,0,inst->src,as_reg(REG_R10),NULL));
+                inst->src=as_reg(REG_R10);
+            }
+
+            if (inst->dst.type!=AS_REG){
+                AsmOperand dst=inst->dst;
+                push_inst(tail,make_asm(AS_CVTSI2SD,t,0,0,inst->src,as_reg(REG_XMM15),NULL));
+                inst->type=AS_MOV;
+                inst->asm_type=ASM_DOUBLE;
+                inst->src=as_reg(REG_XMM15);
+                inst->dst=dst;
+            }
+            break;
+
+        //addsd, subsd, mulsd, divsd and xorpd write only to a register
         case AS_BINARY:
+            if (t==ASM_DOUBLE){
+                if (inst->dst.type!=AS_REG){
+                    AsmOperand dst=inst->dst;
+                    push_inst(tail,make_asm(AS_MOV,t,0,0,dst,as_reg(REG_XMM15),NULL));
+                    push_inst(tail,make_asm(AS_BINARY,t,inst->binary_op,0,inst->src,as_reg(REG_XMM15),NULL));
+                    inst->type=AS_MOV;
+                    inst->src=as_reg(REG_XMM15);
+                    inst->dst=dst;
+                }
+                break;
+            }
+
             //shift count immediates are 8 bits; mask like the CPU does for %cl
             if (is_shift_op(inst->binary_op)){
                 if (inst->src.type==AS_IMM){
@@ -4542,7 +4851,16 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
             }
             break;
 
+        //comisd compares against a register
         case AS_CMP:
+            if (t==ASM_DOUBLE){
+                if (inst->dst.type!=AS_REG){
+                    push_inst(tail,make_asm(AS_MOV,t,0,0,inst->dst,as_reg(REG_XMM15),NULL));
+                    inst->dst=as_reg(REG_XMM15);
+                }
+                break;
+            }
+
             if (is_large_imm(inst->src) ||
                 (is_memory_operand(inst->src) && is_memory_operand(inst->dst))){
                 push_inst(tail,make_asm(AS_MOV,t,0,0,inst->src,as_reg(REG_R10),NULL));
@@ -5499,14 +5817,34 @@ static const char *reg_name_8(AsmReg reg){
 #define SYMBOL_PREFIX ""
 #endif
 
+//backend symbols of the program being emitted, to tell constants from variables
+static AsmSymbol *emit_symbols=NULL;
+
 static void emit_data_op(AsmOperand op,FILE *out){
-    fprintf(out,SYMBOL_PREFIX "%s(%%rip)",op.data_name);
+    AsmSymbol *entry=asm_symbol_find(emit_symbols,op.data_name);
+    if (entry && entry->is_constant){
+        fprintf(out,".L%s(%%rip)",op.data_name);
+    }else{
+        fprintf(out,SYMBOL_PREFIX "%s(%%rip)",op.data_name);
+    }
+}
+
+static const char *xmm_name(AsmReg reg){
+    static const char *names[]={
+        "%xmm0","%xmm1","%xmm2","%xmm3",
+        "%xmm4","%xmm5","%xmm6","%xmm7",
+        "%xmm14","%xmm15"
+    };
+    return names[reg-REG_XMM0];
 }
 
 //register names depend on operand size; 1 byte is for SetCC
 static void emit_sized_op(AsmOperand op,int bytes,FILE *out){
     if (op.type==AS_IMM){
         fprintf(out,"$%ld",op.imm);
+    }
+    else if (op.type==AS_REG && op.reg>=REG_XMM0){
+        fprintf(out,"%s",xmm_name(op.reg));
     }
     else if (op.type==AS_REG){
         const char *name=bytes==8 ? reg_name_64(op.reg)
@@ -5527,7 +5865,7 @@ static void emit_sized_op(AsmOperand op,int bytes,FILE *out){
 }
 
 void emit_op(AsmOperand op,AsmType t,FILE *out){
-    emit_sized_op(op,t==ASM_QUADWORD ? 8 : 4,out);
+    emit_sized_op(op,t==ASM_LONGWORD ? 4 : 8,out);
 }
 
 static char type_suffix(AsmType t){
@@ -5546,6 +5884,8 @@ const char *cond_to_str(CondCode c){
         case COND_AE: return "ae";
         case COND_B: return "b";
         case COND_BE: return "be";
+        case COND_P: return "p";
+        case COND_NP: return "np";
         default: return "";
     }
 }
@@ -5640,7 +5980,11 @@ static void emit_instruction(
             break;
 
         case AS_MOV:
-            fprintf(out,"    mov%c    ",suffix);
+            if (t==ASM_DOUBLE){
+                fprintf(out,"    movsd   ");
+            }else{
+                fprintf(out,"    mov%c    ",suffix);
+            }
             emit_op(curr->src,t,out);
             fprintf(out,", ");
             emit_op(curr->dst,t,out);
@@ -5680,6 +6024,25 @@ static void emit_instruction(
 
         case AS_BINARY:{
             const char *op_str=NULL;
+
+            if (t==ASM_DOUBLE){
+                switch (curr->binary_op){
+                    case BINARY_ADD: op_str="addsd"; break;
+                    case BINARY_SUB: op_str="subsd"; break;
+                    case BINARY_MULT: op_str="mulsd"; break;
+                    case BINARY_DIV: op_str="divsd"; break;
+                    case BINARY_BITWISE_XOR: op_str="xorpd"; break;
+                    default:
+                        fprintf(stderr,"Emitter Error: unsupported double operator\n");
+                        exit(1);
+                }
+                fprintf(out,"    %-8s",op_str);
+                emit_op(curr->src,t,out);
+                fprintf(out,", ");
+                emit_op(curr->dst,t,out);
+                fprintf(out,"\n");
+                break;
+            }
 
             switch (curr->binary_op){
                 case BINARY_ADD:
@@ -5744,8 +6107,28 @@ static void emit_instruction(
             break;
 
         case AS_CMP:
-            fprintf(out,"    cmp%c    ",suffix);
+            if (t==ASM_DOUBLE){
+                fprintf(out,"    comisd  ");
+            }else{
+                fprintf(out,"    cmp%c    ",suffix);
+            }
             emit_op(curr->src,t,out);
+            fprintf(out,", ");
+            emit_op(curr->dst,t,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_CVTSI2SD:
+            fprintf(out,"    cvtsi2sd%c ",suffix);
+            emit_op(curr->src,t,out);
+            fprintf(out,", ");
+            emit_op(curr->dst,ASM_DOUBLE,out);
+            fprintf(out,"\n");
+            break;
+
+        case AS_CVTTSD2SI:
+            fprintf(out,"    cvttsd2si%c ",suffix);
+            emit_op(curr->src,ASM_DOUBLE,out);
             fprintf(out,", ");
             emit_op(curr->dst,t,out);
             fprintf(out,"\n");
@@ -5805,7 +6188,13 @@ static void emit_static_variable(AsmStaticVariable *var,FILE *out){
 
     int is_long=(var->init.type==INIT_LONG || var->init.type==INIT_ULONG);
 
-    if (var->init.value!=0){
+    //doubles always go in .data as their bit pattern, so -0.0 keeps its sign bit
+    if (var->init.type==INIT_DOUBLE){
+        long bits;
+        memcpy(&bits,&var->init.dvalue,sizeof(bits));
+        fprintf(out,".data\n.balign %d\n" SYMBOL_PREFIX "%s:\n",var->alignment,var->name);
+        fprintf(out,"    .quad %ld\n",bits);
+    }else if (var->init.value!=0){
         fprintf(out,".data\n.balign %d\n" SYMBOL_PREFIX "%s:\n",var->alignment,var->name);
         fprintf(out,"    %s %ld\n",is_long ? ".quad" : ".long",var->init.value);
     }else{
@@ -5816,10 +6205,27 @@ static void emit_static_variable(AsmStaticVariable *var,FILE *out){
     fprintf(out,"\n");
 }
 
+static void emit_static_constant(AsmStaticConstant *c,FILE *out){
+    long bits;
+    memcpy(&bits,&c->init.dvalue,sizeof(bits));
+#ifdef __APPLE__
+    fprintf(out,"%s\n.balign %d\n.L%s:\n",c->alignment==16 ? ".literal16" : ".literal8",c->alignment,c->name);
+    fprintf(out,"    .quad %ld\n",bits);
+    //the linker expects 16-byte-aligned literals to be 16 bytes long
+    if (c->alignment==16) fprintf(out,"    .quad 0\n");
+#else
+    fprintf(out,".section .rodata\n.balign %d\n.L%s:\n",c->alignment,c->name);
+    fprintf(out,"    .quad %ld\n",bits);
+#endif
+    fprintf(out,"\n");
+}
+
 void emit_asm_new(AsmProg *asmp,FILE *out){
     if (!asmp || !out){
         return;
     }
+
+    emit_symbols=asmp->symbols;
 
     for (int i=0;i<asmp->top_level_count;i++){
         AsmTopLevel *top_level=asmp->top_levels[i];
@@ -5829,6 +6235,9 @@ void emit_asm_new(AsmProg *asmp,FILE *out){
                 break;
             case ASM_TOP_STATIC_VARIABLE:
                 emit_static_variable(top_level->static_variable,out);
+                break;
+            case ASM_TOP_STATIC_CONSTANT:
+                emit_static_constant(top_level->static_constant,out);
                 break;
         }
     }
