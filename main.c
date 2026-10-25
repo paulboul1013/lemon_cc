@@ -775,6 +775,10 @@ typedef enum {
     TACKY_INST_SIGN_EXTEND,
     TACKY_INST_ZERO_EXTEND,
     TACKY_INST_TRUNCATE,
+    TACKY_INST_DOUBLE_TO_INT,
+    TACKY_INST_DOUBLE_TO_UINT,
+    TACKY_INST_INT_TO_DOUBLE,
+    TACKY_INST_UINT_TO_DOUBLE,
     TACKY_INST_UNARY,
     TACKY_INST_BINARY,
     TACKY_INST_COPY,
@@ -4195,6 +4199,13 @@ static void convert_tacky_instruction(
         case TACKY_INST_FUN_CALL:
             convert_function_call(curr,head,symbols);
             break;
+
+        case TACKY_INST_DOUBLE_TO_INT:
+        case TACKY_INST_DOUBLE_TO_UINT:
+        case TACKY_INST_INT_TO_DOUBLE:
+        case TACKY_INST_UINT_TO_DOUBLE:
+            fprintf(stderr,"Codegen Error: double is not supported yet\n");
+            exit(1);
     }
 }
 
@@ -4656,7 +4667,11 @@ static TackyVal *emit_tacky_cast(
 
     TackyVal *dst=make_tacky_variable(to);
     TackyInstType type;
-    if (type_size(from)==type_size(to)){
+    if (to->kind==TYPE_DOUBLE){
+        type=type_is_signed(from) ? TACKY_INST_INT_TO_DOUBLE : TACKY_INST_UINT_TO_DOUBLE;
+    }else if (from->kind==TYPE_DOUBLE){
+        type=type_is_signed(to) ? TACKY_INST_DOUBLE_TO_INT : TACKY_INST_DOUBLE_TO_UINT;
+    }else if (type_size(from)==type_size(to)){
         type=TACKY_INST_COPY;
     }else if (type_size(from)>type_size(to)){
         type=TACKY_INST_TRUNCATE;
