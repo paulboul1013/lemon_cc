@@ -6,7 +6,7 @@
 
 //define Token type
 typedef  enum{
-    TOK_INT, TOK_LONG, TOK_SIGNED, TOK_UNSIGNED, TOK_VOID, TOK_RETURN,
+    TOK_INT, TOK_LONG, TOK_SIGNED, TOK_UNSIGNED, TOK_DOUBLE, TOK_VOID, TOK_RETURN,
     TOK_STATIC, TOK_EXTERN,
 
     TOK_IF,
@@ -24,7 +24,7 @@ typedef  enum{
     TOK_DEFAULT,
 
     TOK_IDENTIFIER, TOK_CONSTANT, TOK_LONG_CONSTANT,
-    TOK_UNSIGNED_CONSTANT, TOK_UNSIGNED_LONG_CONSTANT,
+    TOK_UNSIGNED_CONSTANT, TOK_UNSIGNED_LONG_CONSTANT, TOK_DOUBLE_CONSTANT,
     TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
     TOK_SEMICOLON, 
     TOK_COMMA,
@@ -88,6 +88,7 @@ typedef enum {
     TYPE_LONG,
     TYPE_UINT,
     TYPE_ULONG,
+    TYPE_DOUBLE,
     TYPE_FUNCTION
 } TypeKind;
 
@@ -118,8 +119,13 @@ Type *type_ulong(void){
     return &t;
 }
 
+Type *type_double(void){
+    static Type t={TYPE_DOUBLE,NULL,0,NULL};
+    return &t;
+}
+
 int type_size(Type *t){
-    return (t->kind==TYPE_LONG || t->kind==TYPE_ULONG) ? 8 : 4;
+    return (t->kind==TYPE_LONG || t->kind==TYPE_ULONG || t->kind==TYPE_DOUBLE) ? 8 : 4;
 }
 
 int type_is_signed(Type *t){
@@ -160,12 +166,16 @@ typedef enum {
     CONST_INT,
     CONST_LONG,
     CONST_UINT,
-    CONST_ULONG
+    CONST_ULONG,
+    CONST_DOUBLE
 } ConstType;
 
 typedef struct {
     ConstType type;
-    long value; //bit pattern, already wrapped by convert_value
+    union {
+        long value; //bit pattern, already wrapped by convert_value
+        double dvalue; //CONST_DOUBLE
+    };
 } Const;
 
 Type *const_exp_type(Const c){
@@ -173,6 +183,7 @@ Type *const_exp_type(Const c){
         case CONST_LONG: return type_long();
         case CONST_UINT: return type_uint();
         case CONST_ULONG: return type_ulong();
+        case CONST_DOUBLE: return type_double();
         default: return type_int();
     }
 }
@@ -181,12 +192,16 @@ typedef enum {
     INIT_INT,
     INIT_LONG,
     INIT_UINT,
-    INIT_ULONG
+    INIT_ULONG,
+    INIT_DOUBLE
 } StaticInitType;
 
 typedef struct {
     StaticInitType type;
-    long value;
+    union {
+        long value;
+        double dvalue; //INIT_DOUBLE
+    };
 } StaticInit;
 
 typedef enum {
@@ -836,16 +851,36 @@ char *make_temporary(){
     return name;
 }
 
-Const make_const(Type *t,long value){
-    Const c;
+//every compile-time conversion: integer wrap, int<->double, double->int truncates toward zero
+Const convert_const(Const c,Type *t){
+    Const r;
     switch (t->kind){
-        case TYPE_LONG: c.type=CONST_LONG; break;
-        case TYPE_UINT: c.type=CONST_UINT; break;
-        case TYPE_ULONG: c.type=CONST_ULONG; break;
-        default: c.type=CONST_INT; break;
+        case TYPE_LONG: r.type=CONST_LONG; break;
+        case TYPE_UINT: r.type=CONST_UINT; break;
+        case TYPE_ULONG: r.type=CONST_ULONG; break;
+        case TYPE_DOUBLE: r.type=CONST_DOUBLE; break;
+        default: r.type=CONST_INT; break;
     }
-    c.value=convert_value(value,t);
-    return c;
+
+    if (c.type==CONST_DOUBLE){
+        switch (t->kind){
+            case TYPE_DOUBLE: r.dvalue=c.dvalue; break;
+            case TYPE_LONG: r.value=(long)c.dvalue; break;
+            case TYPE_UINT: r.value=(unsigned int)c.dvalue; break;
+            case TYPE_ULONG: r.value=(long)(unsigned long)c.dvalue; break;
+            default: r.value=(int)c.dvalue; break;
+        }
+    }else if (t->kind==TYPE_DOUBLE){
+        r.dvalue=c.type==CONST_ULONG ? (double)(unsigned long)c.value : (double)c.value;
+    }else{
+        r.value=convert_value(c.value,t);
+    }
+    return r;
+}
+
+Const make_const(Type *t,long value){
+    Const c={CONST_LONG,{value}};
+    return convert_const(c,t);
 }
 
 TackyVal *tacky_val_constant(Const c){
@@ -887,6 +922,7 @@ TokenType check_keyword(const char *s){
     if (strcmp(s,"long")==0) return TOK_LONG;
     if (strcmp(s,"signed")==0) return TOK_SIGNED;
     if (strcmp(s,"unsigned")==0) return TOK_UNSIGNED;
+    if (strcmp(s,"double")==0) return TOK_DOUBLE;
     if (strcmp(s,"void")==0) return TOK_VOID;
     if (strcmp(s,"return")==0) return TOK_RETURN;
     if (strcmp(s,"static")==0) return TOK_STATIC;
@@ -958,14 +994,32 @@ void lex(const char *input){
         }
 
         //constant number
-        if (isdigit(*p)){
+        if (isdigit(*p) || (*p=='.' && isdigit(*(p+1)))){
             const char *start=p;
+            int is_double=0;
             while (isdigit(*p)) p++;
+            if (*p=='.'){
+                is_double=1;
+                p++;
+                while (isdigit(*p)) p++;
+            }
+            //an exponent needs digits; otherwise the e is left to fail the boundary check
+            if (*p=='e' || *p=='E'){
+                const char *q=p+1;
+                if (*q=='+' || *q=='-') q++;
+                if (isdigit(*q)){
+                    is_double=1;
+                    while (isdigit(*q)) q++;
+                    p=q;
+                }
+            }
             int len=p-start;
 
-            //suffix: l, u, ul or lu in any case
+            //integer suffix: l, u, ul or lu in any case
             int is_long=0,is_unsigned=0;
-            if (*p=='l' || *p=='L'){
+            if (is_double){
+                //a floating constant takes no suffix; one fails the boundary check below
+            }else if (*p=='l' || *p=='L'){
                 is_long=1;
                 p++;
                 if (*p=='u' || *p=='U'){
@@ -980,7 +1034,8 @@ void lex(const char *input){
                     p++;
                 }
             }
-            TokenType const_type=is_unsigned
+            TokenType const_type=is_double ? TOK_DOUBLE_CONSTANT
+                : is_unsigned
                 ? (is_long ? TOK_UNSIGNED_LONG_CONSTANT : TOK_UNSIGNED_CONSTANT)
                 : (is_long ? TOK_LONG_CONSTANT : TOK_CONSTANT);
 
@@ -1211,7 +1266,7 @@ void resolve_for_init(ForInit *init,IdentifierMap **map){
 }
 
 int is_type_specifier(TokenType type){
-    return type==TOK_INT || type==TOK_LONG || type==TOK_SIGNED || type==TOK_UNSIGNED;
+    return type==TOK_INT || type==TOK_LONG || type==TOK_SIGNED || type==TOK_UNSIGNED || type==TOK_DOUBLE;
 }
 
 int is_declaration_start(void) {
@@ -1219,12 +1274,13 @@ int is_declaration_start(void) {
     return is_type_specifier(type) || type==TOK_STATIC || type==TOK_EXTERN;
 }
 
-// specifiers in any order, none repeated, not both signed and unsigned
+// specifiers in any order, none repeated, not both signed and unsigned; double stands alone
 Type *parse_type(TokenType *types,int count){
-    int has_int=0,has_long=0,has_signed=0,has_unsigned=0;
+    int has_int=0,has_long=0,has_signed=0,has_unsigned=0,has_double=0;
 
     for (int i=0;i<count;i++){
-        int *seen=types[i]==TOK_INT ? &has_int :
+        int *seen=types[i]==TOK_DOUBLE ? &has_double :
+                  types[i]==TOK_INT ? &has_int :
                   types[i]==TOK_LONG ? &has_long :
                   types[i]==TOK_SIGNED ? &has_signed : &has_unsigned;
         if (*seen){
@@ -1234,10 +1290,12 @@ Type *parse_type(TokenType *types,int count){
         *seen=1;
     }
 
-    if (count==0 || (has_signed && has_unsigned)){
+    if (count==0 || (has_signed && has_unsigned) || (has_double && count>1)){
         fprintf(stderr,"Parse Error: invalid type specifier\n");
         exit(1);
     }
+
+    if (has_double) return type_double();
 
     if (has_unsigned) return has_long ? type_ulong() : type_uint();
     return has_long ? type_long() : type_int();
@@ -1589,6 +1647,13 @@ Exp **parse_argument_list(int *out_count) {
 // <int> fits in int -> ConstInt, otherwise ConstLong; <long> -> ConstLong
 // <uint> fits in unsigned int -> ConstUInt, otherwise ConstULong; <ulong> -> ConstULong
 Const parse_constant(Token t){
+    if (t.type==TOK_DOUBLE_CONSTANT){
+        Const c;
+        c.type=CONST_DOUBLE;
+        c.dvalue=strtod(t.value,NULL);
+        return c;
+    }
+
     int is_unsigned=(t.type==TOK_UNSIGNED_CONSTANT || t.type==TOK_UNSIGNED_LONG_CONSTANT);
     const unsigned long max=is_unsigned ? ULONG_MAX : LONG_MAX;
     unsigned long v=0;
@@ -1617,7 +1682,8 @@ Exp *parse_factor(){
     Exp *inner = NULL;
 
     if (t.type==TOK_CONSTANT || t.type==TOK_LONG_CONSTANT ||
-        t.type==TOK_UNSIGNED_CONSTANT || t.type==TOK_UNSIGNED_LONG_CONSTANT){
+        t.type==TOK_UNSIGNED_CONSTANT || t.type==TOK_UNSIGNED_LONG_CONSTANT ||
+        t.type==TOK_DOUBLE_CONSTANT){
         take();
         return make_constant_exp(parse_constant(t));
     }
@@ -2051,7 +2117,7 @@ void typecheck_local_variable_declaration(VariableDeclaration *decl,Symbol **sym
 void typecheck_statement(Statement *stmt,Symbol **symbols);
 void typecheck_expression(Exp *exp,Symbol **symbols);
 void typecheck_for_init(ForInit *init,Symbol **symbols);
-static int eval_const_expr(Exp *e,long *out);
+static int eval_const_expr(Exp *e,Const *out);
 
 //return type of the function whose body is being type checked
 static Type *current_return_type=NULL;
@@ -2076,19 +2142,25 @@ InitialValue make_initial_value(InitialValueType type,StaticInit value) {
 
 //convert a constant to a static initializer of type t, truncating like a C cast
 StaticInit const_to_static_init(Const c,Type *t) {
+    Const converted=convert_const(c,t);
     StaticInit init;
-    switch (t->kind){
-        case TYPE_LONG: init.type=INIT_LONG; break;
-        case TYPE_UINT: init.type=INIT_UINT; break;
-        case TYPE_ULONG: init.type=INIT_ULONG; break;
+    switch (converted.type){
+        case CONST_LONG: init.type=INIT_LONG; break;
+        case CONST_UINT: init.type=INIT_UINT; break;
+        case CONST_ULONG: init.type=INIT_ULONG; break;
+        case CONST_DOUBLE: init.type=INIT_DOUBLE; break;
         default: init.type=INIT_INT; break;
     }
-    init.value=convert_value(c.value,t);
+    if (converted.type==CONST_DOUBLE){
+        init.dvalue=converted.dvalue;
+    }else{
+        init.value=converted.value;
+    }
     return init;
 }
 
 StaticInit zero_static_init(Type *t) {
-    Const zero={CONST_INT,0};
+    Const zero={CONST_INT,{0}};
     return const_to_static_init(zero,t);
 }
 
@@ -2142,6 +2214,9 @@ Type *get_common_type(Type *t1,Type *t2) {
     if (type_equal(t1,t2)) {
         return t1;
     }
+    if (t1->kind==TYPE_DOUBLE || t2->kind==TYPE_DOUBLE) {
+        return type_double();
+    }
     if (type_size(t1)==type_size(t2)) {
         return type_is_signed(t1) ? t2 : t1;
     }
@@ -2188,6 +2263,23 @@ static int is_shift_op(BinaryOpType op) {
 
 static int is_comparison_op(BinaryOpType op) {
     return op>=BINARY_EQ && op<=BINARY_GTE;
+}
+
+//%, bitwise and shift operators only take integer operands
+static int is_integer_only_op(BinaryOpType op) {
+    return op==BINARY_REM || is_shift_op(op) ||
+           op==BINARY_BITWISE_AND || op==BINARY_BITWISE_OR || op==BINARY_BITWISE_XOR;
+}
+
+static int is_double(Type *t) {
+    return t->kind==TYPE_DOUBLE;
+}
+
+static void check_integer_operands(BinaryOpType op,Type *left,Type *right) {
+    if (is_integer_only_op(op) && (is_double(left) || is_double(right))) {
+        fprintf(stderr,"Type Error: operator requires integer operands\n");
+        exit(1);
+    }
 }
 
 void typecheck_expression(Exp *exp,Symbol **symbols) {
@@ -2271,6 +2363,10 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
         case EXP_UNARY:
             typecheck_expression(exp->unary.exp,symbols);
+            if (exp->unary.op==UNARY_COMPLEMENT && is_double(exp->unary.exp->exp_type)) {
+                fprintf(stderr,"Type Error: can't take the bitwise complement of a double\n");
+                exit(1);
+            }
             exp->exp_type=(exp->unary.op==UNARY_NOT) ? type_int() : exp->unary.exp->exp_type;
             return;
 
@@ -2278,6 +2374,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             BinaryOpType op=exp->binary.op;
             typecheck_expression(exp->binary.left,symbols);
             typecheck_expression(exp->binary.right,symbols);
+            check_integer_operands(op,exp->binary.left->exp_type,exp->binary.right->exp_type);
 
             if (op==BINARY_LOGICAL_AND || op==BINARY_LOGICAL_OR) {
                 exp->exp_type=type_int();
@@ -2319,6 +2416,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             typecheck_expression(exp->compound.rvalue,symbols);
 
             Type *left_type=exp->compound.lvalue->exp_type;
+            check_integer_operands(exp->compound.op,left_type,exp->compound.rvalue->exp_type);
             Type *op_type=is_shift_op(exp->compound.op)
                 ? left_type
                 : get_common_type(left_type,exp->compound.rvalue->exp_type);
@@ -2354,14 +2452,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 // static initializers may be any constant expression; fold it at compile time
 static int eval_static_initializer(Exp *init,Symbol **symbols,Const *out) {
     typecheck_expression(init,symbols);
-
-    long value;
-    if (!eval_const_expr(init,&value)) {
-        return 0;
-    }
-
-    *out=make_const(init->exp_type,value);
-    return 1;
+    return eval_const_expr(init,out);
 }
 
 void typecheck_file_scope_variable_declaration(
@@ -2648,6 +2739,10 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
                 stmt->switch_stmt.control,
                 symbols
             );
+            if (is_double(stmt->switch_stmt.control->exp_type)) {
+                fprintf(stderr,"Type Error: switch controlling expression must be an integer\n");
+                exit(1);
+            }
             typecheck_statement(
                 stmt->switch_stmt.body,
                 symbols
@@ -2659,6 +2754,10 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
                 stmt->case_stmt.value_exp,
                 symbols
             );
+            if (is_double(stmt->case_stmt.value_exp->exp_type)) {
+                fprintf(stderr,"Type Error: case label must be an integer\n");
+                exit(1);
+            }
             typecheck_statement(
                 stmt->case_stmt.body,
                 symbols
@@ -3404,101 +3503,148 @@ void label_statement(Statement *stmt,char *current_break_label,char *current_con
 
 //eval case/default expression
 /*
-Fold an already type-checked constant expression. Arithmetic runs in long
-(wrapping through unsigned to avoid host overflow), then every node is
+Fold an already type-checked constant expression. Integer arithmetic runs in
+long (wrapping through unsigned to avoid host overflow), then every node is
 wrapped to its own type, so results match what gcc computes, e.g.
 (1 << 31) is INT_MIN rather than 2^31. Operands of an unsigned type are
 already non-negative or raw bit patterns, so their division, shifts and
-comparisons run in unsigned long.
+comparisons run in unsigned long. Double operands fold with host double ops.
 */
-static int eval_const_value(Exp *e,long *out){
+static int const_is_true(Const c){
+    return c.type==CONST_DOUBLE ? c.dvalue!=0 : c.value!=0;
+}
+
+static int eval_double_binary(BinaryOpType op,double l,double r,Type *t,Const *out){
+    switch (op){
+        case BINARY_ADD: out->dvalue=l+r; break;
+        case BINARY_SUB: out->dvalue=l-r; break;
+        case BINARY_MULT: out->dvalue=l*r; break;
+        case BINARY_DIV: out->dvalue=l/r; break;
+        case BINARY_EQ: *out=make_const(t,l==r); return 1;
+        case BINARY_NEQ: *out=make_const(t,l!=r); return 1;
+        case BINARY_LT: *out=make_const(t,l<r); return 1;
+        case BINARY_LTE: *out=make_const(t,l<=r); return 1;
+        case BINARY_GT: *out=make_const(t,l>r); return 1;
+        case BINARY_GTE: *out=make_const(t,l>=r); return 1;
+        default: return 0;
+    }
+    out->type=CONST_DOUBLE;
+    return 1;
+}
+
+static int eval_const_value(Exp *e,Const *out){
     switch(e->type){
         case EXP_CONSTANT:
-            *out=e->constant.value;
+            *out=e->constant;
             return 1;
 
         case EXP_CAST:
             return eval_const_expr(e->cast.exp,out);
 
         case EXP_UNARY: {
-            long v;
-            if (!eval_const_expr(e->unary.exp,&v)) return 0;
+            Const c;
+            if (!eval_const_expr(e->unary.exp,&c)) return 0;
+            long v=c.value;
 
             switch (e->unary.op){
-                case UNARY_NEGATION: *out=(long)(0UL-(unsigned long)v); return 1;
-                case UNARY_COMPLEMENT: *out=~v; return 1;
-                case UNARY_NOT: *out=!v; return 1;
+                case UNARY_NEGATION:
+                    if (c.type==CONST_DOUBLE){
+                        out->type=CONST_DOUBLE;
+                        out->dvalue=-c.dvalue;
+                        return 1;
+                    }
+                    *out=make_const(e->exp_type,(long)(0UL-(unsigned long)v));
+                    return 1;
+                case UNARY_COMPLEMENT: *out=make_const(e->exp_type,~v); return 1;
+                case UNARY_NOT: *out=make_const(e->exp_type,!const_is_true(c)); return 1;
             }
             
             return 0;
         }
 
         case EXP_BINARY:{
-            long l,r;
-            if (!eval_const_expr(e->binary.left,&l)) return 0;
-            if (!eval_const_expr(e->binary.right,&r)) return 0;
+            Const lc,rc;
+            if (!eval_const_expr(e->binary.left,&lc)) return 0;
+            if (!eval_const_expr(e->binary.right,&rc)) return 0;
 
+            Type *t=e->exp_type;
+            BinaryOpType op=e->binary.op;
+
+            if (op==BINARY_LOGICAL_AND){
+                *out=make_const(t,const_is_true(lc) && const_is_true(rc));
+                return 1;
+            }
+            if (op==BINARY_LOGICAL_OR){
+                *out=make_const(t,const_is_true(lc) || const_is_true(rc));
+                return 1;
+            }
+
+            if (lc.type==CONST_DOUBLE){
+                return eval_double_binary(op,lc.dvalue,rc.dvalue,t,out);
+            }
+
+            long l=lc.value,r=rc.value;
             unsigned long ul=(unsigned long)l;
             unsigned long ur=(unsigned long)r;
 
             if (!type_is_signed(e->binary.left->exp_type)){
-                switch (e->binary.op){
+                switch (op){
                     case BINARY_DIV:
                         if (ur==0) return 0;
-                        *out=(long)(ul/ur);
+                        *out=make_const(t,(long)(ul/ur));
                         return 1;
                     case BINARY_REM:
                         if (ur==0) return 0;
-                        *out=(long)(ul%ur);
+                        *out=make_const(t,(long)(ul%ur));
                         return 1;
-                    case BINARY_RSHIFT: *out=(long)(ul>>(r&63)); return 1;
-                    case BINARY_LT: *out=(ul<ur); return 1;
-                    case BINARY_LTE: *out=(ul<=ur); return 1;
-                    case BINARY_GT: *out=(ul>ur); return 1;
-                    case BINARY_GTE: *out=(ul>=ur); return 1;
+                    case BINARY_RSHIFT: *out=make_const(t,(long)(ul>>(r&63))); return 1;
+                    case BINARY_LT: *out=make_const(t,ul<ur); return 1;
+                    case BINARY_LTE: *out=make_const(t,ul<=ur); return 1;
+                    case BINARY_GT: *out=make_const(t,ul>ur); return 1;
+                    case BINARY_GTE: *out=make_const(t,ul>=ur); return 1;
                     default: break;
                 }
             }
 
-            switch (e->binary.op){
-                case BINARY_ADD : *out=(long)(ul+ur); return 1;
-                case BINARY_SUB: *out=(long)(ul-ur); return 1;
-                case BINARY_MULT: *out=(long)(ul*ur); return 1;
+            long v;
+            switch (op){
+                case BINARY_ADD : v=(long)(ul+ur); break;
+                case BINARY_SUB: v=(long)(ul-ur); break;
+                case BINARY_MULT: v=(long)(ul*ur); break;
                 case BINARY_DIV:
                     if (r==0) return 0;
-                    *out=(r==-1) ? (long)(0UL-ul) : l/r;
-                    return 1;
+                    v=(r==-1) ? (long)(0UL-ul) : l/r;
+                    break;
                 case BINARY_REM:
                     if (r==0) return 0;
-                    *out=(r==-1) ? 0 : l%r;
-                    return 1;
+                    v=(r==-1) ? 0 : l%r;
+                    break;
 
-                case BINARY_LSHIFT: *out=(long)(ul<<(r&63)); return 1;
-                case BINARY_RSHIFT: *out=l>>(r&63); return 1;
-                case BINARY_SHR: *out=(long)(ul>>(r&63)); return 1;
+                case BINARY_LSHIFT: v=(long)(ul<<(r&63)); break;
+                case BINARY_RSHIFT: v=l>>(r&63); break;
+                case BINARY_SHR: v=(long)(ul>>(r&63)); break;
                 
-                case BINARY_BITWISE_AND: *out=l&r; return 1;
-                case BINARY_BITWISE_OR: *out=l|r; return 1;
-                case BINARY_BITWISE_XOR: *out=l^r; return 1;
+                case BINARY_BITWISE_AND: v=l&r; break;
+                case BINARY_BITWISE_OR: v=l|r; break;
+                case BINARY_BITWISE_XOR: v=l^r; break;
 
-                case BINARY_LOGICAL_AND: *out=(l&&r); return 1;
-                case BINARY_LOGICAL_OR: *out=(l||r); return 1;
-
-                case BINARY_EQ: *out=(l==r); return 1;
-                case BINARY_NEQ: *out=(l!=r); return 1;
-                case BINARY_LT: *out=(l<r); return 1;
-                case BINARY_LTE: *out = (l <= r); return 1;
-                case BINARY_GT: *out = (l > r); return 1;
-                case BINARY_GTE: *out = (l >= r); return 1;
+                case BINARY_EQ: v=(l==r); break;
+                case BINARY_NEQ: v=(l!=r); break;
+                case BINARY_LT: v=(l<r); break;
+                case BINARY_LTE: v=(l<=r); break;
+                case BINARY_GT: v=(l>r); break;
+                case BINARY_GTE: v=(l>=r); break;
+                default: return 0;
             }
 
-            return 0;
+            *out=make_const(t,v);
+            return 1;
         }
 
         case EXP_CONDITIONAL:{
-            long cond;
+            Const cond;
             if (!eval_const_expr(e->conditional.condition,&cond)) return 0;
-            if (cond) return eval_const_expr(e->conditional.true_expr,out);
+            if (const_is_true(cond)) return eval_const_expr(e->conditional.true_expr,out);
             return eval_const_expr(e->conditional.false_expr,out);
         }
 
@@ -3507,12 +3653,12 @@ static int eval_const_value(Exp *e,long *out){
     }
 }
 
-static int eval_const_expr(Exp *e,long *out){
+static int eval_const_expr(Exp *e,Const *out){
     if (!e || !eval_const_value(e,out)) {
         return 0;
     }
 
-    *out=convert_value(*out,e->exp_type);
+    *out=convert_const(*out,e->exp_type);
     return 1;
 }
 
@@ -3558,13 +3704,13 @@ void collect_switch_cases_statement(Statement *stmt,Statement *current_switch){
                 exit(1);
             }
 
-            long value;
-            if (!eval_const_expr(stmt->case_stmt.value_exp,&value)){
+            Const case_value;
+            if (!eval_const_expr(stmt->case_stmt.value_exp,&case_value)){
                 fprintf(stderr, "Semantic Error: case label is not an integer constant expression\n");
                 exit(1);
             }
 
-            value=convert_value(value,current_switch->switch_stmt.control->exp_type);
+            long value=convert_const(case_value,current_switch->switch_stmt.control->exp_type).value;
 
             if (switch_case_exists(current_switch->switch_stmt.cases,value)){
                 fprintf(stderr, "Semantic Error: duplicate case value %ld\n",value);
@@ -5704,6 +5850,7 @@ int main(int argc,char *argv[]){
     int stage=6;
     int s_flag=0;
     int c_flag=0;
+    char libs[256]="";
 
     for(int i=1;i<argc;i++){
         if (strcmp(argv[i],"--lex")==0){
@@ -5732,6 +5879,15 @@ int main(int argc,char *argv[]){
         }
         else if (strcmp(argv[i],"-c")==0){
             c_flag=1;
+            continue;
+        }
+        else if (strncmp(argv[i],"-l",2)==0){
+            if (strlen(libs)+strlen(argv[i])+2 > sizeof(libs)){
+                fprintf(stderr,"Error: too many libraries\n");
+                return 1;
+            }
+            strcat(libs," ");
+            strcat(libs,argv[i]);
             continue;
         }
         else if (argv[i][0]!='-'){
@@ -5847,7 +6003,7 @@ int main(int argc,char *argv[]){
         *dot = '\0';
     }
 
-    snprintf(cmd, sizeof(cmd), "gcc %s -o %s", asm_path, out_path);
+    snprintf(cmd, sizeof(cmd), "gcc %s -o %s%s", asm_path, out_path, libs);
     int res = system(cmd);
 
     remove(asm_path);
