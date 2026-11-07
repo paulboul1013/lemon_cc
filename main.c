@@ -5142,11 +5142,9 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
 
         case AS_LEA:
             if (inst->dst.type!=AS_REG){
-                AsmOperand dst=inst->dst;
                 push_inst(tail,make_asm(AS_LEA,ASM_QUADWORD,0,0,inst->src,as_reg(REG_R11),NULL));
                 inst->type=AS_MOV;
                 inst->src=as_reg(REG_R11);
-                inst->dst=dst;
             }
             break;
 
@@ -5228,7 +5226,7 @@ TackyVal *make_tacky_variable(Type *type){
     return tacky_val_var(name);
 }
 
-static void emit_tacky_conversion(
+static void emit_tacky_src_dst(
     TackyInstruction **inst_list,
     TackyInstType type,
     TackyVal *src,
@@ -5265,7 +5263,7 @@ static TackyVal *emit_tacky_cast(
     }else{
         type=type_is_signed(from) ? TACKY_INST_SIGN_EXTEND : TACKY_INST_ZERO_EXTEND;
     }
-    emit_tacky_conversion(inst_list,type,val,dst);
+    emit_tacky_src_dst(inst_list,type,val,dst);
     return dst;
 }
 
@@ -5290,18 +5288,18 @@ TackyVal *emit_lvalue_load(TackyLvalue lv,Type *t,TackyInstruction **inst_list){
     }
 
     TackyVal *dst=make_tacky_variable(t);
-    emit_tacky_conversion(inst_list,TACKY_INST_LOAD,lv.val,dst);
+    emit_tacky_src_dst(inst_list,TACKY_INST_LOAD,lv.val,dst);
     return dst;
 }
 
 //returns the value of the assignment expression
 TackyVal *emit_lvalue_store(TackyLvalue lv,TackyVal *v,TackyInstruction **inst_list){
     if (lv.is_deref){
-        emit_tacky_conversion(inst_list,TACKY_INST_STORE,v,lv.val);
+        emit_tacky_src_dst(inst_list,TACKY_INST_STORE,v,lv.val);
         return v;
     }
 
-    emit_tacky_conversion(inst_list,TACKY_INST_COPY,v,lv.val);
+    emit_tacky_src_dst(inst_list,TACKY_INST_COPY,v,lv.val);
     return lv.val;
 }
 
@@ -5316,6 +5314,7 @@ TackyVal *emit_lvalue_store(TackyLvalue lv,TackyVal *v,TackyInstruction **inst_l
 //   compound assignment
 //   ++ / --
 //   conditional (?:)
+//   dereference and address-of
 //   short-circuit logical operators (&&, ||)
 TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     if (e->type==EXP_CONSTANT){
@@ -5476,6 +5475,13 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         //calculate right side value
         TackyVal *rhs_val=gen_tacky_exp(e->assign.rvalue,inst_list);
 
+        //the store returns its source as the value, and a later call may change a source variable
+        if (lv.is_deref && rhs_val->type==TACKY_VAL_VAR){
+            TackyVal *stored=make_tacky_variable(e->exp_type);
+            emit_tacky_src_dst(inst_list,TACKY_INST_COPY,rhs_val,stored);
+            rhs_val=stored;
+        }
+
         return emit_lvalue_store(lv,rhs_val,inst_list);
     }
     else if (e->type==EXP_DEREFERENCE){
@@ -5489,7 +5495,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         }
 
         TackyVal *dst=make_tacky_variable(e->exp_type);
-        emit_tacky_conversion(inst_list,TACKY_INST_GET_ADDRESS,lv.val,dst);
+        emit_tacky_src_dst(inst_list,TACKY_INST_GET_ADDRESS,lv.val,dst);
         return dst;
     }
     else if (e->type==EXP_UNARY){
