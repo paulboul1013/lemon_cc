@@ -665,7 +665,7 @@ typedef enum {
     AS_IMM, //immediate value
     AS_REG, // register
     AS_PSEUDO, //virtual register (tmp.0)
-    AS_STACK, // stack address -4(%rbp), 16(%rbp), ...
+    AS_MEMORY, // base register plus offset: -4(%rbp), 16(%rbp), (%rax)
     AS_DATA // static storage, foo(%rip)
 } AsmOpType;
 
@@ -681,6 +681,7 @@ typedef enum{
     REG_R10, //for source operand fix-up
     REG_R11, //for destination operand fix-up
     REG_SP,
+    REG_BP,
     REG_XMM0, REG_XMM1, REG_XMM2, REG_XMM3, //double arguments and return value
     REG_XMM4, REG_XMM5, REG_XMM6, REG_XMM7,
     REG_XMM14, //for double source operand fix-up
@@ -699,7 +700,10 @@ typedef struct {
         long imm;
         AsmReg reg;
         char *pseudo;
-        int stack_offset;
+        struct {
+            AsmReg base;
+            int offset;
+        } memory;
         char *data_name;
     };
 } AsmOperand;
@@ -3929,10 +3933,10 @@ AsmOperand as_pseudo(char *s){
     };
 }
 
-AsmOperand as_stack(int offset){
+AsmOperand as_memory(AsmReg base,int offset){
     return (AsmOperand){
-        AS_STACK,
-        .stack_offset=offset
+        AS_MEMORY,
+        .memory={base,offset}
     };
 }
 
@@ -4497,7 +4501,7 @@ static AsmFunc *convert_tacky_function(TackyFunction *tacky_fn,Symbol *symbols){
     }
 
     for (int i=0;i<args.stack_count;i++){
-        append_asm(head,AS_MOV,args.stack_args[i].type,0,0,as_stack(16+8*i),args.stack_args[i].operand,NULL);
+        append_asm(head,AS_MOV,args.stack_args[i].type,0,0,as_memory(REG_BP,16+8*i),args.stack_args[i].operand,NULL);
     }
     free(args.stack_args);
 
@@ -4650,7 +4654,7 @@ typedef struct {
 } MapEntry;
 
 static int is_memory_operand(AsmOperand op){
-    return op.type==AS_STACK || op.type==AS_DATA;
+    return op.type==AS_MEMORY || op.type==AS_DATA;
 }
 
 static int is_large_imm(AsmOperand op){
@@ -4719,8 +4723,7 @@ static void replace_pseudos(AsmFunc *fn,AsmSymbol *symbols){
                 map_size++;
             }
 
-            ops[i]->type=AS_STACK;
-            ops[i]->stack_offset=found_offset;
+            *ops[i]=as_memory(REG_BP,found_offset);
         }
     }
 
@@ -5801,7 +5804,7 @@ TackyProgram *generate_tacky(Program *prog,Symbol **symbols){
 static const char *reg_name_64(AsmReg reg){
     static const char *names[]={
         "%rax","%rcx","%rdx","%rdi","%rsi",
-        "%r8","%r9","%r10","%r11","%rsp"
+        "%r8","%r9","%r10","%r11","%rsp","%rbp"
     };
     return names[reg];
 }
@@ -5809,7 +5812,7 @@ static const char *reg_name_64(AsmReg reg){
 static const char *reg_name_32(AsmReg reg){
     static const char *names[]={
         "%eax","%ecx","%edx","%edi","%esi",
-        "%r8d","%r9d","%r10d","%r11d","%esp"
+        "%r8d","%r9d","%r10d","%r11d","%esp","%ebp"
     };
     return names[reg];
 }
@@ -5817,7 +5820,7 @@ static const char *reg_name_32(AsmReg reg){
 static const char *reg_name_8(AsmReg reg){
     static const char *names[]={
         "%al","%cl","%dl","%dil","%sil",
-        "%r8b","%r9b","%r10b","%r11b","%spl"
+        "%r8b","%r9b","%r10b","%r11b","%spl","%bpl"
     };
     return names[reg];
 }
@@ -5863,8 +5866,9 @@ static void emit_sized_op(AsmOperand op,int bytes,FILE *out){
                         : reg_name_8(op.reg);
         fprintf(out,"%s",name);
     }
-    else if (op.type==AS_STACK){
-        fprintf(out,"%d(%%rbp)",op.stack_offset);
+    //an address is 8 bytes whatever the operand size
+    else if (op.type==AS_MEMORY){
+        fprintf(out,"%d(%s)",op.memory.offset,reg_name_64(op.memory.base));
     }
     else if (op.type==AS_DATA){
         emit_data_op(op,out);
