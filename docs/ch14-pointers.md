@@ -400,8 +400,15 @@ reg     += BP
 | 型別 | `Type` 已有 `params`/`ret`（函式用） | 加 `TYPE_POINTER` 和 `referenced` 欄位；`type_equal` 要遞迴比較 |
 | 宣告解析 | `parse_type_and_storage_class` 之後直接讀 identifier | 改成 declarator 中間結構 + `process_declarator`；參數也要用 declarator |
 | lvalue 檢查 | 在 identifier resolution（`resolve_expression` 裡的 `Invalid lvalue ...`），只接受 `EXP_VAR` | 搬到 type checker，接受 `Var` 和 `Dereference` |
-| TACKY | `gen_tacky_exp` 回傳 `TackyVal *`；compound assign 和 `++`/`--` 直接用 `lvalue->var_name` | 改成 `exp_result`；compound/`++` 要支援 `*p += 1`，而且左邊**只能求值一次**（測試 `eval_compound_lhs_once`） |
+| TACKY | `gen_tacky_exp` 回傳 `TackyVal *`；compound assign 和 `++`/`--` 直接用 `lvalue->var_name` | 新增 `gen_tacky_lvalue`（見下方「和書上的差異」）；compound/`++` 要支援 `*p += 1`，而且左邊**只能求值一次**（測試 `eval_compound_lhs_once`） |
 | 組語運算元 | `AS_STACK` + `stack_offset` | 換成 `Memory(reg, offset)`，加 `REG_BP` |
+
+**和書上的差異**（lemon_cc 實際的做法）：
+
+- **`exp_result`**：`gen_tacky_exp` 維持回傳轉換後的值，只有 lvalue 走 `gen_tacky_lvalue`，回傳 `TackyLvalue`（`is_deref` 對應 `DereferencedPointer`）。原本的呼叫點都不用改；代價是 `*p;` 這種敘述會多一個 `Load`。
+- **賦值的值**：§7.3 的 `PlainOperand(obj)` 回傳變數本身，但這樣 `(y = x) + bump(&y)` 會讀到 `bump` 改過的值。lemon_cc 改成回傳存入的值：右邊是變數時先 `Copy` 到暫存變數，代價是 `a = b;` 會多一次 `Copy`。全域變數從第 10 章就有這個問題（`(g = x) + set_g()`）。
+- **Static 初始值**：先套 `convert_by_assignment` 再折疊，所以除了 `= 0`，`= (int *)8` 也合法（gcc 同樣接受）；`= 10`、`= 0.0`、`= &a` 都是錯誤。
+- **指標的 `+`、`-`、`<`、`>`、`+=`、`++`**：第 15 章之前一律是 type error。
 
 **Extra credit 測試**（本章 `--extra-credit`）主要測：指標不能做位元運算、不能 `%=`/`*=`/`/=`、不能 `switch`；`*p` 可以做位元運算、compound 賦值和 `++`/`--`；`&label`、`*label` 是錯誤。
 
