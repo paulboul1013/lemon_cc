@@ -226,6 +226,8 @@ typedef enum {
     EXP_POSTFIX_OP, //a++,a--
     EXP_CONDITIONAL,
     EXP_FUNCTION_CALL,
+    EXP_DEREFERENCE, // *e
+    EXP_ADDR_OF, // &e
 }ExpType;
 
 typedef enum {
@@ -293,6 +295,14 @@ typedef struct Exp {
             struct Exp **args;
             int arg_count;
         } function_call;
+
+        struct { //for EXP_DEREFERENCE
+            struct Exp *exp;
+        } deref;
+
+        struct { //for EXP_ADDR_OF
+            struct Exp *exp;
+        } addr_of;
     };
 } Exp;
 
@@ -527,6 +537,20 @@ Exp *make_inc_dec_exp(ExpType type,int is_increment,Exp *lvalue){
     e->type=type;
     e->inc_dec.lvalue=lvalue;
     e->inc_dec.is_increment=is_increment;
+    return e;
+}
+
+Exp *make_dereference_exp(Exp *inner){
+    Exp *e=calloc(1,sizeof(Exp));
+    e->type=EXP_DEREFERENCE;
+    e->deref.exp=inner;
+    return e;
+}
+
+Exp *make_addr_of_exp(Exp *inner){
+    Exp *e=calloc(1,sizeof(Exp));
+    e->type=EXP_ADDR_OF;
+    e->addr_of.exp=inner;
     return e;
 }
 
@@ -1883,6 +1907,14 @@ Exp *parse_factor(){
         Exp *inner=parse_factor(); //unary after factor
         return make_unary_exp(op,inner);
     }
+    else if (t.type==TOK_MULT){
+        take();
+        return make_dereference_exp(parse_factor());
+    }
+    else if (t.type==TOK_BITWISE_AND){
+        take();
+        return make_addr_of_exp(parse_factor());
+    }
     else if (t.type==TOK_LPAREN){
         take();
         inner =parse_exp(0); // PAREN inter predence reset to 0
@@ -2404,9 +2436,87 @@ static int is_double(Type *t) {
     return t->kind==TYPE_DOUBLE;
 }
 
-static void check_integer_operands(BinaryOpType op,Type *left,Type *right) {
-    if (is_integer_only_op(op) && (is_double(left) || is_double(right))) {
-        fprintf(stderr,"Type Error: operator requires integer operands\n");
+static int is_pointer(Type *t) {
+    return t->kind==TYPE_POINTER;
+}
+
+static int is_integer_type(Type *t) {
+    return !is_double(t) && !is_pointer(t);
+}
+
+int is_lvalue(Exp *e) {
+    return e->type==EXP_VAR || e->type==EXP_DEREFERENCE;
+}
+
+static void check_lvalue(Exp *e,const char *context) {
+    if (!is_lvalue(e)) {
+        fprintf(stderr,"Type Error: invalid lvalue in %s\n",context);
+        exit(1);
+    }
+}
+
+//only an integer literal 0 qualifies: 0.0, (long)0 and 10-10 do not
+int is_null_pointer_constant(Exp *e) {
+    return e->type==EXP_CONSTANT && e->constant.type!=CONST_DOUBLE && e->constant.value==0;
+}
+
+Type *get_common_pointer_type(Exp *a,Exp *b) {
+    if (type_equal(a->exp_type,b->exp_type)) {
+        return a->exp_type;
+    }
+    if (is_null_pointer_constant(a)) {
+        return b->exp_type;
+    }
+    if (is_null_pointer_constant(b)) {
+        return a->exp_type;
+    }
+    fprintf(stderr,"Type Error: expressions have incompatible pointer types\n");
+    exit(1);
+}
+
+Type *common_operand_type(Exp *a,Exp *b) {
+    if (is_pointer(a->exp_type) || is_pointer(b->exp_type)) {
+        return get_common_pointer_type(a,b);
+    }
+    return get_common_type(a->exp_type,b->exp_type);
+}
+
+//the implicit conversion of assignment, arguments, initializers and return
+void convert_by_assignment(Exp **slot,Type *t) {
+    Type *from=(*slot)->exp_type;
+    int both_arithmetic=!is_pointer(from) && !is_pointer(t);
+
+    if (type_equal(from,t) || both_arithmetic ||
+        (is_pointer(t) && is_null_pointer_constant(*slot))) {
+        convert_to(slot,t);
+        return;
+    }
+
+    fprintf(stderr,"Type Error: cannot convert type as if by assignment\n");
+    exit(1);
+}
+
+void check_binary_operands(BinaryOpType op,Type *left,Type *right) {
+    if (op==BINARY_LOGICAL_AND || op==BINARY_LOGICAL_OR || op==BINARY_EQ || op==BINARY_NEQ) {
+        return;
+    }
+
+    int has_pointer=is_pointer(left) || is_pointer(right);
+
+    if (is_integer_only_op(op)) {
+        if (has_pointer || is_double(left) || is_double(right)) {
+            fprintf(stderr,"Type Error: operator requires integer operands\n");
+            exit(1);
+        }
+        return;
+    }
+
+    if (has_pointer) {
+        if (op==BINARY_MULT || op==BINARY_DIV) {
+            fprintf(stderr,"Type Error: can't multiply or divide a pointer\n");
+        }else{
+            fprintf(stderr,"Type Error: pointer arithmetic and ordering are not supported until chapter 15\n");
+        }
         exit(1);
     }
 }
@@ -2423,6 +2533,11 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
         case EXP_CAST:
             typecheck_expression(exp->cast.exp,symbols);
+            if ((is_pointer(exp->cast.target_type) && is_double(exp->cast.exp->exp_type)) ||
+                (is_double(exp->cast.target_type) && is_pointer(exp->cast.exp->exp_type))) {
+                fprintf(stderr,"Type Error: can't cast between a pointer and a double\n");
+                exit(1);
+            }
             exp->exp_type=exp->cast.target_type;
             return;
 
@@ -2483,7 +2598,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
             for(int i=0;i<exp->function_call.arg_count;i++){
                 typecheck_expression(exp->function_call.args[i],symbols);
-                convert_to(&exp->function_call.args[i],fun_type->params[i]);
+                convert_by_assignment(&exp->function_call.args[i],fun_type->params[i]);
             }
 
             exp->exp_type=fun_type->ret;
@@ -2496,6 +2611,10 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
                 fprintf(stderr,"Type Error: can't take the bitwise complement of a double\n");
                 exit(1);
             }
+            if (exp->unary.op!=UNARY_NOT && is_pointer(exp->unary.exp->exp_type)) {
+                fprintf(stderr,"Type Error: can't negate or complement a pointer\n");
+                exit(1);
+            }
             exp->exp_type=(exp->unary.op==UNARY_NOT) ? type_int() : exp->unary.exp->exp_type;
             return;
 
@@ -2503,7 +2622,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             BinaryOpType op=exp->binary.op;
             typecheck_expression(exp->binary.left,symbols);
             typecheck_expression(exp->binary.right,symbols);
-            check_integer_operands(op,exp->binary.left->exp_type,exp->binary.right->exp_type);
+            check_binary_operands(op,exp->binary.left->exp_type,exp->binary.right->exp_type);
 
             if (op==BINARY_LOGICAL_AND || op==BINARY_LOGICAL_OR) {
                 exp->exp_type=type_int();
@@ -2518,10 +2637,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
                 return;
             }
 
-            Type *common_type=get_common_type(
-                exp->binary.left->exp_type,
-                exp->binary.right->exp_type
-            );
+            Type *common_type=common_operand_type(exp->binary.left,exp->binary.right);
             convert_to(&exp->binary.left,common_type);
             convert_to(&exp->binary.right,common_type);
 
@@ -2532,7 +2648,8 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
         case EXP_ASSIGN:
             typecheck_expression(exp->assign.lvalue,symbols);
             typecheck_expression(exp->assign.rvalue,symbols);
-            convert_to(&exp->assign.rvalue,exp->assign.lvalue->exp_type);
+            check_lvalue(exp->assign.lvalue,"assignment");
+            convert_by_assignment(&exp->assign.rvalue,exp->assign.lvalue->exp_type);
             exp->exp_type=exp->assign.lvalue->exp_type;
             return;
 
@@ -2543,9 +2660,10 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
         case EXP_COMPOUND_ASSIGN: {
             typecheck_expression(exp->compound.lvalue,symbols);
             typecheck_expression(exp->compound.rvalue,symbols);
+            check_lvalue(exp->compound.lvalue,"compound assignment");
 
             Type *left_type=exp->compound.lvalue->exp_type;
-            check_integer_operands(exp->compound.op,left_type,exp->compound.rvalue->exp_type);
+            check_binary_operands(exp->compound.op,left_type,exp->compound.rvalue->exp_type);
             Type *op_type=is_shift_op(exp->compound.op)
                 ? left_type
                 : get_common_type(left_type,exp->compound.rvalue->exp_type);
@@ -2558,7 +2676,13 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
         case EXP_PREFIX_OP:
         case EXP_POSTFIX_OP:
             typecheck_expression(exp->inc_dec.lvalue,symbols);
+            check_lvalue(exp->inc_dec.lvalue,"increment/decrement");
             exp->exp_type=exp->inc_dec.lvalue->exp_type;
+            check_binary_operands(
+                exp->inc_dec.is_increment ? BINARY_ADD : BINARY_SUB,
+                exp->exp_type,
+                exp->exp_type
+            );
             return;
 
         case EXP_CONDITIONAL: {
@@ -2566,22 +2690,38 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             typecheck_expression(exp->conditional.true_expr,symbols);
             typecheck_expression(exp->conditional.false_expr,symbols);
 
-            Type *common_type=get_common_type(
-                exp->conditional.true_expr->exp_type,
-                exp->conditional.false_expr->exp_type
+            Type *common_type=common_operand_type(
+                exp->conditional.true_expr,
+                exp->conditional.false_expr
             );
             convert_to(&exp->conditional.true_expr,common_type);
             convert_to(&exp->conditional.false_expr,common_type);
             exp->exp_type=common_type;
             return;
         }
+
+        case EXP_DEREFERENCE:
+            typecheck_expression(exp->deref.exp,symbols);
+            if (!is_pointer(exp->deref.exp->exp_type)) {
+                fprintf(stderr,"Type Error: can't dereference a non-pointer\n");
+                exit(1);
+            }
+            exp->exp_type=exp->deref.exp->exp_type->referenced;
+            return;
+
+        case EXP_ADDR_OF:
+            typecheck_expression(exp->addr_of.exp,symbols);
+            check_lvalue(exp->addr_of.exp,"address-of");
+            exp->exp_type=make_pointer_type(exp->addr_of.exp->exp_type);
+            return;
     }
 }
 
-// static initializers may be any constant expression; fold it at compile time
-static int eval_static_initializer(Exp *init,Symbol **symbols,Const *out) {
-    typecheck_expression(init,symbols);
-    return eval_const_expr(init,out);
+// a static initializer follows the assignment rule, then must fold at compile time
+static int eval_static_initializer(Exp **init,Type *target,Symbol **symbols,Const *out) {
+    typecheck_expression(*init,symbols);
+    convert_by_assignment(init,target);
+    return eval_const_expr(*init,out);
 }
 
 void typecheck_file_scope_variable_declaration(
@@ -2592,7 +2732,7 @@ void typecheck_file_scope_variable_declaration(
 
     if (decl->init) {
         Const value;
-        if (!eval_static_initializer(decl->init,symbols,&value)) {
+        if (!eval_static_initializer(&decl->init,decl->var_type,symbols,&value)) {
             fprintf(
                 stderr,
                 "Type Error: non-constant initializer for file-scope variable '%s'\n",
@@ -2712,7 +2852,7 @@ void typecheck_local_variable_declaration(
 
         if (decl->init) {
             Const value;
-            if (!eval_static_initializer(decl->init,symbols,&value)) {
+            if (!eval_static_initializer(&decl->init,decl->var_type,symbols,&value)) {
                 fprintf(
                     stderr,
                     "Type Error: non-constant initializer on local static variable '%s'\n",
@@ -2744,7 +2884,7 @@ void typecheck_local_variable_declaration(
 
     if (decl->init) {
         typecheck_expression(decl->init,symbols);
-        convert_to(&decl->init,decl->var_type);
+        convert_by_assignment(&decl->init,decl->var_type);
     }
 }
 
@@ -2782,7 +2922,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
     switch(stmt->type) {
         case STMT_RETURN:
             typecheck_expression(stmt->exp,symbols);
-            convert_to(&stmt->exp,current_return_type);
+            convert_by_assignment(&stmt->exp,current_return_type);
             return;
 
         case STMT_EXPRESSION:
@@ -2868,7 +3008,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
                 stmt->switch_stmt.control,
                 symbols
             );
-            if (is_double(stmt->switch_stmt.control->exp_type)) {
+            if (!is_integer_type(stmt->switch_stmt.control->exp_type)) {
                 fprintf(stderr,"Type Error: switch controlling expression must be an integer\n");
                 exit(1);
             }
@@ -2883,7 +3023,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
                 stmt->case_stmt.value_exp,
                 symbols
             );
-            if (is_double(stmt->case_stmt.value_exp->exp_type)) {
+            if (!is_integer_type(stmt->case_stmt.value_exp->exp_type)) {
                 fprintf(stderr,"Type Error: case label must be an integer\n");
                 exit(1);
             }
@@ -3238,19 +3378,11 @@ void resolve_expression(Exp *e,IdentifierMap *map){
             break;
 
         case EXP_COMPOUND_ASSIGN:
-            if (e->compound.lvalue->type!=EXP_VAR){
-                fprintf(stderr, "Semantic Error: Invalid lvalue in compound assignment\n");
-                exit(1);
-            }
             resolve_expression(e->compound.lvalue,map);
             resolve_expression(e->compound.rvalue,map);
             break;
         case EXP_PREFIX_OP:
         case EXP_POSTFIX_OP:
-            if (e->inc_dec.lvalue->type!=EXP_VAR){
-                fprintf(stderr, "Semantic Error: Invalid lvalue in increment/decrement\n");
-                exit(1);
-            }
             resolve_expression(e->inc_dec.lvalue, map);
             break;
         case EXP_VAR: {
@@ -3285,11 +3417,6 @@ void resolve_expression(Exp *e,IdentifierMap *map){
         }
 
         case EXP_ASSIGN:
-            //lvalue check
-            if (e->assign.lvalue->type!=EXP_VAR){
-                fprintf(stderr, "Semantic Error: Invalid lvalue in assignment\n");
-                exit(1);
-            }
             resolve_expression(e->assign.lvalue,map);
             resolve_expression(e->assign.rvalue,map);
             break;
@@ -3301,6 +3428,14 @@ void resolve_expression(Exp *e,IdentifierMap *map){
         case EXP_BINARY:
             resolve_expression(e->binary.left,map);
             resolve_expression(e->binary.right,map);
+            break;
+
+        case EXP_DEREFERENCE:
+            resolve_expression(e->deref.exp,map);
+            break;
+
+        case EXP_ADDR_OF:
+            resolve_expression(e->addr_of.exp,map);
             break;
     }
 }
