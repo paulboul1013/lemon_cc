@@ -409,6 +409,8 @@ reg     += BP
 - **賦值的值**：§7.3 的 `PlainOperand(obj)` 回傳變數本身，但這樣 `(y = x) + bump(&y)` 會讀到 `bump` 改過的值。lemon_cc 改成回傳存入的值：右邊是變數時先 `Copy` 到暫存變數，代價是 `a = b;` 會多一次 `Copy`。全域變數從第 10 章就有這個問題（`(g = x) + set_g()`）。
 - **Static 初始值**：先套 `convert_by_assignment` 再折疊，所以除了 `= 0`，`= (int *)8` 也合法（gcc 同樣接受）；`= 10`、`= 0.0`、`= &a` 都是錯誤。
 - **指標的 `+`、`-`、`<`、`>`、`+=`、`++`**：第 15 章之前一律是 type error。
+- **Abstract declarator**：§5.5 的獨立結構和 `process_abstract_declarator` 併進 `parse_declarator(int abstract)`，型別由 `process_declarator(...).type` 取得。
+- **`push` XMM 的 fix-up**：§8.4 的規則沒有實作，因為目前不會產生這種指令；Part III 做暫存器分配時要補上。
 
 **Extra credit 測試**（本章 `--extra-credit`）主要測：指標不能做位元運算、不能 `%=`/`*=`/`/=`、不能 `switch`；`*p` 可以做位元運算、compound 賦值和 `++`/`--`；`&label`、`*label` 是錯誤。
 

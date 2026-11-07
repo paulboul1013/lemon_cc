@@ -17,7 +17,7 @@ _Avoid_: 左值的值、可賦值的東西
 
 **Referenced type**:
 指標指向的型別，例如 `int *` 的 referenced type 是 `int`。
-_Avoid_: base type（那是 specifier 決定的型別）
+_Avoid_: 把它叫 basic type（basic type 是 specifier 決定的型別）
 
 **Null pointer constant**:
 值為 0 的整數常數字面值，例如 `0`、`0ul`。`0.0`、`10 - 10`、`(long)0` 都不算。
@@ -27,7 +27,6 @@ _Avoid_: null 指標（null 指標是值，這個詞指的是原始碼裡的常�
 
 **Basic type**:
 宣告中由 specifiers 決定的型別，還沒套用任何 declarator 推導。
-_Avoid_: base type
 
 **Declarator**:
 宣告裡 specifiers 以外的部分：要宣告的名字，加上要套用在 basic type 上的型別推導。

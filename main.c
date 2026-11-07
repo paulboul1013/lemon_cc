@@ -1436,20 +1436,20 @@ Statement *parse_block(){
 Grammar order is the reverse of type-derivation order, so a declarator is
 parsed into this tree first and turned into a type by process_declarator.
 */
-typedef enum {DTOR_IDENT,DTOR_POINTER,DTOR_FUN} DtorKind;
+typedef enum {DECLARATOR_IDENT,DECLARATOR_POINTER,DECLARATOR_FUN} DeclaratorKind;
 
 typedef struct Declarator Declarator;
 
 typedef struct {
     Type *base;
-    Declarator *d;
+    Declarator *declarator;
 } ParamInfo;
 
 struct Declarator {
-    DtorKind kind;
-    char *name; //DTOR_IDENT; NULL at the bottom of an abstract declarator
-    Declarator *inner; //DTOR_POINTER, DTOR_FUN
-    ParamInfo *params; //DTOR_FUN
+    DeclaratorKind kind;
+    char *name; //DECLARATOR_IDENT; NULL at the bottom of an abstract declarator
+    Declarator *inner; //DECLARATOR_POINTER, DECLARATOR_FUN
+    ParamInfo *params; //DECLARATOR_FUN
     int param_count;
 };
 
@@ -1459,7 +1459,7 @@ typedef struct {
     char **param_names;
 } DeclInfo;
 
-static Declarator *make_declarator(DtorKind kind,Declarator *inner){
+static Declarator *make_declarator(DeclaratorKind kind,Declarator *inner){
     Declarator *d=calloc(1,sizeof(Declarator));
     d->kind=kind;
     d->inner=inner;
@@ -1478,7 +1478,7 @@ ParamInfo *parse_param_list(int *count);
 Declarator *parse_declarator(int abstract){
     if (peek().type==TOK_MULT){
         take();
-        return make_declarator(DTOR_POINTER,parse_declarator(abstract));
+        return make_declarator(DECLARATOR_POINTER,parse_declarator(abstract));
     }
 
     Declarator *d;
@@ -1491,20 +1491,20 @@ Declarator *parse_declarator(int abstract){
         d=parse_declarator(abstract);
         expect(TOK_RPAREN);
     }else if (abstract){
-        d=make_declarator(DTOR_IDENT,NULL);
+        d=make_declarator(DECLARATOR_IDENT,NULL);
     }else{
         Token id=take();
         if (id.type!=TOK_IDENTIFIER){
             fprintf(stderr,"Parse Error: expected identifier in declarator\n");
             exit(1);
         }
-        d=make_declarator(DTOR_IDENT,NULL);
+        d=make_declarator(DECLARATOR_IDENT,NULL);
         d->name=strdup(id.value);
     }
 
     if (!abstract && peek().type==TOK_LPAREN){
         take();
-        Declarator *fun=make_declarator(DTOR_FUN,d);
+        Declarator *fun=make_declarator(DECLARATOR_FUN,d);
         fun->params=parse_param_list(&fun->param_count);
         expect(TOK_RPAREN);
         return fun;
@@ -1532,7 +1532,7 @@ ParamInfo *parse_param_list(int *count) {
     while (1) {
         params=realloc(params,sizeof(ParamInfo) * (*count+1));
         params[*count].base=parse_type_specifiers();
-        params[*count].d=parse_declarator(0);
+        params[*count].declarator=parse_declarator(0);
         (*count)++;
 
         if (peek().type!=TOK_COMMA) {
@@ -1544,11 +1544,11 @@ ParamInfo *parse_param_list(int *count) {
 
 DeclInfo process_declarator(Declarator *d,Type *base){
     switch (d->kind){
-        case DTOR_POINTER:
+        case DECLARATOR_POINTER:
             return process_declarator(d->inner,make_pointer_type(base));
 
-        case DTOR_FUN: {
-            if (d->inner->kind!=DTOR_IDENT){
+        case DECLARATOR_FUN: {
+            if (d->inner->kind!=DECLARATOR_IDENT){
                 fprintf(stderr,"Parse Error: function pointers and functions returning functions are not supported\n");
                 exit(1);
             }
@@ -1557,7 +1557,7 @@ DeclInfo process_declarator(Declarator *d,Type *base){
             char **names=d->param_count ? calloc(d->param_count,sizeof(char*)) : NULL;
 
             for (int i=0;i<d->param_count;i++){
-                DeclInfo param=process_declarator(d->params[i].d,d->params[i].base);
+                DeclInfo param=process_declarator(d->params[i].declarator,d->params[i].base);
                 if (param.type->kind==TYPE_FUNCTION){
                     fprintf(stderr,"Parse Error: function-typed parameter '%s' is not supported\n",param.name);
                     exit(1);
@@ -1569,7 +1569,7 @@ DeclInfo process_declarator(Declarator *d,Type *base){
             return (DeclInfo){d->inner->name,make_function_type(types,d->param_count,base),names};
         }
 
-        case DTOR_IDENT:
+        case DECLARATOR_IDENT:
             break;
     }
     return (DeclInfo){d->name,base,NULL};
