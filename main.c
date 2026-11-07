@@ -690,7 +690,8 @@ typedef enum {
     AS_JMP, // jmp
     AS_JMP_CC, // setCC
     AS_SET_CC, // label:
-    AS_LABEL
+    AS_LABEL,
+    AS_LEA // load effective address
 } AsmInstType;
 
 
@@ -842,7 +843,10 @@ typedef enum {
     TACKY_INST_JZ,
     TACKY_INST_JNZ,
     TACKY_INST_LABEL,
-    TACKY_INST_FUN_CALL
+    TACKY_INST_FUN_CALL,
+    TACKY_INST_LOAD, // dst = *src
+    TACKY_INST_STORE, // *dst = src
+    TACKY_INST_GET_ADDRESS // dst = &src
 } TackyInstType;
 
 typedef struct TackyInstruction{
@@ -4688,6 +4692,21 @@ static void convert_tacky_instruction(
         case TACKY_INST_DOUBLE_TO_UINT:
             convert_double_to_uint(curr,head,symbols);
             break;
+
+        //AX holds the pointer: fix-up rewrites these moves with R10, R11 and XMM14
+        case TACKY_INST_LOAD:
+            append_asm(head,AS_MOV,ASM_QUADWORD,0,0,convert_tacky_val(curr->src),as_reg(REG_AX),NULL);
+            append_asm(head,AS_MOV,tacky_val_asm_type(curr->dst,symbols),0,0,as_memory(REG_AX,0),convert_tacky_val(curr->dst),NULL);
+            break;
+
+        case TACKY_INST_STORE:
+            append_asm(head,AS_MOV,ASM_QUADWORD,0,0,convert_tacky_val(curr->dst),as_reg(REG_AX),NULL);
+            append_asm(head,AS_MOV,tacky_val_asm_type(curr->src,symbols),0,0,convert_tacky_val(curr->src),as_memory(REG_AX,0),NULL);
+            break;
+
+        case TACKY_INST_GET_ADDRESS:
+            append_asm(head,AS_LEA,ASM_QUADWORD,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+            break;
     }
 }
 
@@ -5121,6 +5140,16 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
             }
             break;
 
+        case AS_LEA:
+            if (inst->dst.type!=AS_REG){
+                AsmOperand dst=inst->dst;
+                push_inst(tail,make_asm(AS_LEA,ASM_QUADWORD,0,0,inst->src,as_reg(REG_R11),NULL));
+                inst->type=AS_MOV;
+                inst->src=as_reg(REG_R11);
+                inst->dst=dst;
+            }
+            break;
+
         case AS_PUSH:
             if (is_large_imm(inst->src)){
                 push_inst(tail,make_asm(AS_MOV,ASM_QUADWORD,0,0,inst->src,as_reg(REG_R10),NULL));
@@ -5240,6 +5269,42 @@ static TackyVal *emit_tacky_cast(
     return dst;
 }
 
+//val is the variable itself, or the pointer value when is_deref
+typedef struct {
+    TackyVal *val;
+    int is_deref;
+} TackyLvalue;
+
+TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list);
+
+TackyLvalue gen_tacky_lvalue(Exp *e,TackyInstruction **inst_list){
+    if (e->type==EXP_DEREFERENCE){
+        return (TackyLvalue){gen_tacky_exp(e->deref.exp,inst_list),1};
+    }
+    return (TackyLvalue){tacky_val_var(e->var_name),0};
+}
+
+TackyVal *emit_lvalue_load(TackyLvalue lv,Type *t,TackyInstruction **inst_list){
+    if (!lv.is_deref){
+        return lv.val;
+    }
+
+    TackyVal *dst=make_tacky_variable(t);
+    emit_tacky_conversion(inst_list,TACKY_INST_LOAD,lv.val,dst);
+    return dst;
+}
+
+//returns the value of the assignment expression
+TackyVal *emit_lvalue_store(TackyLvalue lv,TackyVal *v,TackyInstruction **inst_list){
+    if (lv.is_deref){
+        emit_tacky_conversion(inst_list,TACKY_INST_STORE,v,lv.val);
+        return v;
+    }
+
+    emit_tacky_conversion(inst_list,TACKY_INST_COPY,v,lv.val);
+    return lv.val;
+}
+
 // Generate TACKY IR for <expression>
 //
 // Handles:
@@ -5347,12 +5412,13 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
 
     }
     else if (e->type==EXP_COMPOUND_ASSIGN){
+        TackyLvalue lv=gen_tacky_lvalue(e->compound.lvalue,inst_list);
         TackyVal *rhs_val=gen_tacky_exp(e->compound.rvalue,inst_list);
-        TackyVal *lhs_val=tacky_val_var(e->compound.lvalue->var_name);
 
         //the type checker converted the rvalue to the type the operation runs in
         Type *lhs_type=e->compound.lvalue->exp_type;
         Type *op_type=e->compound.rvalue->exp_type;
+        TackyVal *lhs_val=emit_lvalue_load(lv,lhs_type,inst_list);
 
         //calculate a+b
         TackyVal *tmp=make_tacky_variable(op_type);
@@ -5365,18 +5431,13 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         append_tacky_inst(inst_list,bin);
 
         //store resultd into a
-        TackyInstruction *cp=calloc(1,sizeof(TackyInstruction));
-        cp->type=TACKY_INST_COPY;
-        cp->src=emit_tacky_cast(inst_list,tmp,op_type,lhs_type);
-        cp->dst=lhs_val;
-        append_tacky_inst(inst_list,cp);
-        
-        return lhs_val;
+        return emit_lvalue_store(lv,emit_tacky_cast(inst_list,tmp,op_type,lhs_type),inst_list);
     }
     //  ++ / --
     else if (e->type==EXP_PREFIX_OP || e->type==EXP_POSTFIX_OP){
-        TackyVal *lhs_val=tacky_val_var(e->inc_dec.lvalue->var_name);
+        TackyLvalue lv=gen_tacky_lvalue(e->inc_dec.lvalue,inst_list);
         Type *lhs_type=e->inc_dec.lvalue->exp_type;
+        TackyVal *lhs_val=emit_lvalue_load(lv,lhs_type,inst_list);
         TackyVal *one_val=tacky_val_constant(make_const(lhs_type,1));
         BinaryOpType op=e->inc_dec.is_increment ? BINARY_ADD :BINARY_SUB;
 
@@ -5403,11 +5464,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         append_tacky_inst(inst_list,bin);
 
         //soter new value to a
-        TackyInstruction *cp=calloc(1,sizeof(TackyInstruction));
-        cp->type=TACKY_INST_COPY;
-        cp->src=tmp;
-        cp->dst=lhs_val;
-        append_tacky_inst(inst_list,cp);
+        emit_lvalue_store(lv,tmp,inst_list);
 
         return (e->type==EXP_POSTFIX_OP) ? old_val : tmp;
     }
@@ -5415,19 +5472,25 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         return tacky_val_var(e->var_name);
     }
     else if (e->type==EXP_ASSIGN){
+        TackyLvalue lv=gen_tacky_lvalue(e->assign.lvalue,inst_list);
         //calculate right side value
         TackyVal *rhs_val=gen_tacky_exp(e->assign.rvalue,inst_list);
-        //left side must be variable (already pass semantic anaylsis)
-        TackyVal *lhs_val=tacky_val_var(e->assign.lvalue->var_name);
 
-        TackyInstruction *inst=calloc(1,sizeof(TackyInstruction));
-        inst->type=TACKY_INST_COPY;
-        inst->src=rhs_val;
-        inst->dst=lhs_val;
-        inst->next=NULL;
-        append_tacky_inst(inst_list,inst);
-        
-        return lhs_val;
+        return emit_lvalue_store(lv,rhs_val,inst_list);
+    }
+    else if (e->type==EXP_DEREFERENCE){
+        return emit_lvalue_load(gen_tacky_lvalue(e,inst_list),e->exp_type,inst_list);
+    }
+    else if (e->type==EXP_ADDR_OF){
+        TackyLvalue lv=gen_tacky_lvalue(e->addr_of.exp,inst_list);
+        //&*p is p: neither operator is evaluated
+        if (lv.is_deref){
+            return lv.val;
+        }
+
+        TackyVal *dst=make_tacky_variable(e->exp_type);
+        emit_tacky_conversion(inst_list,TACKY_INST_GET_ADDRESS,lv.val,dst);
+        return dst;
     }
     else if (e->type==EXP_UNARY){
         //deal with inner expression first,get sorce operator
@@ -6396,6 +6459,14 @@ static void emit_instruction(
 
         case AS_LABEL:
             fprintf(out,".L%s:\n",curr->label);
+            break;
+
+        case AS_LEA:
+            fprintf(out,"    leaq    ");
+            emit_op(curr->src,ASM_QUADWORD,out);
+            fprintf(out,", ");
+            emit_op(curr->dst,ASM_QUADWORD,out);
+            fprintf(out,"\n");
             break;
     }
 }
