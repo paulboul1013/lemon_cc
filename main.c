@@ -89,6 +89,7 @@ typedef enum {
     TYPE_UINT,
     TYPE_ULONG,
     TYPE_DOUBLE,
+    TYPE_POINTER,
     TYPE_FUNCTION
 } TypeKind;
 
@@ -97,35 +98,36 @@ typedef struct Type {
     struct Type **params; //for TYPE_FUNCTION
     int param_count;
     struct Type *ret;
+    struct Type *referenced; //for TYPE_POINTER
 } Type;
 
 Type *type_int(void){
-    static Type t={TYPE_INT,NULL,0,NULL};
+    static Type t={.kind=TYPE_INT};
     return &t;
 }
 
 Type *type_long(void){
-    static Type t={TYPE_LONG,NULL,0,NULL};
+    static Type t={.kind=TYPE_LONG};
     return &t;
 }
 
 Type *type_uint(void){
-    static Type t={TYPE_UINT,NULL,0,NULL};
+    static Type t={.kind=TYPE_UINT};
     return &t;
 }
 
 Type *type_ulong(void){
-    static Type t={TYPE_ULONG,NULL,0,NULL};
+    static Type t={.kind=TYPE_ULONG};
     return &t;
 }
 
 Type *type_double(void){
-    static Type t={TYPE_DOUBLE,NULL,0,NULL};
+    static Type t={.kind=TYPE_DOUBLE};
     return &t;
 }
 
 int type_size(Type *t){
-    return (t->kind==TYPE_LONG || t->kind==TYPE_ULONG || t->kind==TYPE_DOUBLE) ? 8 : 4;
+    return (t->kind==TYPE_LONG || t->kind==TYPE_ULONG || t->kind==TYPE_DOUBLE || t->kind==TYPE_POINTER) ? 8 : 4;
 }
 
 int type_is_signed(Type *t){
@@ -150,8 +152,16 @@ Type *make_function_type(Type **params,int param_count,Type *ret){
     return t;
 }
 
+Type *make_pointer_type(Type *referenced){
+    Type *t=calloc(1,sizeof(Type));
+    t->kind=TYPE_POINTER;
+    t->referenced=referenced;
+    return t;
+}
+
 int type_equal(Type *a,Type *b){
     if (a->kind!=b->kind) return 0;
+    if (a->kind==TYPE_POINTER) return type_equal(a->referenced,b->referenced);
     if (a->kind!=TYPE_FUNCTION) return 1;
 
     if (a->param_count!=b->param_count) return 0;
@@ -893,7 +903,8 @@ Const convert_const(Const c,Type *t){
     switch (t->kind){
         case TYPE_LONG: r.type=CONST_LONG; break;
         case TYPE_UINT: r.type=CONST_UINT; break;
-        case TYPE_ULONG: r.type=CONST_ULONG; break;
+        case TYPE_ULONG:
+        case TYPE_POINTER: r.type=CONST_ULONG; break;
         case TYPE_DOUBLE: r.type=CONST_DOUBLE; break;
         default: r.type=CONST_INT; break;
     }
@@ -1393,16 +1404,95 @@ Statement *parse_block(){
     return s;
 }
 
-char **parse_param_list(int *out_count,Type ***out_types) {
-    char **params=NULL;
-    Type **types=NULL;
-    int count=0;
+/*
+Grammar order is the reverse of type-derivation order, so a declarator is
+parsed into this tree first and turned into a type by process_declarator.
+*/
+typedef enum {DTOR_IDENT,DTOR_POINTER,DTOR_FUN} DtorKind;
 
-    *out_types=NULL;
+typedef struct Declarator Declarator;
+
+typedef struct {
+    Type *base;
+    Declarator *d;
+} ParamInfo;
+
+struct Declarator {
+    DtorKind kind;
+    char *name; //DTOR_IDENT; NULL at the bottom of an abstract declarator
+    Declarator *inner; //DTOR_POINTER, DTOR_FUN
+    ParamInfo *params; //DTOR_FUN
+    int param_count;
+};
+
+typedef struct {
+    char *name;
+    Type *type;
+    char **param_names;
+} DeclInfo;
+
+static Declarator *make_declarator(DtorKind kind,Declarator *inner){
+    Declarator *d=calloc(1,sizeof(Declarator));
+    d->kind=kind;
+    d->inner=inner;
+    return d;
+}
+
+ParamInfo *parse_param_list(int *count);
+
+// <declarator>        ::= "*" <declarator> | <direct-declarator>
+// <direct-declarator> ::= <simple-declarator> [ <param-list> ]
+// <simple-declarator> ::= <identifier> | "(" <declarator> ")"
+//
+// abstract: no identifier allowed, no function suffix
+// <abstract-declarator>        ::= "*" [ <abstract-declarator> ] | <direct-abstract-declarator>
+// <direct-abstract-declarator> ::= "(" <abstract-declarator> ")"
+Declarator *parse_declarator(int abstract){
+    if (peek().type==TOK_MULT){
+        take();
+        return make_declarator(DTOR_POINTER,parse_declarator(abstract));
+    }
+
+    Declarator *d;
+    if (peek().type==TOK_LPAREN){
+        take();
+        if (abstract && peek().type!=TOK_MULT && peek().type!=TOK_LPAREN){
+            fprintf(stderr,"Parse Error: malformed abstract declarator\n");
+            exit(1);
+        }
+        d=parse_declarator(abstract);
+        expect(TOK_RPAREN);
+    }else if (abstract){
+        d=make_declarator(DTOR_IDENT,NULL);
+    }else{
+        Token id=take();
+        if (id.type!=TOK_IDENTIFIER){
+            fprintf(stderr,"Parse Error: expected identifier in declarator\n");
+            exit(1);
+        }
+        d=make_declarator(DTOR_IDENT,NULL);
+        d->name=strdup(id.value);
+    }
+
+    if (!abstract && peek().type==TOK_LPAREN){
+        take();
+        Declarator *fun=make_declarator(DTOR_FUN,d);
+        fun->params=parse_param_list(&fun->param_count);
+        expect(TOK_RPAREN);
+        return fun;
+    }
+
+    return d;
+}
+
+// <param-list> without its parentheses: "void" | <param> { "," <param> }
+// <param> ::= { <type-specifier> }+ <declarator>
+ParamInfo *parse_param_list(int *count) {
+    ParamInfo *params=NULL;
+    *count=0;
 
     if (peek().type == TOK_VOID) {
         take();
-        *out_count=0;
         return NULL;
     }
 
@@ -1412,30 +1502,49 @@ char **parse_param_list(int *out_count,Type ***out_types) {
     }
 
     while (1) {
-        Type *param_type=parse_type_specifiers();
+        params=realloc(params,sizeof(ParamInfo) * (*count+1));
+        params[*count].base=parse_type_specifiers();
+        params[*count].d=parse_declarator(0);
+        (*count)++;
 
-        Token id = take();
-        if (id.type!=TOK_IDENTIFIER) {
-            fprintf(stderr, "Parse Error: expected parameter name\n");
-            exit(1);
+        if (peek().type!=TOK_COMMA) {
+            return params;
         }
-
-        params=realloc(params,sizeof(char*) * (count+1));
-        types=realloc(types,sizeof(Type*) * (count+1));
-        types[count]=param_type;
-        params[count++]=strdup(id.value);
-
-        if (peek().type==TOK_COMMA) {
-            take();
-            continue;
-        }
-
-        break;
+        take();
     }
+}
 
-    *out_count=count;
-    *out_types=types;
-    return params;
+DeclInfo process_declarator(Declarator *d,Type *base){
+    switch (d->kind){
+        case DTOR_POINTER:
+            return process_declarator(d->inner,make_pointer_type(base));
+
+        case DTOR_FUN: {
+            if (d->inner->kind!=DTOR_IDENT){
+                fprintf(stderr,"Parse Error: function pointers and functions returning functions are not supported\n");
+                exit(1);
+            }
+
+            Type **types=d->param_count ? calloc(d->param_count,sizeof(Type*)) : NULL;
+            char **names=d->param_count ? calloc(d->param_count,sizeof(char*)) : NULL;
+
+            for (int i=0;i<d->param_count;i++){
+                DeclInfo param=process_declarator(d->params[i].d,d->params[i].base);
+                if (param.type->kind==TYPE_FUNCTION){
+                    fprintf(stderr,"Parse Error: function-typed parameter '%s' is not supported\n",param.name);
+                    exit(1);
+                }
+                types[i]=param.type;
+                names[i]=param.name;
+            }
+
+            return (DeclInfo){d->inner->name,make_function_type(types,d->param_count,base),names};
+        }
+
+        case DTOR_IDENT:
+            break;
+    }
+    return (DeclInfo){d->name,base,NULL};
 }
 
 Exp *parse_optional_exp(TokenType end_token){
@@ -1725,10 +1834,11 @@ Exp *parse_factor(){
         take();
         return make_constant_exp(parse_constant(t));
     }
-    // "(" { <type-specifier> }+ ")" <factor>
+    // "(" { <type-specifier> }+ [ <abstract-declarator> ] ")" <factor>
     else if (t.type==TOK_LPAREN && is_type_specifier(token_list[token_pos+1].type)){
         take();
-        Type *target_type=parse_type_specifiers();
+        Type *base=parse_type_specifiers();
+        Type *target_type=process_declarator(parse_declarator(1),base).type;
         expect(TOK_RPAREN);
         return make_cast_exp(target_type,parse_factor());
     }
@@ -1987,27 +2097,16 @@ ParsedSpecifiers parse_type_and_storage_class(){
     return result;
 }
 
-Function *parse_function_after_name(
-    const char *name,
-    Type *ret_type,
-    StorageClass storage_class
-){
-    expect(TOK_LPAREN);
-
-    int param_count=0;
-    Type **param_types=NULL;
-    char **params=parse_param_list(&param_count,&param_types);
-
-    expect(TOK_RPAREN);
-
+// the declarator is already consumed; only ';' or the body remain
+Function *parse_function_rest(DeclInfo info,StorageClass storage_class){
     Function *f=calloc(1,sizeof(Function));
-    f->name=strdup(name);
-    f->params=params;
-    f->param_count=param_count;
+    f->name=strdup(info.name);
+    f->params=info.param_names;
+    f->param_count=info.type->param_count;
     f->body=NULL;
     f->body_count=0;
     f->has_body=0;
-    f->fun_type=make_function_type(param_types,param_count,ret_type);
+    f->fun_type=info.type;
     f->storage_class=storage_class;
 
     if (peek().type==TOK_SEMICOLON){
@@ -2046,27 +2145,19 @@ Function *parse_function_after_name(
 Declaration *parse_declaration(){
     ParsedSpecifiers specs=parse_type_and_storage_class();
 
-    Token id=take();
-    if (id.type!=TOK_IDENTIFIER){
-        fprintf(stderr,"Parse Error: expected identifier in declaration\n");
-        exit(1);
-    }
+    DeclInfo info=process_declarator(parse_declarator(0),specs.type);
 
     Declaration *decl=calloc(1,sizeof(Declaration));
 
-    if (peek().type==TOK_LPAREN){
+    if (info.type->kind==TYPE_FUNCTION){
         decl->type=DECL_FUN;
-        decl->fun=parse_function_after_name(
-            id.value,
-            specs.type,
-            specs.storage_class
-        );
+        decl->fun=parse_function_rest(info,specs.storage_class);
         return decl;
     }
 
     VariableDeclaration *var=calloc(1,sizeof(VariableDeclaration));
-    var->name=strdup(id.value);
-    var->var_type=specs.type;
+    var->name=strdup(info.name);
+    var->var_type=info.type;
     var->storage_class=specs.storage_class;
 
     if (peek().type==TOK_ASSIGN){
