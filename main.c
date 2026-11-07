@@ -5294,13 +5294,8 @@ TackyVal *emit_lvalue_load(TackyLvalue lv,Type *t,TackyInstruction **inst_list){
 
 //returns the value of the assignment expression
 TackyVal *emit_lvalue_store(TackyLvalue lv,TackyVal *v,TackyInstruction **inst_list){
-    if (lv.is_deref){
-        emit_tacky_src_dst(inst_list,TACKY_INST_STORE,v,lv.val);
-        return v;
-    }
-
-    emit_tacky_src_dst(inst_list,TACKY_INST_COPY,v,lv.val);
-    return lv.val;
+    emit_tacky_src_dst(inst_list,lv.is_deref ? TACKY_INST_STORE : TACKY_INST_COPY,v,lv.val);
+    return v;
 }
 
 // Generate TACKY IR for <expression>
@@ -5475,8 +5470,8 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         //calculate right side value
         TackyVal *rhs_val=gen_tacky_exp(e->assign.rvalue,inst_list);
 
-        //the store returns its source as the value, and a later call may change a source variable
-        if (lv.is_deref && rhs_val->type==TACKY_VAL_VAR){
+        //the value is what was stored, and a later call may change a source variable
+        if (rhs_val->type==TACKY_VAL_VAR){
             TackyVal *stored=make_tacky_variable(e->exp_type);
             emit_tacky_src_dst(inst_list,TACKY_INST_COPY,rhs_val,stored);
             rhs_val=stored;
