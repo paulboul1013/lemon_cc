@@ -28,4 +28,5 @@ make
 | 第十一章 | [Long Integers](docs/ch11-long-integers.md) |
 | 第十二章 | [Unsigned Integers](docs/ch12-unsigned-integers.md) |
 | 第十三章 | [Floating-Point Numbers](docs/ch13-floating-point-numbers.md) |
+| 第十四章 | [Pointers](docs/ch14-pointers.md) |
 | 附錄 A | [Debugging Assembly Code with GDB or LLDB](docs/appA-debugging-with-gdb-lldb.md) |
