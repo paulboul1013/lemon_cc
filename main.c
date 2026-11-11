@@ -25,7 +25,7 @@ typedef  enum{
 
     TOK_IDENTIFIER, TOK_CONSTANT, TOK_LONG_CONSTANT,
     TOK_UNSIGNED_CONSTANT, TOK_UNSIGNED_LONG_CONSTANT, TOK_DOUBLE_CONSTANT,
-    TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
+    TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE, TOK_LBRACKET, TOK_RBRACKET,
     TOK_SEMICOLON, 
     TOK_COMMA,
     
@@ -90,6 +90,7 @@ typedef enum {
     TYPE_ULONG,
     TYPE_DOUBLE,
     TYPE_POINTER,
+    TYPE_ARRAY,
     TYPE_FUNCTION
 } TypeKind;
 
@@ -98,7 +99,8 @@ typedef struct Type {
     struct Type **params; //for TYPE_FUNCTION
     int param_count;
     struct Type *ret;
-    struct Type *referenced; //for TYPE_POINTER
+    struct Type *referenced; //pointer referenced type or array element
+    unsigned long count; //TYPE_ARRAY
 } Type;
 
 Type *type_int(void){
@@ -127,6 +129,14 @@ Type *type_double(void){
 }
 
 int type_size(Type *t){
+    if (t->kind==TYPE_ARRAY){
+        int element_size=type_size(t->referenced);
+        if (t->count<=0 || t->count>(unsigned long)(INT_MAX/element_size)){
+            fprintf(stderr,"Type Error: array object is too large\n");
+            exit(1);
+        }
+        return (int)t->count*element_size;
+    }
     return (t->kind==TYPE_LONG || t->kind==TYPE_ULONG || t->kind==TYPE_DOUBLE || t->kind==TYPE_POINTER) ? 8 : 4;
 }
 
@@ -159,8 +169,15 @@ Type *make_pointer_type(Type *referenced){
     return t;
 }
 
+Type *make_array_type(Type *element,unsigned long count){
+    Type *t=calloc(1,sizeof(Type));
+    t->kind=TYPE_ARRAY; t->referenced=element; t->count=count;
+    return t;
+}
+
 int type_equal(Type *a,Type *b){
     if (a->kind!=b->kind) return 0;
+    if (a->kind==TYPE_ARRAY) return a->count==b->count && type_equal(a->referenced,b->referenced);
     if (a->kind==TYPE_POINTER) return type_equal(a->referenced,b->referenced);
     if (a->kind!=TYPE_FUNCTION) return 1;
 
@@ -203,7 +220,8 @@ typedef enum {
     INIT_LONG,
     INIT_UINT,
     INIT_ULONG,
-    INIT_DOUBLE
+    INIT_DOUBLE,
+    INIT_ZERO
 } StaticInitType;
 
 typedef struct {
@@ -213,6 +231,8 @@ typedef struct {
         double dvalue; //INIT_DOUBLE
     };
 } StaticInit;
+
+typedef struct { StaticInit *items; int count; } StaticInitList;
 
 typedef enum {
     EXP_CONSTANT,
@@ -228,6 +248,7 @@ typedef enum {
     EXP_FUNCTION_CALL,
     EXP_DEREFERENCE, // *e
     EXP_ADDR_OF, // &e
+    EXP_SUBSCRIPT,
 }ExpType;
 
 typedef enum {
@@ -296,6 +317,8 @@ typedef struct Exp {
             int arg_count;
         } function_call;
 
+        struct { struct Exp *left,*right; } subscript;
+
         struct { //for EXP_DEREFERENCE
             struct Exp *exp;
         } deref;
@@ -305,6 +328,14 @@ typedef struct Exp {
         } addr_of;
     };
 } Exp;
+
+typedef struct Initializer {
+    int compound;
+    Type *type;
+    Exp *exp;
+    struct Initializer **items;
+    int count;
+} Initializer;
 
 // for save lexer make all tokens
 Token * token_list=NULL;
@@ -341,7 +372,7 @@ typedef enum {
 
 typedef struct {
     char *name;
-    Exp *init; //optional
+    Initializer *init; //optional
     Type *var_type;
     StorageClass storage_class;
 } VariableDeclaration;
@@ -699,7 +730,9 @@ typedef enum {
 typedef enum {
     AS_IMM, //immediate value
     AS_REG, // register
-    AS_PSEUDO, //virtual register (tmp.0)
+    AS_PSEUDO,
+    AS_PSEUDO_MEM,
+    AS_INDEXED, //virtual register (tmp.0)
     AS_MEMORY, // base register plus offset: -4(%rbp), 16(%rbp), (%rax)
     AS_DATA // static storage, foo(%rip)
 } AsmOpType;
@@ -735,6 +768,8 @@ typedef struct {
         long imm;
         AsmReg reg;
         char *pseudo;
+        struct { char *name; int offset; } pseudo_mem;
+        struct { AsmReg base,index; int scale; } indexed;
         struct {
             AsmReg base;
             int offset;
@@ -765,7 +800,7 @@ typedef struct {
     char *name;
     int global;
     int alignment;
-    StaticInit init;
+    StaticInitList init;
 } AsmStaticVariable;
 
 //read-only floating-point constant, emitted under a local label
@@ -800,6 +835,7 @@ typedef struct AsmSymbol {
     char *name;
     AsmSymbolKind kind;
     AsmType asm_type; //ObjEntry
+    int byte_size,alignment,is_aggregate;
     int is_static;    //ObjEntry
     int is_constant;  //ObjEntry: a StaticConstant, emitted with a local label
     int defined;      //FunEntry
@@ -846,7 +882,9 @@ typedef enum {
     TACKY_INST_FUN_CALL,
     TACKY_INST_LOAD, // dst = *src
     TACKY_INST_STORE, // *dst = src
-    TACKY_INST_GET_ADDRESS // dst = &src
+    TACKY_INST_GET_ADDRESS, // dst = &src
+    TACKY_INST_ADD_PTR,
+    TACKY_INST_COPY_TO_OFFSET
 } TackyInstType;
 
 typedef struct TackyInstruction{
@@ -856,6 +894,7 @@ typedef struct TackyInstruction{
     TackyVal *src;
     TackyVal *src2;
     TackyVal *dst;
+    int scale,offset;
     char *label_name;
 
     char *fun_name;
@@ -877,7 +916,7 @@ typedef struct {
     char *name;
     int global;
     Type *type;
-    StaticInit init;
+    StaticInitList init;
 } TackyStaticVariable;
 
 typedef enum {
@@ -1137,6 +1176,8 @@ void lex(const char *input){
             case ')': 
                 add_token(TOK_RPAREN,NULL);
                 break;
+            case '[': add_token(TOK_LBRACKET,NULL); break;
+            case ']': add_token(TOK_RBRACKET,NULL); break;
             case '{': 
                 add_token(TOK_LBRACE,NULL);
                 break;
@@ -1319,6 +1360,11 @@ void label_block_items(BlockItem **items,int count,char *current_break_label,cha
 void resolve_file_scope_variable_declaration(VariableDeclaration *decl,IdentifierMap **map);
 void resolve_local_variable_declaration(VariableDeclaration *decl,IdentifierMap **map);
 void resolve_expression(Exp *e,IdentifierMap *map);
+void resolve_initializer(Initializer *init,IdentifierMap *map){
+    if (!init) return;
+    if (!init->compound) resolve_expression(init->exp,map);
+    for (int i=0;i<init->count;i++) resolve_initializer(init->items[i],map);
+}
 
 void expect(TokenType type){
     Token t=take();
@@ -1436,7 +1482,7 @@ Statement *parse_block(){
 Grammar order is the reverse of type-derivation order, so a declarator is
 parsed into this tree first and turned into a type by process_declarator.
 */
-typedef enum {DECLARATOR_IDENT,DECLARATOR_POINTER,DECLARATOR_FUN} DeclaratorKind;
+typedef enum {DECLARATOR_IDENT,DECLARATOR_POINTER,DECLARATOR_FUN,DECLARATOR_ARRAY} DeclaratorKind;
 
 typedef struct Declarator Declarator;
 
@@ -1451,6 +1497,7 @@ struct Declarator {
     Declarator *inner; //DECLARATOR_POINTER, DECLARATOR_FUN
     ParamInfo *params; //DECLARATOR_FUN
     int param_count;
+    unsigned long array_count;
 };
 
 typedef struct {
@@ -1467,6 +1514,7 @@ static Declarator *make_declarator(DeclaratorKind kind,Declarator *inner){
 }
 
 ParamInfo *parse_param_list(int *count);
+Const parse_constant(Token t);
 
 // <declarator>        ::= "*" <declarator> | <direct-declarator>
 // <direct-declarator> ::= <simple-declarator> [ <param-list> ]
@@ -1484,7 +1532,7 @@ Declarator *parse_declarator(int abstract){
     Declarator *d;
     if (peek().type==TOK_LPAREN){
         take();
-        if (abstract && peek().type!=TOK_MULT && peek().type!=TOK_LPAREN){
+        if (abstract && peek().type!=TOK_MULT && peek().type!=TOK_LPAREN && peek().type!=TOK_LBRACKET){
             fprintf(stderr,"Parse Error: malformed abstract declarator\n");
             exit(1);
         }
@@ -1502,12 +1550,26 @@ Declarator *parse_declarator(int abstract){
         d->name=strdup(id.value);
     }
 
-    if (!abstract && peek().type==TOK_LPAREN){
+    int function_suffix=0;
+    while (peek().type==TOK_LBRACKET || (!abstract && peek().type==TOK_LPAREN)){
+        if (peek().type==TOK_LBRACKET){
+            if (function_suffix){ fprintf(stderr,"Parse Error: array suffix after function suffix\n"); exit(1); }
+            take();
+            Token count=take();
+            if (count.type!=TOK_CONSTANT && count.type!=TOK_LONG_CONSTANT && count.type!=TOK_UNSIGNED_CONSTANT && count.type!=TOK_UNSIGNED_LONG_CONSTANT){
+                fprintf(stderr,"Parse Error: array length must be an integer literal\n"); exit(1);
+            }
+            unsigned long n=(unsigned long)parse_constant(count).value;
+            if (!n){ fprintf(stderr,"Parse Error: unsupported array length\n"); exit(1); }
+            expect(TOK_RBRACKET);
+            Declarator *array=make_declarator(DECLARATOR_ARRAY,d);
+            array->array_count=n; d=array; continue;
+        }
         take();
         Declarator *fun=make_declarator(DECLARATOR_FUN,d);
         fun->params=parse_param_list(&fun->param_count);
         expect(TOK_RPAREN);
-        return fun;
+        d=fun; function_suffix=1;
     }
 
     return d;
@@ -1544,6 +1606,9 @@ ParamInfo *parse_param_list(int *count) {
 
 DeclInfo process_declarator(Declarator *d,Type *base){
     switch (d->kind){
+        case DECLARATOR_ARRAY:
+            if (base->kind==TYPE_FUNCTION){ fprintf(stderr,"Type Error: array of functions\n"); exit(1); }
+            return process_declarator(d->inner,make_array_type(base,d->array_count));
         case DECLARATOR_POINTER:
             return process_declarator(d->inner,make_pointer_type(base));
 
@@ -1562,7 +1627,7 @@ DeclInfo process_declarator(Declarator *d,Type *base){
                     fprintf(stderr,"Parse Error: function-typed parameter '%s' is not supported\n",param.name);
                     exit(1);
                 }
-                types[i]=param.type;
+                types[i]=param.type->kind==TYPE_ARRAY ? make_pointer_type(param.type->referenced) : param.type;
                 names[i]=param.name;
             }
 
@@ -1860,7 +1925,7 @@ Exp *parse_factor(){
         t.type==TOK_UNSIGNED_CONSTANT || t.type==TOK_UNSIGNED_LONG_CONSTANT ||
         t.type==TOK_DOUBLE_CONSTANT){
         take();
-        return make_constant_exp(parse_constant(t));
+        inner=make_constant_exp(parse_constant(t));
     }
     // "(" { <type-specifier> }+ [ <abstract-declarator> ] ")" <factor>
     else if (t.type==TOK_LPAREN && is_type_specifier(token_list[token_pos+1].type)){
@@ -1932,7 +1997,13 @@ Exp *parse_factor(){
     //handle postfix ++/--
     // now  IDENTIFIER and LPAREN can continue parse ++ or --
     Token next=peek();
-    while (next.type==TOK_INCREMENT || next.type==TOK_DECREMENT){
+    while (next.type==TOK_INCREMENT || next.type==TOK_DECREMENT || next.type==TOK_LBRACKET){
+        if (next.type==TOK_LBRACKET){
+            take();
+            Exp *sub=calloc(1,sizeof(Exp)); sub->type=EXP_SUBSCRIPT;
+            sub->subscript.left=inner; sub->subscript.right=parse_exp(0);
+            expect(TOK_RBRACKET); inner=sub; next=peek(); continue;
+        }
         take();
         int is_inc=(next.type==TOK_INCREMENT);
         inner = make_inc_dec_exp(EXP_POSTFIX_OP, is_inc, inner);
@@ -2178,6 +2249,19 @@ Function *parse_function_rest(DeclInfo info,StorageClass storage_class){
     return f;
 }
 
+Initializer *parse_initializer(void){
+    Initializer *init=calloc(1,sizeof(Initializer));
+    if (peek().type!=TOK_LBRACE){ init->exp=parse_exp(0); return init; }
+    take(); init->compound=1;
+    do {
+        init->items=realloc(init->items,sizeof(Initializer*)*(init->count+1));
+        init->items[init->count++]=parse_initializer();
+        if (peek().type!=TOK_COMMA) break;
+        take();
+    } while (peek().type!=TOK_RBRACE);
+    expect(TOK_RBRACE); return init;
+}
+
 Declaration *parse_declaration(){
     ParsedSpecifiers specs=parse_type_and_storage_class();
 
@@ -2198,7 +2282,7 @@ Declaration *parse_declaration(){
 
     if (peek().type==TOK_ASSIGN){
         take();
-        var->init=parse_exp(0);
+        var->init=parse_initializer();
     }else{
         var->init=NULL;
     }
@@ -2257,7 +2341,7 @@ typedef enum {
 
 typedef struct {
     InitialValueType type;
-    StaticInit value;
+    StaticInitList value;
 } InitialValue;
 
 typedef struct Symbol {
@@ -2281,6 +2365,15 @@ void typecheck_file_scope_variable_declaration(VariableDeclaration *decl,Symbol 
 void typecheck_local_variable_declaration(VariableDeclaration *decl,Symbol **symbols);
 void typecheck_statement(Statement *stmt,Symbol **symbols);
 void typecheck_expression(Exp *exp,Symbol **symbols);
+void typecheck_and_convert(Exp **slot,Symbol **symbols){
+    if (!*slot) return;
+    typecheck_expression(*slot,symbols);
+    if ((*slot)->exp_type->kind==TYPE_ARRAY){
+        Exp *decay=make_addr_of_exp(*slot);
+        decay->exp_type=make_pointer_type((*slot)->exp_type->referenced);
+        *slot=decay;
+    }
+}
 void typecheck_for_init(ForInit *init,Symbol **symbols);
 static int eval_const_expr(Exp *e,Const *out);
 
@@ -2298,7 +2391,7 @@ Symbol *symbol_find(Symbol *symbols,const char *name) {
     return NULL;
 }
 
-InitialValue make_initial_value(InitialValueType type,StaticInit value) {
+InitialValue make_initial_value(InitialValueType type,StaticInitList value) {
     InitialValue init;
     init.type=type;
     init.value=value;
@@ -2322,11 +2415,6 @@ StaticInit const_to_static_init(Const c,Type *t) {
         init.value=converted.value;
     }
     return init;
-}
-
-StaticInit zero_static_init(Type *t) {
-    Const zero={CONST_INT,{0}};
-    return const_to_static_init(zero,t);
 }
 
 Symbol *symbol_add(Symbol **symbols,const char *name,Type *type) {
@@ -2445,11 +2533,11 @@ static int is_pointer(Type *t) {
 }
 
 static int is_integer_type(Type *t) {
-    return !is_double(t) && !is_pointer(t);
+    return t->kind==TYPE_INT || t->kind==TYPE_UINT || t->kind==TYPE_LONG || t->kind==TYPE_ULONG;
 }
 
 int is_lvalue(Exp *e) {
-    return e->type==EXP_VAR || e->type==EXP_DEREFERENCE;
+    return e->type==EXP_VAR || e->type==EXP_DEREFERENCE || e->type==EXP_SUBSCRIPT;
 }
 
 static void check_lvalue(Exp *e,const char *context) {
@@ -2516,12 +2604,11 @@ void check_binary_operands(BinaryOpType op,Type *left,Type *right) {
     }
 
     if (has_pointer) {
-        if (op==BINARY_MULT || op==BINARY_DIV) {
-            fprintf(stderr,"Type Error: can't multiply or divide a pointer\n");
-        }else{
-            fprintf(stderr,"Type Error: pointer arithmetic and ordering are not supported until chapter 15\n");
-        }
-        exit(1);
+        int valid=0;
+        if (op==BINARY_ADD) valid=(is_pointer(left) && is_integer_type(right)) || (is_integer_type(left) && is_pointer(right));
+        else if (op==BINARY_SUB) valid=(is_pointer(left) && is_integer_type(right)) || (is_pointer(left) && is_pointer(right) && type_equal(left,right));
+        else if (is_comparison_op(op)) valid=is_pointer(left) && is_pointer(right) && type_equal(left,right);
+        if (!valid){ fprintf(stderr,"Type Error: incompatible pointer operands\n"); exit(1); }
     }
 }
 
@@ -2536,7 +2623,8 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             return;
 
         case EXP_CAST:
-            typecheck_expression(exp->cast.exp,symbols);
+            if (exp->cast.target_type->kind==TYPE_ARRAY){ fprintf(stderr,"Type Error: cast to array\n"); exit(1); }
+            typecheck_and_convert(&exp->cast.exp,symbols);
             if ((is_pointer(exp->cast.target_type) && is_double(exp->cast.exp->exp_type)) ||
                 (is_double(exp->cast.target_type) && is_pointer(exp->cast.exp->exp_type))) {
                 fprintf(stderr,"Type Error: can't cast between a pointer and a double\n");
@@ -2601,7 +2689,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             }
 
             for(int i=0;i<exp->function_call.arg_count;i++){
-                typecheck_expression(exp->function_call.args[i],symbols);
+                typecheck_and_convert(&exp->function_call.args[i],symbols);
                 convert_by_assignment(&exp->function_call.args[i],fun_type->params[i]);
             }
 
@@ -2610,7 +2698,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
         }
 
         case EXP_UNARY:
-            typecheck_expression(exp->unary.exp,symbols);
+            typecheck_and_convert(&exp->unary.exp,symbols);
             if (exp->unary.op==UNARY_COMPLEMENT && is_double(exp->unary.exp->exp_type)) {
                 fprintf(stderr,"Type Error: can't take the bitwise complement of a double\n");
                 exit(1);
@@ -2624,12 +2712,20 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
         case EXP_BINARY: {
             BinaryOpType op=exp->binary.op;
-            typecheck_expression(exp->binary.left,symbols);
-            typecheck_expression(exp->binary.right,symbols);
+            typecheck_and_convert(&exp->binary.left,symbols);
+            typecheck_and_convert(&exp->binary.right,symbols);
             check_binary_operands(op,exp->binary.left->exp_type,exp->binary.right->exp_type);
 
             if (op==BINARY_LOGICAL_AND || op==BINARY_LOGICAL_OR) {
                 exp->exp_type=type_int();
+                return;
+            }
+
+            Type *left=exp->binary.left->exp_type,*right=exp->binary.right->exp_type;
+            if ((op==BINARY_ADD || op==BINARY_SUB) && (is_pointer(left) || is_pointer(right))){
+                if (is_pointer(left) && is_pointer(right)) exp->exp_type=type_long();
+                else if (is_pointer(left)){ convert_to(&exp->binary.right,type_long()); exp->exp_type=left; }
+                else { convert_to(&exp->binary.left,type_long()); exp->exp_type=right; }
                 return;
             }
 
@@ -2650,8 +2746,8 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
         }
 
         case EXP_ASSIGN:
-            typecheck_expression(exp->assign.lvalue,symbols);
-            typecheck_expression(exp->assign.rvalue,symbols);
+            typecheck_and_convert(&exp->assign.lvalue,symbols);
+            typecheck_and_convert(&exp->assign.rvalue,symbols);
             check_lvalue(exp->assign.lvalue,"assignment");
             convert_by_assignment(&exp->assign.rvalue,exp->assign.lvalue->exp_type);
             exp->exp_type=exp->assign.lvalue->exp_type;
@@ -2662,12 +2758,21 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
         TACKY generation reads that type from the converted rvalue.
         */
         case EXP_COMPOUND_ASSIGN: {
-            typecheck_expression(exp->compound.lvalue,symbols);
-            typecheck_expression(exp->compound.rvalue,symbols);
+            typecheck_and_convert(&exp->compound.lvalue,symbols);
+            typecheck_and_convert(&exp->compound.rvalue,symbols);
             check_lvalue(exp->compound.lvalue,"compound assignment");
 
             Type *left_type=exp->compound.lvalue->exp_type;
             check_binary_operands(exp->compound.op,left_type,exp->compound.rvalue->exp_type);
+            if (is_pointer(left_type)){
+                if ((exp->compound.op!=BINARY_ADD && exp->compound.op!=BINARY_SUB) || !is_integer_type(exp->compound.rvalue->exp_type)){
+                    fprintf(stderr,"Type Error: invalid pointer compound assignment\n"); exit(1);
+                }
+                convert_to(&exp->compound.rvalue,type_long()); exp->exp_type=left_type; return;
+            }
+            if (is_pointer(exp->compound.rvalue->exp_type)){
+                fprintf(stderr,"Type Error: pointer cannot be assigned to an arithmetic object\n"); exit(1);
+            }
             Type *op_type=is_shift_op(exp->compound.op)
                 ? left_type
                 : get_common_type(left_type,exp->compound.rvalue->exp_type);
@@ -2679,20 +2784,20 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
         case EXP_PREFIX_OP:
         case EXP_POSTFIX_OP:
-            typecheck_expression(exp->inc_dec.lvalue,symbols);
+            typecheck_and_convert(&exp->inc_dec.lvalue,symbols);
             check_lvalue(exp->inc_dec.lvalue,"increment/decrement");
             exp->exp_type=exp->inc_dec.lvalue->exp_type;
             check_binary_operands(
                 exp->inc_dec.is_increment ? BINARY_ADD : BINARY_SUB,
                 exp->exp_type,
-                exp->exp_type
+                type_int()
             );
             return;
 
         case EXP_CONDITIONAL: {
-            typecheck_expression(exp->conditional.condition,symbols);
-            typecheck_expression(exp->conditional.true_expr,symbols);
-            typecheck_expression(exp->conditional.false_expr,symbols);
+            typecheck_and_convert(&exp->conditional.condition,symbols);
+            typecheck_and_convert(&exp->conditional.true_expr,symbols);
+            typecheck_and_convert(&exp->conditional.false_expr,symbols);
 
             Type *common_type=common_operand_type(
                 exp->conditional.true_expr,
@@ -2704,8 +2809,18 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             return;
         }
 
+        case EXP_SUBSCRIPT: {
+            typecheck_and_convert(&exp->subscript.left,symbols);
+            typecheck_and_convert(&exp->subscript.right,symbols);
+            Exp **ptr=&exp->subscript.left,**idx=&exp->subscript.right;
+            if (!is_pointer((*ptr)->exp_type)){ ptr=&exp->subscript.right; idx=&exp->subscript.left; }
+            if (!is_pointer((*ptr)->exp_type) || !is_integer_type((*idx)->exp_type)){
+                fprintf(stderr,"Type Error: invalid subscript operands\n"); exit(1);
+            }
+            convert_to(idx,type_long()); exp->exp_type=(*ptr)->exp_type->referenced; return;
+        }
         case EXP_DEREFERENCE:
-            typecheck_expression(exp->deref.exp,symbols);
+            typecheck_and_convert(&exp->deref.exp,symbols);
             if (!is_pointer(exp->deref.exp->exp_type)) {
                 fprintf(stderr,"Type Error: can't dereference a non-pointer\n");
                 exit(1);
@@ -2721,11 +2836,59 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
     }
 }
 
-// a static initializer follows the assignment rule, then must fold at compile time
-static int eval_static_initializer(Exp **init,Type *target,Symbol **symbols,Const *out) {
-    typecheck_expression(*init,symbols);
-    convert_by_assignment(init,target);
-    return eval_const_expr(*init,out);
+static Initializer *zero_initializer(Type *t){
+    Initializer *init=calloc(1,sizeof(Initializer)); init->type=t;
+    if (t->kind==TYPE_ARRAY){
+        init->compound=1; init->count=(int)t->count;
+        init->items=calloc(t->count,sizeof(Initializer*));
+        for (int i=0;i<(int)t->count;i++) init->items[i]=zero_initializer(t->referenced);
+    }else{
+        init->exp=make_constant_exp(make_const(t,0)); init->exp->exp_type=t;
+    }
+    return init;
+}
+
+static void check_initializer(Initializer *init,Type *t,Symbol **symbols){
+    init->type=t;
+    if (t->kind!=TYPE_ARRAY){
+        if (init->compound){ fprintf(stderr,"Type Error: scalar initializer cannot be a list\n"); exit(1); }
+        typecheck_and_convert(&init->exp,symbols); convert_by_assignment(&init->exp,t); return;
+    }
+    if (!init->compound || init->count>(int)t->count){ fprintf(stderr,"Type Error: invalid array initializer shape\n"); exit(1); }
+    for (int i=0;i<init->count;i++) check_initializer(init->items[i],t->referenced,symbols);
+    init->items=realloc(init->items,sizeof(Initializer*)*t->count);
+    while (init->count<(int)t->count) init->items[init->count++]=zero_initializer(t->referenced);
+}
+
+static void append_static_init(StaticInitList *list,StaticInit value){
+    if (value.type==INIT_ZERO && list->count && list->items[list->count-1].type==INIT_ZERO){
+        list->items[list->count-1].value+=value.value; return;
+    }
+    list->items=realloc(list->items,sizeof(StaticInit)*(list->count+1));
+    list->items[list->count++]=value;
+}
+
+static StaticInitList zero_static_list(Type *t){
+    StaticInitList list={0}; append_static_init(&list,(StaticInit){INIT_ZERO,{type_size(t)}}); return list;
+}
+
+static void flatten_static_initializer(Initializer *init,StaticInitList *list){
+    if (init->compound){
+        for (int i=0;i<init->count;i++) flatten_static_initializer(init->items[i],list);
+    }else{
+        Const c;
+        if (!eval_const_expr(init->exp,&c)){ fprintf(stderr,"Type Error: non-constant static initializer\n"); exit(1); }
+        StaticInit v=const_to_static_init(c,init->type);
+        unsigned long bits=0;
+        if (v.type==INIT_DOUBLE) memcpy(&bits,&v.dvalue,sizeof(bits)); else bits=(unsigned long)v.value;
+        if (bits==0) v=(StaticInit){INIT_ZERO,{type_size(init->type)}};
+        append_static_init(list,v);
+    }
+}
+
+static StaticInitList eval_static_initializer(Initializer *init,Type *target,Symbol **symbols){
+    check_initializer(init,target,symbols);
+    StaticInitList list={0}; flatten_static_initializer(init,&list); return list;
 }
 
 void typecheck_file_scope_variable_declaration(
@@ -2733,28 +2896,16 @@ void typecheck_file_scope_variable_declaration(
     Symbol **symbols
 ) {
     InitialValue initial_value;
+    if (decl->init || decl->storage_class!=STORAGE_EXTERN) type_size(decl->var_type);
 
     if (decl->init) {
-        Const value;
-        if (!eval_static_initializer(&decl->init,decl->var_type,symbols,&value)) {
-            fprintf(
-                stderr,
-                "Type Error: non-constant initializer for file-scope variable '%s'\n",
-                decl->name
-            );
-            exit(1);
-        }
-
-        initial_value=make_initial_value(
-            INITIAL_VALUE,
-            const_to_static_init(value,decl->var_type)
-        );
+        initial_value=make_initial_value(INITIAL_VALUE,eval_static_initializer(decl->init,decl->var_type,symbols));
     }
     else if (decl->storage_class==STORAGE_EXTERN) {
-        initial_value=make_initial_value(INITIAL_NONE,zero_static_init(decl->var_type));
+        initial_value=make_initial_value(INITIAL_NONE,(StaticInitList){0});
     }
     else {
-        initial_value=make_initial_value(INITIAL_TENTATIVE,zero_static_init(decl->var_type));
+        initial_value=make_initial_value(INITIAL_TENTATIVE,zero_static_list(decl->var_type));
     }
 
     int global=(decl->storage_class!=STORAGE_STATIC);
@@ -2823,6 +2974,7 @@ void typecheck_local_variable_declaration(
     VariableDeclaration *decl,
     Symbol **symbols
 ) {
+    if (decl->storage_class!=STORAGE_EXTERN) type_size(decl->var_type);
     if (decl->storage_class==STORAGE_EXTERN) {
         if (decl->init) {
             fprintf(
@@ -2845,7 +2997,7 @@ void typecheck_local_variable_declaration(
             symbols,
             decl->name,
             decl->var_type,
-            make_initial_value(INITIAL_NONE,zero_static_init(decl->var_type)),
+            make_initial_value(INITIAL_NONE,(StaticInitList){0}),
             1
         );
         return;
@@ -2855,23 +3007,10 @@ void typecheck_local_variable_declaration(
         InitialValue initial_value;
 
         if (decl->init) {
-            Const value;
-            if (!eval_static_initializer(&decl->init,decl->var_type,symbols,&value)) {
-                fprintf(
-                    stderr,
-                    "Type Error: non-constant initializer on local static variable '%s'\n",
-                    decl->name
-                );
-                exit(1);
-            }
-
-            initial_value=make_initial_value(
-                INITIAL_VALUE,
-                const_to_static_init(value,decl->var_type)
-            );
+            initial_value=make_initial_value(INITIAL_VALUE,eval_static_initializer(decl->init,decl->var_type,symbols));
         }
         else {
-            initial_value=make_initial_value(INITIAL_VALUE,zero_static_init(decl->var_type));
+            initial_value=make_initial_value(INITIAL_VALUE,zero_static_list(decl->var_type));
         }
 
         symbol_add_static(
@@ -2887,8 +3026,7 @@ void typecheck_local_variable_declaration(
     symbol_add_local(symbols,decl->name,decl->var_type);
 
     if (decl->init) {
-        typecheck_expression(decl->init,symbols);
-        convert_by_assignment(&decl->init,decl->var_type);
+        check_initializer(decl->init,decl->var_type,symbols);
     }
 }
 
@@ -2914,7 +3052,7 @@ void typecheck_for_init(ForInit *init,Symbol **symbols) {
     }
 
     if (init->exp) {
-        typecheck_expression(init->exp,symbols);
+        typecheck_and_convert(&init->exp,symbols);
     }
 }
 
@@ -2925,18 +3063,18 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
 
     switch(stmt->type) {
         case STMT_RETURN:
-            typecheck_expression(stmt->exp,symbols);
+            typecheck_and_convert(&stmt->exp,symbols);
             convert_by_assignment(&stmt->exp,current_return_type);
             return;
 
         case STMT_EXPRESSION:
             if (stmt->exp) {
-                typecheck_expression(stmt->exp,symbols);
+                typecheck_and_convert(&stmt->exp,symbols);
             }
             return;
 
         case STMT_IF:
-            typecheck_expression(stmt->if_stmt.condition,symbols);
+            typecheck_and_convert(&stmt->if_stmt.condition,symbols);
             typecheck_statement(stmt->if_stmt.then_branch,symbols);
 
             if (stmt->if_stmt.else_branch) {
@@ -2960,10 +3098,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
             return;
 
         case STMT_WHILE:
-            typecheck_expression(
-                stmt->while_stmt.condition,
-                symbols
-            );
+            typecheck_and_convert(&stmt->while_stmt.condition,symbols);
             typecheck_statement(
                 stmt->while_stmt.body,
                 symbols
@@ -2975,10 +3110,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
                 stmt->do_while_stmt.body,
                 symbols
             );
-            typecheck_expression(
-                stmt->do_while_stmt.condition,
-                symbols
-            );
+            typecheck_and_convert(&stmt->do_while_stmt.condition,symbols);
             return;
 
         case STMT_FOR:
@@ -2988,17 +3120,11 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
             );
 
             if (stmt->for_stmt.condition) {
-                typecheck_expression(
-                    stmt->for_stmt.condition,
-                    symbols
-                );
+                typecheck_and_convert(&stmt->for_stmt.condition,symbols);
             }
 
             if (stmt->for_stmt.post) {
-                typecheck_expression(
-                    stmt->for_stmt.post,
-                    symbols
-                );
+                typecheck_and_convert(&stmt->for_stmt.post,symbols);
             }
 
             typecheck_statement(
@@ -3008,10 +3134,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
             return;
 
         case STMT_SWITCH:
-            typecheck_expression(
-                stmt->switch_stmt.control,
-                symbols
-            );
+            typecheck_and_convert(&stmt->switch_stmt.control,symbols);
             if (!is_integer_type(stmt->switch_stmt.control->exp_type)) {
                 fprintf(stderr,"Type Error: switch controlling expression must be an integer\n");
                 exit(1);
@@ -3023,10 +3146,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
             return;
 
         case STMT_CASE:
-            typecheck_expression(
-                stmt->case_stmt.value_exp,
-                symbols
-            );
+            typecheck_and_convert(&stmt->case_stmt.value_exp,symbols);
             if (!is_integer_type(stmt->case_stmt.value_exp->exp_type)) {
                 fprintf(stderr,"Type Error: case label must be an integer\n");
                 exit(1);
@@ -3087,6 +3207,8 @@ void typecheck_function_declaration(
     Function *fn,
     Symbol **symbols
 ) {
+    if (fn->fun_type->ret->kind==TYPE_ARRAY){ fprintf(stderr,"Type Error: function returns array\n"); exit(1); }
+
     int has_body=fn->has_body;
     int already_defined=0;
     int global=(fn->storage_class!=STORAGE_STATIC);
@@ -3434,6 +3556,10 @@ void resolve_expression(Exp *e,IdentifierMap *map){
             resolve_expression(e->binary.right,map);
             break;
 
+        case EXP_SUBSCRIPT:
+            resolve_expression(e->subscript.left,map);
+            resolve_expression(e->subscript.right,map);
+            return;
         case EXP_DEREFERENCE:
             resolve_expression(e->deref.exp,map);
             break;
@@ -3532,7 +3658,7 @@ void resolve_local_variable_declaration(
     );
 
     if (decl->init) {
-        resolve_expression(decl->init,*map);
+        resolve_initializer(decl->init,*map);
     }
 
     free(decl->name);
@@ -4163,6 +4289,14 @@ AsmOperand as_pseudo(char *s){
     };
 }
 
+AsmOperand as_pseudo_mem(char *name,int offset){
+    return (AsmOperand){AS_PSEUDO_MEM,.pseudo_mem={name,offset}};
+}
+
+AsmOperand as_indexed(AsmReg base,AsmReg index,int scale){
+    return (AsmOperand){AS_INDEXED,.indexed={base,index,scale}};
+}
+
 AsmOperand as_memory(AsmReg base,int offset){
     return (AsmOperand){
         AS_MEMORY,
@@ -4219,6 +4353,10 @@ AsmType type_to_asm_type(Type *t){
 }
 
 int type_alignment(Type *t){
+    if (t->kind==TYPE_ARRAY){
+        if (type_size(t)>=16) return 16;
+        while (t->kind==TYPE_ARRAY) t=t->referenced;
+    }
     return type_size(t);
 }
 
@@ -4704,9 +4842,32 @@ static void convert_tacky_instruction(
             append_asm(head,AS_MOV,tacky_val_asm_type(curr->src,symbols),0,0,convert_tacky_val(curr->src),as_memory(REG_AX,0),NULL);
             break;
 
-        case TACKY_INST_GET_ADDRESS:
-            append_asm(head,AS_LEA,ASM_QUADWORD,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+        case TACKY_INST_ADD_PTR: {
+            append_asm(head,AS_MOV,ASM_QUADWORD,0,0,convert_tacky_val(curr->src),as_reg(REG_AX),NULL);
+            int scale=curr->scale;
+            if (curr->src2->type==TACKY_VAL_CONSTANT){
+                long index=curr->src2->constant.value;
+                if (index>=INT_MIN/scale && index<=INT_MAX/scale){
+                    append_asm(head,AS_LEA,ASM_QUADWORD,0,0,as_memory(REG_AX,(int)(index*scale)),convert_tacky_val(curr->dst),NULL);
+                    break;
+                }
+            }
+            append_asm(head,AS_MOV,ASM_QUADWORD,0,0,convert_tacky_val(curr->src2),as_reg(REG_DX),NULL);
+            if (scale!=1 && scale!=2 && scale!=4 && scale!=8){
+                append_asm(head,AS_BINARY,ASM_QUADWORD,BINARY_MULT,0,as_imm(scale),as_reg(REG_DX),NULL); scale=1;
+            }
+            append_asm(head,AS_LEA,ASM_QUADWORD,0,0,as_indexed(REG_AX,REG_DX,scale),convert_tacky_val(curr->dst),NULL);
             break;
+        }
+        case TACKY_INST_COPY_TO_OFFSET:
+            append_asm(head,AS_MOV,tacky_val_asm_type(curr->src,symbols),0,0,convert_tacky_val(curr->src),as_pseudo_mem(curr->dst->var_name,curr->offset),NULL);
+            break;
+        case TACKY_INST_GET_ADDRESS: {
+            Symbol *obj=symbol_find(symbols,curr->src->var_name);
+            AsmOperand src=obj->type->kind==TYPE_ARRAY ? as_pseudo_mem(curr->src->var_name,0) : convert_tacky_val(curr->src);
+            append_asm(head,AS_LEA,ASM_QUADWORD,0,0,src,convert_tacky_val(curr->dst),NULL);
+            break;
+        }
     }
 }
 
@@ -4775,7 +4936,14 @@ static AsmSymbol *build_backend_symbols(Symbol *symbols){
             asm_entry->defined=entry->defined;
         }else{
             asm_entry->kind=ASM_SYMBOL_OBJ;
-            asm_entry->asm_type=type_to_asm_type(entry->type);
+            if (entry->attr_type==SYMBOL_ATTR_STATIC && entry->init.type==INITIAL_NONE){
+                asm_entry->asm_type=ASM_LONGWORD; asm_entry->alignment=1;
+            }else{
+                asm_entry->asm_type=entry->type->kind==TYPE_ARRAY ? ASM_LONGWORD : type_to_asm_type(entry->type);
+                asm_entry->byte_size=type_size(entry->type);
+                asm_entry->alignment=type_alignment(entry->type);
+            }
+            asm_entry->is_aggregate=entry->type->kind==TYPE_ARRAY;
             asm_entry->is_static=(entry->attr_type==SYMBOL_ATTR_STATIC);
         }
 
@@ -4899,7 +5067,7 @@ typedef struct {
 } MapEntry;
 
 static int is_memory_operand(AsmOperand op){
-    return op.type==AS_MEMORY || op.type==AS_DATA;
+    return op.type==AS_MEMORY || op.type==AS_DATA || op.type==AS_INDEXED;
 }
 
 static int is_large_imm(AsmOperand op){
@@ -4923,15 +5091,17 @@ static void replace_pseudos(AsmFunc *fn,AsmSymbol *symbols){
         };
 
         for (int i=0;i<2;i++){
-            if (ops[i]->type!=AS_PSEUDO){
+            if (ops[i]->type!=AS_PSEUDO && ops[i]->type!=AS_PSEUDO_MEM){
                 continue;
             }
 
+            int object_offset=ops[i]->type==AS_PSEUDO_MEM ? ops[i]->pseudo_mem.offset : 0;
+            char *object_name=ops[i]->type==AS_PSEUDO_MEM ? ops[i]->pseudo_mem.name : ops[i]->pseudo;
             int found_offset=0;
             int already_exists=0;
 
             for (int j=0;j<map_size;j++){
-                if (strcmp(map[j].name,ops[i]->pseudo)==0){
+                if (strcmp(map[j].name,object_name)==0){
                     found_offset=map[j].offset;
                     already_exists=1;
                     break;
@@ -4939,15 +5109,15 @@ static void replace_pseudos(AsmFunc *fn,AsmSymbol *symbols){
             }
 
             if (!already_exists){
-                AsmSymbol *sym=asm_symbol_find(symbols,ops[i]->pseudo);
+                AsmSymbol *sym=asm_symbol_find(symbols,object_name);
                 if (!sym || sym->kind!=ASM_SYMBOL_OBJ){
-                    fprintf(stderr,"Codegen Error: unknown pseudoregister '%s'\n",ops[i]->pseudo);
+                    fprintf(stderr,"Codegen Error: unknown pseudoregister '%s'\n",object_name);
                     exit(1);
                 }
 
                 if (sym->is_static){
                     ops[i]->type=AS_DATA;
-                    ops[i]->data_name=ops[i]->pseudo;
+                    ops[i]->data_name=object_name;
                     continue;
                 }
 
@@ -4956,19 +5126,17 @@ static void replace_pseudos(AsmFunc *fn,AsmSymbol *symbols){
                     exit(1);
                 }
 
-                if (sym->asm_type!=ASM_LONGWORD){
-                    stack_bytes=((stack_bytes+8+7)/8)*8;
-                }else{
-                    stack_bytes+=4;
-                }
+                int alignment=sym->alignment;
+                if (stack_bytes>INT_MAX-sym->byte_size-alignment-16){ fprintf(stderr,"Codegen Error: stack frame too large\n"); exit(1); }
+                stack_bytes=((stack_bytes+sym->byte_size+alignment-1)/alignment)*alignment;
 
-                map[map_size].name=strdup(ops[i]->pseudo);
+                map[map_size].name=strdup(object_name);
                 map[map_size].offset=-stack_bytes;
                 found_offset=-stack_bytes;
                 map_size++;
             }
 
-            *ops[i]=as_memory(REG_BP,found_offset);
+            *ops[i]=as_memory(REG_BP,found_offset+object_offset);
         }
     }
 
@@ -5275,7 +5443,67 @@ typedef struct {
 
 TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list);
 
+static TackyVal *emit_tacky_binary(
+    TackyInstruction **list,BinaryOpType op,TackyVal *left,TackyVal *right,
+    Type *lt,Type *rt,Type *result
+){
+    if ((op==BINARY_ADD || op==BINARY_SUB) && (is_pointer(lt) || is_pointer(rt))){
+        if (is_pointer(lt) && is_pointer(rt)){
+            TackyVal *bytes=make_tacky_variable(type_long());
+            TackyInstruction *sub=calloc(1,sizeof(TackyInstruction));
+            sub->type=TACKY_INST_BINARY;
+            sub->binary_op=BINARY_SUB;
+            sub->src=left;
+            sub->src2=right;
+            sub->dst=bytes;
+            append_tacky_inst(list,sub);
+            TackyVal *scale=tacky_val_constant(make_const(type_long(),type_size(lt->referenced)));
+            return emit_tacky_binary(list,BINARY_DIV,bytes,scale,type_long(),type_long(),type_long());
+        }
+        if (!is_pointer(lt)){
+            TackyVal *swap=left;
+            left=right;
+            right=swap;
+            lt=rt;
+        }
+        if (op==BINARY_SUB){
+            TackyVal *negative=make_tacky_variable(type_long());
+            TackyInstruction *neg=calloc(1,sizeof(TackyInstruction));
+            neg->type=TACKY_INST_UNARY;
+            neg->unary_op=UNARY_NEGATION;
+            neg->src=right;
+            neg->dst=negative;
+            append_tacky_inst(list,neg);
+            right=negative;
+        }
+        TackyVal *dst=make_tacky_variable(result);
+        TackyInstruction *add=calloc(1,sizeof(TackyInstruction));
+        add->type=TACKY_INST_ADD_PTR;
+        add->src=left;
+        add->src2=right;
+        add->scale=type_size(lt->referenced);
+        add->dst=dst;
+        append_tacky_inst(list,add);
+        return dst;
+    }
+    TackyVal *dst=make_tacky_variable(result);
+    TackyInstruction *bin=calloc(1,sizeof(TackyInstruction));
+    bin->type=TACKY_INST_BINARY;
+    bin->binary_op=op;
+    bin->src=left;
+    bin->src2=right;
+    bin->dst=dst;
+    append_tacky_inst(list,bin);
+    return dst;
+}
+
 TackyLvalue gen_tacky_lvalue(Exp *e,TackyInstruction **inst_list){
+    if (e->type==EXP_SUBSCRIPT){
+        Exp *ptr=e->subscript.left,*idx=e->subscript.right;
+        if (!is_pointer(ptr->exp_type)){ Exp *swap=ptr; ptr=idx; idx=swap; }
+        TackyVal *p=gen_tacky_exp(ptr,inst_list),*i=gen_tacky_exp(idx,inst_list);
+        return (TackyLvalue){emit_tacky_binary(inst_list,BINARY_ADD,p,i,ptr->exp_type,idx->exp_type,ptr->exp_type),1};
+    }
     if (e->type==EXP_DEREFERENCE){
         return (TackyLvalue){gen_tacky_exp(e->deref.exp,inst_list),1};
     }
@@ -5414,25 +5642,17 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         Type *op_type=e->compound.rvalue->exp_type;
         TackyVal *lhs_val=emit_lvalue_load(lv,lhs_type,inst_list);
 
-        //calculate a+b
-        TackyVal *tmp=make_tacky_variable(op_type);
-        TackyInstruction *bin=calloc(1,sizeof(TackyInstruction));
-        bin->type=TACKY_INST_BINARY;
-        bin->binary_op=e->compound.op;
-        bin->src=emit_tacky_cast(inst_list,lhs_val,lhs_type,op_type);
-        bin->src2=rhs_val;
-        bin->dst=tmp;
-        append_tacky_inst(inst_list,bin);
-
-        //store resultd into a
-        return emit_lvalue_store(lv,emit_tacky_cast(inst_list,tmp,op_type,lhs_type),inst_list);
+        Type *calculation_type=is_pointer(lhs_type) ? lhs_type : op_type;
+        TackyVal *left=is_pointer(lhs_type) ? lhs_val : emit_tacky_cast(inst_list,lhs_val,lhs_type,op_type);
+        TackyVal *tmp=emit_tacky_binary(inst_list,e->compound.op,left,rhs_val,calculation_type,op_type,calculation_type);
+        return emit_lvalue_store(lv,emit_tacky_cast(inst_list,tmp,calculation_type,lhs_type),inst_list);
     }
     //  ++ / --
     else if (e->type==EXP_PREFIX_OP || e->type==EXP_POSTFIX_OP){
         TackyLvalue lv=gen_tacky_lvalue(e->inc_dec.lvalue,inst_list);
         Type *lhs_type=e->inc_dec.lvalue->exp_type;
         TackyVal *lhs_val=emit_lvalue_load(lv,lhs_type,inst_list);
-        TackyVal *one_val=tacky_val_constant(make_const(lhs_type,1));
+        TackyVal *one_val=tacky_val_constant(make_const(is_pointer(lhs_type) ? type_long() : lhs_type,1));
         BinaryOpType op=e->inc_dec.is_increment ? BINARY_ADD :BINARY_SUB;
 
         TackyVal *old_val=NULL;
@@ -5447,15 +5667,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
             append_tacky_inst(inst_list,save_old);
         }
 
-        // calculate a+1 or a-1
-        TackyVal *tmp=make_tacky_variable(lhs_type);
-        TackyInstruction *bin=calloc(1,sizeof(TackyInstruction));
-        bin->type=TACKY_INST_BINARY;
-        bin->binary_op=op;
-        bin->src=lhs_val;
-        bin->src2=one_val;
-        bin->dst=tmp;
-        append_tacky_inst(inst_list,bin);
+        TackyVal *tmp=emit_tacky_binary(inst_list,op,lhs_val,one_val,lhs_type,is_pointer(lhs_type) ? type_long() : lhs_type,lhs_type);
 
         //soter new value to a
         emit_lvalue_store(lv,tmp,inst_list);
@@ -5479,7 +5691,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
 
         return emit_lvalue_store(lv,rhs_val,inst_list);
     }
-    else if (e->type==EXP_DEREFERENCE){
+    else if (e->type==EXP_DEREFERENCE || e->type==EXP_SUBSCRIPT){
         return emit_lvalue_load(gen_tacky_lvalue(e,inst_list),e->exp_type,inst_list);
     }
     else if (e->type==EXP_ADDR_OF){
@@ -5633,20 +5845,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
 
         TackyVal *v2=gen_tacky_exp(e->binary.right,inst_list);
 
-        //build temporal variable to save result
-        TackyVal *dst=make_tacky_variable(e->exp_type);
-
-        //build and emit binary instruction
-        TackyInstruction *inst=calloc(1, sizeof(TackyInstruction));
-        inst->type=TACKY_INST_BINARY;
-        inst->binary_op=e->binary.op;
-        inst->src=v1;
-        inst->src2=v2;
-        inst->dst=dst;
-        inst->next=NULL;
-        append_tacky_inst(inst_list,inst);
-
-        return dst;
+        return emit_tacky_binary(inst_list,e->binary.op,v1,v2,e->binary.left->exp_type,e->binary.right->exp_type,e->exp_type);
     }
 
     return NULL;
@@ -5867,20 +6066,20 @@ static void emit_switch_dispatch(
     }
 }
 
-// let Declaration turn to TACKY (only have init value need to generate)
-void gen_tacky_decl(VariableDeclaration *decl,TackyInstruction **inst_list){
-    if (!decl || decl->storage_class!=STORAGE_NONE) {
-        return;
-    }
-
-    if (decl->init){
-        TackyVal *src=gen_tacky_exp(decl->init,inst_list);
+static void gen_tacky_initializer(Initializer *init,char *name,int offset,int aggregate,TackyInstruction **list){
+    if (init->compound){
+        int step=type_size(init->type->referenced);
+        for (int i=0;i<init->count;i++) gen_tacky_initializer(init->items[i],name,offset+i*step,1,list);
+    }else{
+        TackyVal *src=gen_tacky_exp(init->exp,list);
         TackyInstruction *copy=calloc(1,sizeof(TackyInstruction));
-        copy->type=TACKY_INST_COPY;
-        copy->src=src;
-        copy->dst=tacky_val_var(decl->name);
-        append_tacky_inst(inst_list,copy);
+        copy->type=aggregate ? TACKY_INST_COPY_TO_OFFSET : TACKY_INST_COPY;
+        copy->src=src; copy->dst=tacky_val_var(name); copy->offset=offset; append_tacky_inst(list,copy);
     }
+}
+
+void gen_tacky_decl(VariableDeclaration *decl,TackyInstruction **inst_list){
+    if (decl && decl->storage_class==STORAGE_NONE && decl->init) gen_tacky_initializer(decl->init,decl->name,0,decl->var_type->kind==TYPE_ARRAY,inst_list);
 }
 
 void gen_tacky_block_items(BlockItem **items,int count,TackyInstruction **inst_list){
@@ -5996,7 +6195,7 @@ static void append_tacky_static_variable(
     const char *name,
     int global,
     Type *type,
-    StaticInit init
+    StaticInitList init
 ){
     TackyStaticVariable *variable=calloc(1,sizeof(TackyStaticVariable));
     if (!variable) {
@@ -6033,12 +6232,12 @@ static void convert_symbols_to_tacky(
             continue;
         }
 
-        StaticInit init;
+        StaticInitList init;
         if (entry->init.type==INITIAL_VALUE) {
             init=entry->init.value;
         }
         else {
-            init=zero_static_init(entry->type);
+            init=zero_static_list(entry->type);
         }
 
         append_tacky_static_variable(
@@ -6159,6 +6358,9 @@ static void emit_sized_op(AsmOperand op,int bytes,FILE *out){
     //an address is 8 bytes whatever the operand size
     else if (op.type==AS_MEMORY){
         fprintf(out,"%d(%s)",op.memory.offset,reg_name_64(op.memory.base));
+    }
+    else if (op.type==AS_INDEXED){
+        fprintf(out,"(%s,%s,%d)",reg_name_64(op.indexed.base),reg_name_64(op.indexed.index),op.indexed.scale);
     }
     else if (op.type==AS_DATA){
         emit_data_op(op,out);
@@ -6505,20 +6707,15 @@ static void emit_static_variable(AsmStaticVariable *var,FILE *out){
         fprintf(out,".globl " SYMBOL_PREFIX "%s\n",var->name);
     }
 
-    int is_long=(var->init.type==INIT_LONG || var->init.type==INIT_ULONG);
-
-    //doubles always go in .data as their bit pattern, so -0.0 keeps its sign bit
-    if (var->init.type==INIT_DOUBLE){
-        fprintf(out,".data\n.balign %d\n" SYMBOL_PREFIX "%s:\n",var->alignment,var->name);
-        fprintf(out,"    .quad %ld\n",double_bits(var->init.dvalue));
-    }else if (var->init.value!=0){
-        fprintf(out,".data\n.balign %d\n" SYMBOL_PREFIX "%s:\n",var->alignment,var->name);
-        fprintf(out,"    %s %ld\n",is_long ? ".quad" : ".long",var->init.value);
-    }else{
-        fprintf(out,".bss\n.balign %d\n" SYMBOL_PREFIX "%s:\n",var->alignment,var->name);
-        fprintf(out,"    .zero %d\n",is_long ? 8 : 4);
+    int all_zero=1;
+    for (int i=0;i<var->init.count;i++) if (var->init.items[i].type!=INIT_ZERO) all_zero=0;
+    fprintf(out,"%s\n.balign %d\n" SYMBOL_PREFIX "%s:\n",all_zero ? ".bss" : ".data",var->alignment,var->name);
+    for (int i=0;i<var->init.count;i++){
+        StaticInit v=var->init.items[i];
+        if (v.type==INIT_ZERO) fprintf(out,"    .zero %ld\n",v.value);
+        else if (v.type==INIT_DOUBLE) fprintf(out,"    .quad %ld\n",double_bits(v.dvalue));
+        else fprintf(out,"    %s %ld\n",v.type==INIT_LONG || v.type==INIT_ULONG ? ".quad" : ".long",v.value);
     }
-
     fprintf(out,"\n");
 }
 
