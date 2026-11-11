@@ -2,6 +2,8 @@
 
 照 Nora Sandler《Writing a C Compiler》一章一章用 C 寫的 C 編譯器。
 
+目前支援到第十五章：固定長度與多維陣列、下標、陣列初始化，以及指標運算。
+
 ## 建置與使用
 
 ```sh
@@ -9,6 +11,7 @@ make
 ./main file.c        # 在 file.c 旁產生執行檔 file
 ./main -S file.c     # 只輸出組語 file.s
 ./main --lex|--parse|--validate|--tacky|--codegen file.c   # 只跑到某個階段
+python3 tests/ch15_regressions.py ./main  # 第十五章補充回歸測試
 ```
 
 ## 各章筆記
@@ -29,4 +32,5 @@ make
 | 第十二章 | [Unsigned Integers](docs/ch12-unsigned-integers.md) |
 | 第十三章 | [Floating-Point Numbers](docs/ch13-floating-point-numbers.md) |
 | 第十四章 | [Pointers](docs/ch14-pointers.md) |
+| 第十五章 | [Arrays and Pointer Arithmetic](docs/ch15-arrays-and-pointer-arithmetic.md) |
 | 附錄 A | [Debugging Assembly Code with GDB or LLDB](docs/appA-debugging-with-gdb-lldb.md) |

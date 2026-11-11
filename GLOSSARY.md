@@ -9,7 +9,7 @@
 _Avoid_: 變數（變數只是指向物件的一種名字）
 
 **Lvalue**:
-可能指向某個 object 的運算式，目前只有 `Var` 和 `Dereference`。它是運算式，不是值。
+可能指向某個 object 的運算式，包括 `Var`、`Dereference` 和 `Subscript`。陣列也可以是 lvalue，但不能整體賦值。
 _Avoid_: 左值的值、可賦值的東西
 
 **Lvalue conversion**:
@@ -18,6 +18,17 @@ _Avoid_: 左值的值、可賦值的東西
 **Referenced type**:
 指標指向的型別，例如 `int *` 的 referenced type 是 `int`。
 _Avoid_: 把它叫 basic type（basic type 是 specifier 決定的型別）
+
+**Array-to-pointer decay（陣列轉指標）**:
+陣列運算式轉成指向第一個元素之指標的隱式轉換，轉換結果不是 lvalue。顯式 `&` 的運算元保留陣列型別。
+_Avoid_: 陣列就是指標、多維陣列轉成雙重指標
+
+**Subscript（下標）**:
+`a[i]` 的運算式節點，表示 `*(a + i)` 指到的物件。索引的單位是元素，不是 byte。
+
+**Compound initializer（複合初始值）**:
+初始化陣列的大括號列表，每一項初始化一個元素，元素本身是陣列時使用巢狀列表。
+_Avoid_: compound literal（另一種建立匿名物件的語法）
 
 **Null pointer constant**:
 值為 0 的整數常數字面值，例如 `0`、`0ul`。`0.0`、`10 - 10`、`(long)0` 都不算。
