@@ -9,7 +9,7 @@
 _Avoid_: 變數（變數只是指向物件的一種名字）
 
 **Lvalue**:
-可能指向某個 object 的運算式，包括 `Var`、`Dereference` 和 `Subscript`。陣列也可以是 lvalue，但不能整體賦值。
+可能指向某個 object 的運算式，包括 `Var`、`Dereference`、`Subscript` 和 `String`。陣列與字串字面值也可以是 lvalue，但不能整體賦值。
 _Avoid_: 左值的值、可賦值的東西
 
 **Lvalue conversion**:

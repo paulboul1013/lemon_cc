@@ -2,7 +2,7 @@
 
 照 Nora Sandler《Writing a C Compiler》一章一章用 C 寫的 C 編譯器。
 
-目前支援到第十五章：固定長度與多維陣列、下標、陣列初始化，以及指標運算。
+目前支援到第十六章：三種 char、字元常數、相鄰字串、字串陣列初始化，以及靜態字串物件。實作與驗收命令見 [ch16 實作紀錄](docs/ch16-implementation.md)。
 
 ## 建置與使用
 
@@ -12,6 +12,7 @@ make
 ./main -S file.c     # 只輸出組語 file.s
 ./main --lex|--parse|--validate|--tacky|--codegen file.c   # 只跑到某個階段
 python3 tests/ch15_regressions.py ./main  # 第十五章補充回歸測試
+python3 tests/ch16_regressions.py ./main  # 第十六章補充回歸與 GCC 呼叫互通測試
 ```
 
 ## 各章筆記
