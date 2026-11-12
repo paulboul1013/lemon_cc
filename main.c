@@ -6,7 +6,7 @@
 
 //define Token type
 typedef  enum{
-    TOK_INT, TOK_LONG, TOK_SIGNED, TOK_UNSIGNED, TOK_DOUBLE, TOK_VOID, TOK_RETURN,
+    TOK_CHAR, TOK_CHAR_CONSTANT, TOK_STRING, TOK_INT, TOK_LONG, TOK_SIGNED, TOK_UNSIGNED, TOK_DOUBLE, TOK_VOID, TOK_RETURN,
     TOK_STATIC, TOK_EXTERN,
 
     TOK_IF,
@@ -84,6 +84,7 @@ typedef struct {
 }Token;
 
 typedef enum {
+    TYPE_CHAR, TYPE_SCHAR, TYPE_UCHAR,
     TYPE_INT,
     TYPE_LONG,
     TYPE_UINT,
@@ -128,7 +129,18 @@ Type *type_double(void){
     return &t;
 }
 
+Type *type_char(void){ static Type t={.kind=TYPE_CHAR}; return &t; }
+Type *type_schar(void){ static Type t={.kind=TYPE_SCHAR}; return &t; }
+Type *type_uchar(void){ static Type t={.kind=TYPE_UCHAR}; return &t; }
+
+int is_character_type(Type *t){
+    return t->kind==TYPE_CHAR || t->kind==TYPE_SCHAR || t->kind==TYPE_UCHAR;
+}
+
+Type *integer_promotion(Type *t){ return is_character_type(t) ? type_int() : t; }
+
 int type_size(Type *t){
+    if (is_character_type(t)) return 1;
     if (t->kind==TYPE_ARRAY){
         int element_size=type_size(t->referenced);
         if (t->count<=0 || t->count>(unsigned long)(INT_MAX/element_size)){
@@ -141,12 +153,14 @@ int type_size(Type *t){
 }
 
 int type_is_signed(Type *t){
-    return t->kind==TYPE_INT || t->kind==TYPE_LONG;
+    return t->kind==TYPE_CHAR || t->kind==TYPE_SCHAR || t->kind==TYPE_INT || t->kind==TYPE_LONG;
 }
 
 //wrap v to the range of t, keeping the bit pattern in a long
 long convert_value(long v,Type *t){
     switch (t->kind){
+        case TYPE_CHAR: case TYPE_SCHAR: return (signed char)v;
+        case TYPE_UCHAR: return (unsigned char)v;
         case TYPE_INT: return (int)v;
         case TYPE_UINT: return (unsigned int)v;
         default: return v;
@@ -190,6 +204,7 @@ int type_equal(Type *a,Type *b){
 }
 
 typedef enum {
+    CONST_CHAR, CONST_UCHAR,
     CONST_INT,
     CONST_LONG,
     CONST_UINT,
@@ -207,6 +222,8 @@ typedef struct {
 
 Type *const_exp_type(Const c){
     switch (c.type){
+        case CONST_CHAR: return type_schar();
+        case CONST_UCHAR: return type_uchar();
         case CONST_LONG: return type_long();
         case CONST_UINT: return type_uint();
         case CONST_ULONG: return type_ulong();
@@ -216,6 +233,8 @@ Type *const_exp_type(Const c){
 }
 
 typedef enum {
+    INIT_STRING, INIT_POINTER,
+    INIT_CHAR, INIT_UCHAR,
     INIT_INT,
     INIT_LONG,
     INIT_UINT,
@@ -224,17 +243,22 @@ typedef enum {
     INIT_ZERO
 } StaticInitType;
 
+typedef struct { char *data; int length; } ByteString;
+
 typedef struct {
     StaticInitType type;
     union {
         long value;
         double dvalue; //INIT_DOUBLE
+        struct { ByteString bytes; int null_terminated; } string;
+        char *pointer_name;
     };
 } StaticInit;
 
 typedef struct { StaticInit *items; int count; } StaticInitList;
 
 typedef enum {
+    EXP_STRING,
     EXP_CONSTANT,
     EXP_CAST,
     EXP_UNARY,
@@ -272,6 +296,7 @@ typedef struct Exp {
     Type *exp_type; //set by the type checker
     union {
         Const constant; //for EXP_CONSTANT
+        struct { ByteString bytes; char *name; } string;
         char *var_name; //for EXP_VAR
         struct { //for EXP_CAST
             Type *target_type;
@@ -704,8 +729,8 @@ typedef enum {
 //Asm AST Node
 typedef enum {
     AS_MOV,
-    AS_MOVSX, // sign extend longword to quadword
-    AS_MOVZX, // zero extend longword to quadword
+    AS_MOVSX, // sign extend src_type to asm_type
+    AS_MOVZX, // zero extend src_type to asm_type
     AS_NEG,
     AS_NOT,
     AS_RET,
@@ -757,6 +782,7 @@ typedef enum{
 } AsmReg;
 
 typedef enum {
+    ASM_BYTE,
     ASM_LONGWORD,
     ASM_QUADWORD,
     ASM_DOUBLE
@@ -780,6 +806,7 @@ typedef struct {
 
 typedef struct AsmInst {
     AsmInstType type;
+    AsmType src_type; //extension source size
     AsmType asm_type; //operand size of Mov/Unary/Binary/Cmp/Idiv/Cdq
     BinaryOpType binary_op;
     CondCode cond;
@@ -803,7 +830,7 @@ typedef struct {
     StaticInitList init;
 } AsmStaticVariable;
 
-//read-only floating-point constant, emitted under a local label
+//read-only constant, emitted under a local label
 typedef struct {
     char *name;
     int alignment;
@@ -921,7 +948,8 @@ typedef struct {
 
 typedef enum {
     TACKY_TOP_FUNCTION,
-    TACKY_TOP_STATIC_VARIABLE
+    TACKY_TOP_STATIC_VARIABLE,
+    TACKY_TOP_STATIC_CONSTANT
 } TackyTopLevelType;
 
 typedef struct {
@@ -957,6 +985,8 @@ char *make_temporary(){
 //casting a double outside the target's range (or NaN) is UB in this compiler's own C
 static int double_fits(double d,Type *t){
     switch (t->kind){
+        case TYPE_CHAR: case TYPE_SCHAR: return d>-129.0 && d<128.0;
+        case TYPE_UCHAR: return d>-1.0 && d<256.0;
         case TYPE_LONG: return d>=-9223372036854775808.0 && d<9223372036854775808.0;
         case TYPE_UINT: return d>-1.0 && d<4294967296.0;
         case TYPE_ULONG: return d>-1.0 && d<18446744073709551616.0;
@@ -968,6 +998,8 @@ static int double_fits(double d,Type *t){
 Const convert_const(Const c,Type *t){
     Const r;
     switch (t->kind){
+        case TYPE_CHAR: case TYPE_SCHAR: r.type=CONST_CHAR; break;
+        case TYPE_UCHAR: r.type=CONST_UCHAR; break;
         case TYPE_LONG: r.type=CONST_LONG; break;
         case TYPE_UINT: r.type=CONST_UINT; break;
         case TYPE_ULONG:
@@ -983,6 +1015,8 @@ Const convert_const(Const c,Type *t){
         }
         switch (t->kind){
             case TYPE_DOUBLE: r.dvalue=c.dvalue; break;
+            case TYPE_CHAR: case TYPE_SCHAR: r.value=(signed char)c.dvalue; break;
+            case TYPE_UCHAR: r.value=(unsigned char)c.dvalue; break;
             case TYPE_LONG: r.value=(long)c.dvalue; break;
             case TYPE_UINT: r.value=(unsigned int)c.dvalue; break;
             case TYPE_ULONG: r.value=(long)(unsigned long)c.dvalue; break;
@@ -1036,6 +1070,7 @@ void add_token(TokenType type,const char *val){
 }
 
 TokenType check_keyword(const char *s){
+    if (strcmp(s,"char")==0) return TOK_CHAR;
     if (strcmp(s,"int")==0) return TOK_INT;
     if (strcmp(s,"long")==0) return TOK_LONG;
     if (strcmp(s,"signed")==0) return TOK_SIGNED;
@@ -1061,6 +1096,14 @@ TokenType check_keyword(const char *s){
     if (strcmp(s,"default")==0) return TOK_DEFAULT;
 
     return TOK_IDENTIFIER;
+}
+
+static char decode_escape(char c){
+    const char *escapes="'\"?\\abfnrtv";
+    const char values[]={'\'', '\"', '?', '\\', '\a', '\b', '\f', '\n', '\r', '\t', '\v'};
+    const char *position=strchr(escapes,c);
+    if (!c || !position){ fprintf(stderr,"Lexer Error: invalid escape sequence\n"); exit(1); }
+    return values[position-escapes];
 }
 
 void lex(const char *input){
@@ -1096,6 +1139,24 @@ void lex(const char *input){
             continue;
         }
         
+        if (*p=='\'' || *p=='"'){
+            char quote=*p++;
+            char *bytes=malloc(strlen(p)+1);
+            int length=0;
+            while (*p && *p!=quote){
+                if (*p=='\n' || *p=='\r'){ fprintf(stderr,"Lexer Error: newline in literal\n"); exit(1); }
+                char value=*p++;
+                if (value=='\\') value=decode_escape(*p++);
+                bytes[length++]=value;
+            }
+            if (*p!=quote || (quote=='\'' && length!=1)){
+                fprintf(stderr,"Lexer Error: invalid or unterminated literal\n"); exit(1);
+            }
+            p++; bytes[length]=0;
+            add_token(quote=='\'' ? TOK_CHAR_CONSTANT : TOK_STRING,bytes);
+            free(bytes); continue;
+        }
+
         //identifier and keyword
         if (isalpha(*p) || *p=='_'){
             const char *start=p;
@@ -1389,7 +1450,7 @@ void resolve_for_init(ForInit *init,IdentifierMap **map){
 }
 
 int is_type_specifier(TokenType type){
-    return type==TOK_INT || type==TOK_LONG || type==TOK_SIGNED || type==TOK_UNSIGNED || type==TOK_DOUBLE;
+    return type==TOK_CHAR || type==TOK_INT || type==TOK_LONG || type==TOK_SIGNED || type==TOK_UNSIGNED || type==TOK_DOUBLE;
 }
 
 int is_declaration_start(void) {
@@ -1399,10 +1460,11 @@ int is_declaration_start(void) {
 
 // specifiers in any order, none repeated, not both signed and unsigned; double stands alone
 Type *parse_type(TokenType *types,int count){
-    int has_int=0,has_long=0,has_signed=0,has_unsigned=0,has_double=0;
+    int has_char=0,has_int=0,has_long=0,has_signed=0,has_unsigned=0,has_double=0;
 
     for (int i=0;i<count;i++){
-        int *seen=types[i]==TOK_DOUBLE ? &has_double :
+        int *seen=types[i]==TOK_CHAR ? &has_char :
+                  types[i]==TOK_DOUBLE ? &has_double :
                   types[i]==TOK_INT ? &has_int :
                   types[i]==TOK_LONG ? &has_long :
                   types[i]==TOK_SIGNED ? &has_signed : &has_unsigned;
@@ -1413,11 +1475,12 @@ Type *parse_type(TokenType *types,int count){
         *seen=1;
     }
 
-    if (count==0 || (has_signed && has_unsigned) || (has_double && count>1)){
+    if (count==0 || (has_signed && has_unsigned) || (has_double && count>1) || (has_char && (has_int || has_long || has_double))){
         fprintf(stderr,"Parse Error: invalid type specifier\n");
         exit(1);
     }
 
+    if (has_char) return has_unsigned ? type_uchar() : has_signed ? type_schar() : type_char();
     if (has_double) return type_double();
 
     if (has_unsigned) return has_long ? type_ulong() : type_uint();
@@ -1556,7 +1619,7 @@ Declarator *parse_declarator(int abstract){
             if (function_suffix){ fprintf(stderr,"Parse Error: array suffix after function suffix\n"); exit(1); }
             take();
             Token count=take();
-            if (count.type!=TOK_CONSTANT && count.type!=TOK_LONG_CONSTANT && count.type!=TOK_UNSIGNED_CONSTANT && count.type!=TOK_UNSIGNED_LONG_CONSTANT){
+            if (count.type!=TOK_CHAR_CONSTANT && count.type!=TOK_CONSTANT && count.type!=TOK_LONG_CONSTANT && count.type!=TOK_UNSIGNED_CONSTANT && count.type!=TOK_UNSIGNED_LONG_CONSTANT){
                 fprintf(stderr,"Parse Error: array length must be an integer literal\n"); exit(1);
             }
             unsigned long n=(unsigned long)parse_constant(count).value;
@@ -1887,6 +1950,7 @@ Exp **parse_argument_list(int *out_count) {
 // <int> fits in int -> ConstInt, otherwise ConstLong; <long> -> ConstLong
 // <uint> fits in unsigned int -> ConstUInt, otherwise ConstULong; <ulong> -> ConstULong
 Const parse_constant(Token t){
+    if (t.type==TOK_CHAR_CONSTANT) return make_const(type_int(),(unsigned char)t.value[0]);
     if (t.type==TOK_DOUBLE_CONSTANT){
         Const c;
         c.type=CONST_DOUBLE;
@@ -1921,7 +1985,21 @@ Exp *parse_factor(){
     Token t=peek();
     Exp *inner = NULL;
 
-    if (t.type==TOK_CONSTANT || t.type==TOK_LONG_CONSTANT ||
+    if (t.type==TOK_CHAR_CONSTANT){
+        take(); inner=make_constant_exp(parse_constant(t));
+    }
+    else if (t.type==TOK_STRING){
+        inner=calloc(1,sizeof(Exp)); inner->type=EXP_STRING;
+        inner->string.bytes.data=calloc(1,1);
+        while (peek().type==TOK_STRING){
+            Token part=take(); int length=(int)strlen(part.value);
+            ByteString *bytes=&inner->string.bytes;
+            bytes->data=realloc(bytes->data,(size_t)bytes->length+length+1);
+            memcpy(bytes->data+bytes->length,part.value,(size_t)length+1);
+            bytes->length+=length;
+        }
+    }
+    else if (t.type==TOK_CONSTANT || t.type==TOK_LONG_CONSTANT ||
         t.type==TOK_UNSIGNED_CONSTANT || t.type==TOK_UNSIGNED_LONG_CONSTANT ||
         t.type==TOK_DOUBLE_CONSTANT){
         take();
@@ -2328,6 +2406,7 @@ int label_exists(LabelMap *map,const char *name){
 
 
 typedef enum {
+    SYMBOL_ATTR_CONSTANT,
     SYMBOL_ATTR_FUNCTION,
     SYMBOL_ATTR_STATIC,
     SYMBOL_ATTR_LOCAL
@@ -2403,6 +2482,8 @@ StaticInit const_to_static_init(Const c,Type *t) {
     Const converted=convert_const(c,t);
     StaticInit init;
     switch (converted.type){
+        case CONST_CHAR: init.type=INIT_CHAR; break;
+        case CONST_UCHAR: init.type=INIT_UCHAR; break;
         case CONST_LONG: init.type=INIT_LONG; break;
         case CONST_UINT: init.type=INIT_UINT; break;
         case CONST_ULONG: init.type=INIT_ULONG; break;
@@ -2463,7 +2544,21 @@ void symbol_add_function(
     entry->global=global;
 }
 
+static char *register_string_constant(Symbol **symbols,ByteString bytes){
+    char *name=make_label("string.");
+    Symbol *entry=symbol_add(symbols,name,make_array_type(type_char(),(unsigned long)bytes.length+1));
+    entry->attr_type=SYMBOL_ATTR_CONSTANT;
+    entry->init.type=INITIAL_VALUE;
+    entry->init.value.count=1;
+    entry->init.value.items=calloc(1,sizeof(StaticInit));
+    entry->init.value.items[0].type=INIT_STRING;
+    entry->init.value.items[0].string.bytes=bytes;
+    entry->init.value.items[0].string.null_terminated=1;
+    return name;
+}
+
 Type *get_common_type(Type *t1,Type *t2) {
+    t1=integer_promotion(t1); t2=integer_promotion(t2);
     if (type_equal(t1,t2)) {
         return t1;
     }
@@ -2533,11 +2628,11 @@ static int is_pointer(Type *t) {
 }
 
 static int is_integer_type(Type *t) {
-    return t->kind==TYPE_INT || t->kind==TYPE_UINT || t->kind==TYPE_LONG || t->kind==TYPE_ULONG;
+    return is_character_type(t) || t->kind==TYPE_INT || t->kind==TYPE_UINT || t->kind==TYPE_LONG || t->kind==TYPE_ULONG;
 }
 
 int is_lvalue(Exp *e) {
-    return e->type==EXP_VAR || e->type==EXP_DEREFERENCE || e->type==EXP_SUBSCRIPT;
+    return e->type==EXP_STRING || e->type==EXP_VAR || e->type==EXP_DEREFERENCE || e->type==EXP_SUBSCRIPT;
 }
 
 static void check_lvalue(Exp *e,const char *context) {
@@ -2618,6 +2713,10 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
     }
 
     switch(exp->type) {
+        case EXP_STRING:
+            exp->exp_type=make_array_type(type_char(),(unsigned long)exp->string.bytes.length+1);
+            exp->string.name=register_string_constant(symbols,exp->string.bytes);
+            return;
         case EXP_CONSTANT:
             exp->exp_type=const_exp_type(exp->constant);
             return;
@@ -2707,6 +2806,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
                 fprintf(stderr,"Type Error: can't negate or complement a pointer\n");
                 exit(1);
             }
+            if (exp->unary.op!=UNARY_NOT) convert_to(&exp->unary.exp,integer_promotion(exp->unary.exp->exp_type));
             exp->exp_type=(exp->unary.op==UNARY_NOT) ? type_int() : exp->unary.exp->exp_type;
             return;
 
@@ -2731,7 +2831,8 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
             //a shift has its left operand's type; no usual arithmetic conversions
             if (is_shift_op(op)) {
-                Type *left_type=exp->binary.left->exp_type;
+                Type *left_type=integer_promotion(exp->binary.left->exp_type);
+                convert_to(&exp->binary.left,left_type);
                 convert_to(&exp->binary.right,left_type);
                 exp->exp_type=left_type;
                 return;
@@ -2774,7 +2875,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
                 fprintf(stderr,"Type Error: pointer cannot be assigned to an arithmetic object\n"); exit(1);
             }
             Type *op_type=is_shift_op(exp->compound.op)
-                ? left_type
+                ? integer_promotion(left_type)
                 : get_common_type(left_type,exp->compound.rvalue->exp_type);
 
             convert_to(&exp->compound.rvalue,op_type);
@@ -2850,6 +2951,13 @@ static Initializer *zero_initializer(Type *t){
 
 static void check_initializer(Initializer *init,Type *t,Symbol **symbols){
     init->type=t;
+    if (t->kind==TYPE_ARRAY && !init->compound && init->exp->type==EXP_STRING){
+        if (!is_character_type(t->referenced) || (unsigned long)init->exp->string.bytes.length>t->count){
+            fprintf(stderr,"Type Error: string does not fit character array\n"); exit(1);
+        }
+        init->exp->exp_type=t;
+        return;
+    }
     if (t->kind!=TYPE_ARRAY){
         if (init->compound){ fprintf(stderr,"Type Error: scalar initializer cannot be a list\n"); exit(1); }
         typecheck_and_convert(&init->exp,symbols); convert_by_assignment(&init->exp,t); return;
@@ -2875,6 +2983,18 @@ static StaticInitList zero_static_list(Type *t){
 static void flatten_static_initializer(Initializer *init,StaticInitList *list){
     if (init->compound){
         for (int i=0;i<init->count;i++) flatten_static_initializer(init->items[i],list);
+    }else if (init->type->kind==TYPE_ARRAY && init->exp->type==EXP_STRING){
+        ByteString bytes=init->exp->string.bytes;
+        int terminated=(unsigned long)bytes.length<init->type->count;
+        StaticInit string={.type=INIT_STRING};
+        string.string.bytes=bytes; string.string.null_terminated=terminated;
+        append_static_init(list,string);
+        long padding=(long)init->type->count-bytes.length-terminated;
+        if (padding) append_static_init(list,(StaticInit){INIT_ZERO,{padding}});
+    }else if (init->type->kind==TYPE_POINTER && init->exp->type==EXP_ADDR_OF && init->exp->addr_of.exp->type==EXP_STRING){
+        StaticInit pointer={.type=INIT_POINTER};
+        pointer.pointer_name=init->exp->addr_of.exp->string.name;
+        append_static_init(list,pointer);
     }else{
         Const c;
         if (!eval_const_expr(init->exp,&c)){ fprintf(stderr,"Type Error: non-constant static initializer\n"); exit(1); }
@@ -3135,6 +3255,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
 
         case STMT_SWITCH:
             typecheck_and_convert(&stmt->switch_stmt.control,symbols);
+            convert_to(&stmt->switch_stmt.control,integer_promotion(stmt->switch_stmt.control->exp_type));
             if (!is_integer_type(stmt->switch_stmt.control->exp_type)) {
                 fprintf(stderr,"Type Error: switch controlling expression must be an integer\n");
                 exit(1);
@@ -3496,6 +3617,7 @@ void resolve_expression(Exp *e,IdentifierMap *map){
             resolve_expression(e->conditional.false_expr,map);
             break;
 
+        case EXP_STRING:
         case EXP_CONSTANT:
             break;
 
@@ -4348,6 +4470,7 @@ AsmOperand convert_tacky_val(TackyVal *v){
 }
 
 AsmType type_to_asm_type(Type *t){
+    if (is_character_type(t)) return ASM_BYTE;
     if (t->kind==TYPE_DOUBLE) return ASM_DOUBLE;
     return type_size(t)==8 ? ASM_QUADWORD : ASM_LONGWORD;
 }
@@ -4405,6 +4528,7 @@ AsmInst *make_asm(
     AsmInst *new_inst=calloc(1,sizeof(AsmInst));
     new_inst->type=type;
     new_inst->asm_type=asm_type;
+    new_inst->src_type=ASM_LONGWORD;
     new_inst->binary_op=op;
     new_inst->cond=cond;
     new_inst->src=src;
@@ -4414,7 +4538,7 @@ AsmInst *make_asm(
     return new_inst;
 }
 
-void append_asm(
+AsmInst *append_asm(
     AsmInst **head,
     AsmInstType type,
     AsmType asm_type,
@@ -4435,6 +4559,7 @@ void append_asm(
         }
         curr->next=new_inst;
     }
+    return new_inst;
 }
 
 static const AsmOperand NO_OPERAND={0};
@@ -4535,12 +4660,12 @@ static void convert_function_call(
         AsmOperand arg=args.stack_args[i].operand;
         AsmType arg_type=args.stack_args[i].type;
 
-        if (arg.type==AS_IMM || arg.type==AS_REG || arg_type!=ASM_LONGWORD){
+        if (arg.type==AS_IMM || arg.type==AS_REG || (arg_type!=ASM_LONGWORD && arg_type!=ASM_BYTE)){
             append_asm(head,AS_PUSH,ASM_QUADWORD,0,0,arg,NO_OPERAND,NULL);
         }else{
             /*
-            pushq would read 8 bytes from a 4-byte memory operand,
-            so copy it into EAX and push the full RAX register instead.
+            pushq would read beyond a byte or longword memory operand,
+            so copy its declared width into AX before pushing the register.
             */
             append_asm(head,AS_MOV,arg_type,0,0,arg,as_reg(REG_AX),NULL);
             append_asm(head,AS_PUSH,ASM_QUADWORD,0,0,as_reg(REG_AX),NO_OPERAND,NULL);
@@ -4690,16 +4815,15 @@ static void convert_tacky_instruction(
         }
 
         case TACKY_INST_SIGN_EXTEND:
-            append_asm(head,AS_MOVSX,ASM_QUADWORD,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+        case TACKY_INST_ZERO_EXTEND: {
+            AsmInst *extension=append_asm(head,curr->type==TACKY_INST_SIGN_EXTEND ? AS_MOVSX : AS_MOVZX,
+                tacky_val_asm_type(curr->dst,symbols),0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+            extension->src_type=tacky_val_asm_type(curr->src,symbols);
             break;
+        }
 
-        case TACKY_INST_ZERO_EXTEND:
-            append_asm(head,AS_MOVZX,ASM_QUADWORD,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
-            break;
-
-        //copying the low 4 bytes drops the upper half
         case TACKY_INST_TRUNCATE:
-            append_asm(head,AS_MOV,ASM_LONGWORD,0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
+            append_asm(head,AS_MOV,tacky_val_asm_type(curr->dst,symbols),0,0,convert_tacky_val(curr->src),convert_tacky_val(curr->dst),NULL);
             break;
 
         case TACKY_INST_COPY:
@@ -4944,7 +5068,8 @@ static AsmSymbol *build_backend_symbols(Symbol *symbols){
                 asm_entry->alignment=type_alignment(entry->type);
             }
             asm_entry->is_aggregate=entry->type->kind==TYPE_ARRAY;
-            asm_entry->is_static=(entry->attr_type==SYMBOL_ATTR_STATIC);
+            asm_entry->is_static=(entry->attr_type==SYMBOL_ATTR_STATIC || entry->attr_type==SYMBOL_ATTR_CONSTANT);
+            asm_entry->is_constant=entry->attr_type==SYMBOL_ATTR_CONSTANT;
         }
 
         asm_entry->next=backend;
@@ -5013,6 +5138,14 @@ AsmProg *tacky_to_asm(TackyProgram *tacky,Symbol *symbols){
                 asm_top->type=ASM_TOP_FUNCTION;
                 asm_top->function=convert_tacky_function(top_level->function,symbols);
                 break;
+            case TACKY_TOP_STATIC_CONSTANT: {
+                TackyStaticVariable *value=top_level->static_variable;
+                AsmStaticConstant *constant=calloc(1,sizeof(AsmStaticConstant));
+                constant->name=strdup(value->name); constant->alignment=type_alignment(value->type);
+                constant->init=value->init.items[0];
+                asm_top->type=ASM_TOP_STATIC_CONSTANT; asm_top->static_constant=constant;
+                break;
+            }
             case TACKY_TOP_STATIC_VARIABLE: {
                 TackyStaticVariable *tacky_var=top_level->static_variable;
                 if (!tacky_var){
@@ -5172,6 +5305,7 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
             }
 
             //movl would truncate an 8-byte immediate anyway; do it here to avoid assembler warnings
+            if (t==ASM_BYTE && inst->src.type==AS_IMM) inst->src.imm=(unsigned char)inst->src.imm;
             if (t==ASM_LONGWORD && inst->src.type==AS_IMM){
                 inst->src.imm=(int)inst->src.imm;
             }
@@ -5184,30 +5318,27 @@ static void fix_instruction(AsmInst *inst,AsmInst ***tail){
             break;
 
         case AS_MOVSX:
+        case AS_MOVZX:
+            if (inst->type==AS_MOVZX && inst->src_type==ASM_LONGWORD){
+                if (inst->dst.type==AS_REG){
+                    inst->type=AS_MOV; inst->asm_type=ASM_LONGWORD;
+                }else{
+                    push_inst(tail,make_asm(AS_MOV,ASM_LONGWORD,0,0,inst->src,as_reg(REG_R11),NULL));
+                    inst->type=AS_MOV; inst->src=as_reg(REG_R11);
+                }
+                break;
+            }
             if (inst->src.type==AS_IMM){
-                push_inst(tail,make_asm(AS_MOV,ASM_LONGWORD,0,0,inst->src,as_reg(REG_R10),NULL));
+                AsmOperand source=inst->src;
+                if (inst->src_type==ASM_BYTE) source.imm=(unsigned char)source.imm;
+                push_inst(tail,make_asm(AS_MOV,inst->src_type,0,0,source,as_reg(REG_R10),NULL));
                 inst->src=as_reg(REG_R10);
             }
-
             if (is_memory_operand(inst->dst)){
-                AsmOperand dst=inst->dst;
-                push_inst(tail,make_asm(AS_MOVSX,ASM_QUADWORD,0,0,inst->src,as_reg(REG_R11),NULL));
-                inst->type=AS_MOV;
-                inst->src=as_reg(REG_R11);
-                inst->dst=dst;
-            }
-            break;
-
-        //movl into a register clears its upper 4 bytes
-        case AS_MOVZX:
-            if (inst->dst.type==AS_REG){
-                inst->type=AS_MOV;
-                inst->asm_type=ASM_LONGWORD;
-            }else{
-                push_inst(tail,make_asm(AS_MOV,ASM_LONGWORD,0,0,inst->src,as_reg(REG_R11),NULL));
-                inst->type=AS_MOV;
-                inst->asm_type=ASM_QUADWORD;
-                inst->src=as_reg(REG_R11);
+                AsmInst *extension=make_asm(inst->type,t,0,0,inst->src,as_reg(REG_R11),NULL);
+                extension->src_type=inst->src_type;
+                push_inst(tail,extension);
+                inst->type=AS_MOV; inst->src=as_reg(REG_R11);
             }
             break;
 
@@ -5417,6 +5548,14 @@ static TackyVal *emit_tacky_cast(
     if (type_equal(from,to)){
         return val;
     }
+    if (to->kind==TYPE_DOUBLE && is_character_type(from)){
+        val=emit_tacky_cast(inst_list,val,from,type_int());
+        return emit_tacky_cast(inst_list,val,type_int(),to);
+    }
+    if (from->kind==TYPE_DOUBLE && is_character_type(to)){
+        val=emit_tacky_cast(inst_list,val,from,type_int());
+        return emit_tacky_cast(inst_list,val,type_int(),to);
+    }
 
     TackyVal *dst=make_tacky_variable(to);
     TackyInstType type;
@@ -5498,6 +5637,7 @@ static TackyVal *emit_tacky_binary(
 }
 
 TackyLvalue gen_tacky_lvalue(Exp *e,TackyInstruction **inst_list){
+    if (e->type==EXP_STRING) return (TackyLvalue){tacky_val_var(e->string.name),0};
     if (e->type==EXP_SUBSCRIPT){
         Exp *ptr=e->subscript.left,*idx=e->subscript.right;
         if (!is_pointer(ptr->exp_type)){ Exp *swap=ptr; ptr=idx; idx=swap; }
@@ -5540,6 +5680,7 @@ TackyVal *emit_lvalue_store(TackyLvalue lv,TackyVal *v,TackyInstruction **inst_l
 //   dereference and address-of
 //   short-circuit logical operators (&&, ||)
 TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
+    if (e->type==EXP_STRING) return tacky_val_var(e->string.name);
     if (e->type==EXP_CONSTANT){
         return tacky_val_constant(e->constant);
     }
@@ -5652,7 +5793,8 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
         TackyLvalue lv=gen_tacky_lvalue(e->inc_dec.lvalue,inst_list);
         Type *lhs_type=e->inc_dec.lvalue->exp_type;
         TackyVal *lhs_val=emit_lvalue_load(lv,lhs_type,inst_list);
-        TackyVal *one_val=tacky_val_constant(make_const(is_pointer(lhs_type) ? type_long() : lhs_type,1));
+        Type *op_type=integer_promotion(lhs_type);
+        TackyVal *one_val=tacky_val_constant(make_const(is_pointer(lhs_type) ? type_long() : op_type,1));
         BinaryOpType op=e->inc_dec.is_increment ? BINARY_ADD :BINARY_SUB;
 
         TackyVal *old_val=NULL;
@@ -5667,7 +5809,9 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
             append_tacky_inst(inst_list,save_old);
         }
 
-        TackyVal *tmp=emit_tacky_binary(inst_list,op,lhs_val,one_val,lhs_type,is_pointer(lhs_type) ? type_long() : lhs_type,lhs_type);
+        TackyVal *promoted=emit_tacky_cast(inst_list,lhs_val,lhs_type,op_type);
+        TackyVal *tmp=emit_tacky_binary(inst_list,op,promoted,one_val,op_type,is_pointer(lhs_type) ? type_long() : op_type,op_type);
+        tmp=emit_tacky_cast(inst_list,tmp,op_type,lhs_type);
 
         //soter new value to a
         emit_lvalue_store(lv,tmp,inst_list);
@@ -6067,7 +6211,16 @@ static void emit_switch_dispatch(
 }
 
 static void gen_tacky_initializer(Initializer *init,char *name,int offset,int aggregate,TackyInstruction **list){
-    if (init->compound){
+    if (!init->compound && init->type->kind==TYPE_ARRAY && init->exp->type==EXP_STRING){
+        ByteString bytes=init->exp->string.bytes;
+        for (unsigned long i=0;i<init->type->count;i++){
+            long value=i<(unsigned long)bytes.length ? (unsigned char)bytes.data[i] : 0;
+            TackyInstruction *copy=calloc(1,sizeof(TackyInstruction));
+            copy->type=TACKY_INST_COPY_TO_OFFSET; copy->offset=offset+(int)i;
+            copy->src=tacky_val_constant(make_const(init->type->referenced,value));
+            copy->dst=tacky_val_var(name); append_tacky_inst(list,copy);
+        }
+    }else if (init->compound){
         int step=type_size(init->type->referenced);
         for (int i=0;i<init->count;i++) gen_tacky_initializer(init->items[i],name,offset+i*step,1,list);
     }else{
@@ -6195,7 +6348,8 @@ static void append_tacky_static_variable(
     const char *name,
     int global,
     Type *type,
-    StaticInitList init
+    StaticInitList init,
+    int constant
 ){
     TackyStaticVariable *variable=calloc(1,sizeof(TackyStaticVariable));
     if (!variable) {
@@ -6214,7 +6368,7 @@ static void append_tacky_static_variable(
         exit(1);
     }
 
-    top_level->type=TACKY_TOP_STATIC_VARIABLE;
+    top_level->type=constant ? TACKY_TOP_STATIC_CONSTANT : TACKY_TOP_STATIC_VARIABLE;
     top_level->static_variable=variable;
     append_tacky_top_level(program,top_level);
 }
@@ -6224,7 +6378,7 @@ static void convert_symbols_to_tacky(
     TackyProgram *program
 ){
     for (Symbol *entry=symbols;entry;entry=entry->next) {
-        if (entry->attr_type!=SYMBOL_ATTR_STATIC) {
+        if (entry->attr_type!=SYMBOL_ATTR_STATIC && entry->attr_type!=SYMBOL_ATTR_CONSTANT) {
             continue;
         }
 
@@ -6245,7 +6399,8 @@ static void convert_symbols_to_tacky(
             entry->name,
             entry->global,
             entry->type,
-            init
+            init,
+            entry->attr_type==SYMBOL_ATTR_CONSTANT
         );
     }
 }
@@ -6372,11 +6527,11 @@ static void emit_sized_op(AsmOperand op,int bytes,FILE *out){
 }
 
 void emit_op(AsmOperand op,AsmType t,FILE *out){
-    emit_sized_op(op,t==ASM_LONGWORD ? 4 : 8,out);
+    emit_sized_op(op,t==ASM_BYTE ? 1 : t==ASM_LONGWORD ? 4 : 8,out);
 }
 
 static char type_suffix(AsmType t){
-    return t==ASM_QUADWORD ? 'q' : 'l';
+    return t==ASM_BYTE ? 'b' : t==ASM_QUADWORD ? 'q' : 'l';
 }
 
 const char *cond_to_str(CondCode c){
@@ -6499,17 +6654,11 @@ static void emit_instruction(
             break;
 
         case AS_MOVSX:
-            fprintf(out,"    movslq  ");
-            emit_op(curr->src,ASM_LONGWORD,out);
-            fprintf(out,", ");
-            emit_op(curr->dst,ASM_QUADWORD,out);
-            fprintf(out,"\n");
-            break;
-
-        //fix-up rewrites every MovZeroExtend into plain moves
         case AS_MOVZX:
-            fprintf(stderr,"Emitter Error: unexpected MovZeroExtend\n");
-            exit(1);
+            fprintf(out,"    mov%c%c%c  ",curr->type==AS_MOVSX ? 's' : 'z',type_suffix(curr->src_type),suffix);
+            emit_op(curr->src,curr->src_type,out);
+            fprintf(out,", "); emit_op(curr->dst,t,out); fprintf(out,"\n");
+            break;
 
         case AS_NEG:
             fprintf(out,"    neg%c    ",suffix);
@@ -6702,6 +6851,21 @@ static long double_bits(double d){
     return bits;
 }
 
+static void emit_static_init(StaticInit value,FILE *out){
+    switch (value.type){
+        case INIT_ZERO: fprintf(out,"    .zero %ld\n",value.value); break;
+        case INIT_DOUBLE: fprintf(out,"    .quad %ld\n",double_bits(value.dvalue)); break;
+        case INIT_CHAR: case INIT_UCHAR: fprintf(out,"    .byte %ld\n",value.value); break;
+        case INIT_LONG: case INIT_ULONG: fprintf(out,"    .quad %ld\n",value.value); break;
+        case INIT_INT: case INIT_UINT: fprintf(out,"    .long %ld\n",value.value); break;
+        case INIT_POINTER: fprintf(out,"    .quad .L%s\n",value.pointer_name); break;
+        case INIT_STRING:
+            fprintf(out,"    %s \"",value.string.null_terminated ? ".asciz" : ".ascii");
+            for (int i=0;i<value.string.bytes.length;i++) fprintf(out,"\\%03o",(unsigned char)value.string.bytes.data[i]);
+            fprintf(out,"\"\n"); break;
+    }
+}
+
 static void emit_static_variable(AsmStaticVariable *var,FILE *out){
     if (var->global){
         fprintf(out,".globl " SYMBOL_PREFIX "%s\n",var->name);
@@ -6710,25 +6874,20 @@ static void emit_static_variable(AsmStaticVariable *var,FILE *out){
     int all_zero=1;
     for (int i=0;i<var->init.count;i++) if (var->init.items[i].type!=INIT_ZERO) all_zero=0;
     fprintf(out,"%s\n.balign %d\n" SYMBOL_PREFIX "%s:\n",all_zero ? ".bss" : ".data",var->alignment,var->name);
-    for (int i=0;i<var->init.count;i++){
-        StaticInit v=var->init.items[i];
-        if (v.type==INIT_ZERO) fprintf(out,"    .zero %ld\n",v.value);
-        else if (v.type==INIT_DOUBLE) fprintf(out,"    .quad %ld\n",double_bits(v.dvalue));
-        else fprintf(out,"    %s %ld\n",v.type==INIT_LONG || v.type==INIT_ULONG ? ".quad" : ".long",v.value);
-    }
+    for (int i=0;i<var->init.count;i++) emit_static_init(var->init.items[i],out);
     fprintf(out,"\n");
 }
 
 static void emit_static_constant(AsmStaticConstant *c,FILE *out){
-    long bits=double_bits(c->init.dvalue);
 #ifdef __APPLE__
-    fprintf(out,"%s\n.balign %d\n.L%s:\n",c->alignment==16 ? ".literal16" : ".literal8",c->alignment,c->name);
-    fprintf(out,"    .quad %ld\n",bits);
+    const char *section=c->init.type==INIT_STRING ? ".cstring" : c->alignment==16 ? ".literal16" : ".literal8";
+    fprintf(out,"%s\n.balign %d\n.L%s:\n",section,c->alignment,c->name);
+    emit_static_init(c->init,out);
     //the linker expects 16-byte-aligned literals to be 16 bytes long
-    if (c->alignment==16) fprintf(out,"    .quad 0\n");
+    if (c->init.type==INIT_DOUBLE && c->alignment==16) fprintf(out,"    .quad 0\n");
 #else
     fprintf(out,".section .rodata\n.balign %d\n.L%s:\n",c->alignment,c->name);
-    fprintf(out,"    .quad %ld\n",bits);
+    emit_static_init(c->init,out);
 #endif
     fprintf(out,"\n");
 }
