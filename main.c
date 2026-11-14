@@ -1989,16 +1989,6 @@ Exp **parse_argument_list(int *out_count) {
     return args;
 }
 
-//deal with number and parentheses and unary operator
-//note:unary operator make sure higher precedence than binary operator
-// <factor> ::= <constant>
-//            | <identifier>
-//            | "(" <expression> ")"
-//            | <unary_op> <factor>
-//            | <factor> "++"
-//            | <factor> "--"
-//            | "++" <factor>
-//            | "--" <factor>
 // <int> fits in int -> ConstInt, otherwise ConstLong; <long> -> ConstLong
 // <uint> fits in unsigned int -> ConstUInt, otherwise ConstULong; <ulong> -> ConstULong
 Const parse_constant(Token t){
@@ -2817,6 +2807,14 @@ void check_binary_operands(BinaryOpType op,Type *left,Type *right) {
     }
 }
 
+static Type *sizeof_operand_type(Exp *e) {
+    return e->type==EXP_SIZEOF ? e->sizeof_exp->exp_type : e->sizeof_type;
+}
+
+static Const sizeof_value(Exp *e) {
+    return make_const(type_ulong(),(long)type_bytes(sizeof_operand_type(e)));
+}
+
 void typecheck_expression(Exp *exp,Symbol **symbols) {
     if (!exp) {
         return;
@@ -3065,16 +3063,10 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
 
         //the operand is not decayed: sizeof of an array is the whole array
         case EXP_SIZEOF:
-            typecheck_expression(exp->sizeof_exp,symbols);
-            if (!is_complete(exp->sizeof_exp->exp_type)) {
-                fprintf(stderr,"Type Error: can't get the size of an incomplete type\n");
-                exit(1);
-            }
-            exp->exp_type=type_ulong();
-            return;
         case EXP_SIZEOF_TYPE:
-            validate_type_specifier(exp->sizeof_type);
-            if (!is_complete(exp->sizeof_type)) {
+            if (exp->type==EXP_SIZEOF) typecheck_expression(exp->sizeof_exp,symbols);
+            else validate_type_specifier(exp->sizeof_type);
+            if (!is_complete(sizeof_operand_type(exp))) {
                 fprintf(stderr,"Type Error: can't get the size of an incomplete type\n");
                 exit(1);
             }
@@ -4238,10 +4230,8 @@ static int eval_const_value(Exp *e,Const *out){
             return eval_const_expr(e->cast.exp,out);
 
         case EXP_SIZEOF:
-            *out=make_const(type_ulong(),(long)type_bytes(e->sizeof_exp->exp_type));
-            return 1;
         case EXP_SIZEOF_TYPE:
-            *out=make_const(type_ulong(),(long)type_bytes(e->sizeof_type));
+            *out=sizeof_value(e);
             return 1;
 
         case EXP_UNARY: {
@@ -5874,11 +5864,8 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     if (e->type==EXP_CONSTANT){
         return tacky_val_constant(e->constant);
     }
-    else if (e->type==EXP_SIZEOF){
-        return tacky_val_constant(make_const(type_ulong(),(long)type_bytes(e->sizeof_exp->exp_type)));
-    }
-    else if (e->type==EXP_SIZEOF_TYPE){
-        return tacky_val_constant(make_const(type_ulong(),(long)type_bytes(e->sizeof_type)));
+    else if (e->type==EXP_SIZEOF || e->type==EXP_SIZEOF_TYPE){
+        return tacky_val_constant(sizeof_value(e));
     }
     else if (e->type==EXP_CAST){
         TackyVal *inner=gen_tacky_exp(e->cast.exp,inst_list);
