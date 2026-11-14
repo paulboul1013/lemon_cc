@@ -34,4 +34,6 @@ python3 tests/ch16_regressions.py ./main  # 第十六章補充回歸與 GCC 呼�
 | 第十三章 | [Floating-Point Numbers](docs/ch13-floating-point-numbers.md) |
 | 第十四章 | [Pointers](docs/ch14-pointers.md) |
 | 第十五章 | [Arrays and Pointer Arithmetic](docs/ch15-arrays-and-pointer-arithmetic.md) |
+| 第十六章 | [Characters and Strings](docs/ch16-characters-and-strings.md) |
+| 第十七章 | [Supporting Dynamic Memory Allocation](docs/ch17-supporting-dynamic-memory-allocation.md) |
 | 附錄 A | [Debugging Assembly Code with GDB or LLDB](docs/appA-debugging-with-gdb-lldb.md) |
