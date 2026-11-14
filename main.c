@@ -22,6 +22,7 @@ typedef  enum{
     TOK_SWITCH,
     TOK_CASE,
     TOK_DEFAULT,
+    TOK_SIZEOF,
 
     TOK_IDENTIFIER, TOK_CONSTANT, TOK_LONG_CONSTANT,
     TOK_UNSIGNED_CONSTANT, TOK_UNSIGNED_LONG_CONSTANT, TOK_DOUBLE_CONSTANT,
@@ -90,6 +91,7 @@ typedef enum {
     TYPE_UINT,
     TYPE_ULONG,
     TYPE_DOUBLE,
+    TYPE_VOID,
     TYPE_POINTER,
     TYPE_ARRAY,
     TYPE_FUNCTION
@@ -132,6 +134,7 @@ Type *type_double(void){
 Type *type_char(void){ static Type t={.kind=TYPE_CHAR}; return &t; }
 Type *type_schar(void){ static Type t={.kind=TYPE_SCHAR}; return &t; }
 Type *type_uchar(void){ static Type t={.kind=TYPE_UCHAR}; return &t; }
+Type *type_void(void){ static Type t={.kind=TYPE_VOID}; return &t; }
 
 int is_character_type(Type *t){
     return t->kind==TYPE_CHAR || t->kind==TYPE_SCHAR || t->kind==TYPE_UCHAR;
@@ -150,6 +153,12 @@ int type_size(Type *t){
         return (int)t->count*element_size;
     }
     return (t->kind==TYPE_LONG || t->kind==TYPE_ULONG || t->kind==TYPE_DOUBLE || t->kind==TYPE_POINTER) ? 8 : 4;
+}
+
+//sizeof may name a type far larger than any object type_size accepts
+unsigned long type_bytes(Type *t){
+    if (t->kind==TYPE_ARRAY) return t->count*type_bytes(t->referenced);
+    return (unsigned long)type_size(t);
 }
 
 int type_is_signed(Type *t){
@@ -201,6 +210,38 @@ int type_equal(Type *a,Type *b){
         if (!type_equal(a->params[i],b->params[i])) return 0;
     }
     return 1;
+}
+
+//Void, arrays and functions are the only non-scalar types
+int is_scalar(Type *t){
+    return t->kind!=TYPE_VOID && t->kind!=TYPE_ARRAY && t->kind!=TYPE_FUNCTION;
+}
+
+int is_complete(Type *t){
+    return t->kind!=TYPE_VOID;
+}
+
+int is_pointer_to_complete(Type *t){
+    return t->kind==TYPE_POINTER && is_complete(t->referenced);
+}
+
+//an array of an incomplete type is illegal however deep it is nested
+void validate_type_specifier(Type *t){
+    switch (t->kind){
+        case TYPE_ARRAY:
+            if (!is_complete(t->referenced)){ fprintf(stderr,"Type Error: illegal array of incomplete type\n"); exit(1); }
+            validate_type_specifier(t->referenced);
+            return;
+        case TYPE_POINTER:
+            validate_type_specifier(t->referenced);
+            return;
+        case TYPE_FUNCTION:
+            for (int i=0;i<t->param_count;i++) validate_type_specifier(t->params[i]);
+            validate_type_specifier(t->ret);
+            return;
+        default:
+            return;
+    }
 }
 
 typedef enum {
@@ -273,6 +314,8 @@ typedef enum {
     EXP_DEREFERENCE, // *e
     EXP_ADDR_OF, // &e
     EXP_SUBSCRIPT,
+    EXP_SIZEOF, // sizeof e
+    EXP_SIZEOF_TYPE, // sizeof (type-name)
 }ExpType;
 
 typedef enum {
@@ -351,6 +394,9 @@ typedef struct Exp {
         struct { //for EXP_ADDR_OF
             struct Exp *exp;
         } addr_of;
+
+        struct Exp *sizeof_exp; //for EXP_SIZEOF
+        Type *sizeof_type; //for EXP_SIZEOF_TYPE
     };
 } Exp;
 
@@ -1094,6 +1140,7 @@ TokenType check_keyword(const char *s){
     if (strcmp(s,"switch")==0) return TOK_SWITCH;
     if (strcmp(s,"case")==0) return TOK_CASE;
     if (strcmp(s,"default")==0) return TOK_DEFAULT;
+    if (strcmp(s,"sizeof")==0) return TOK_SIZEOF;
 
     return TOK_IDENTIFIER;
 }
@@ -1385,7 +1432,8 @@ void lex(const char *input){
 Token peek() {return token_list[token_pos];}
 Token take() {return token_list[token_pos++];}
 Exp *parse_exp(int min_prec);
-Exp *parse_factor();
+Exp *parse_cast_exp(void);
+Exp *parse_unary_exp(void);
 Statement *parse_statement();
 
 Declaration *parse_declaration();
@@ -1450,7 +1498,7 @@ void resolve_for_init(ForInit *init,IdentifierMap **map){
 }
 
 int is_type_specifier(TokenType type){
-    return type==TOK_CHAR || type==TOK_INT || type==TOK_LONG || type==TOK_SIGNED || type==TOK_UNSIGNED || type==TOK_DOUBLE;
+    return type==TOK_CHAR || type==TOK_INT || type==TOK_LONG || type==TOK_SIGNED || type==TOK_UNSIGNED || type==TOK_DOUBLE || type==TOK_VOID;
 }
 
 int is_declaration_start(void) {
@@ -1458,13 +1506,14 @@ int is_declaration_start(void) {
     return is_type_specifier(type) || type==TOK_STATIC || type==TOK_EXTERN;
 }
 
-// specifiers in any order, none repeated, not both signed and unsigned; double stands alone
+// specifiers in any order, none repeated, not both signed and unsigned; double and void stand alone
 Type *parse_type(TokenType *types,int count){
-    int has_char=0,has_int=0,has_long=0,has_signed=0,has_unsigned=0,has_double=0;
+    int has_char=0,has_int=0,has_long=0,has_signed=0,has_unsigned=0,has_double=0,has_void=0;
 
     for (int i=0;i<count;i++){
         int *seen=types[i]==TOK_CHAR ? &has_char :
                   types[i]==TOK_DOUBLE ? &has_double :
+                  types[i]==TOK_VOID ? &has_void :
                   types[i]==TOK_INT ? &has_int :
                   types[i]==TOK_LONG ? &has_long :
                   types[i]==TOK_SIGNED ? &has_signed : &has_unsigned;
@@ -1475,13 +1524,14 @@ Type *parse_type(TokenType *types,int count){
         *seen=1;
     }
 
-    if (count==0 || (has_signed && has_unsigned) || (has_double && count>1) || (has_char && (has_int || has_long || has_double))){
+    if (count==0 || (has_signed && has_unsigned) || (has_double && count>1) || (has_void && count>1) || (has_char && (has_int || has_long || has_double))){
         fprintf(stderr,"Parse Error: invalid type specifier\n");
         exit(1);
     }
 
     if (has_char) return has_unsigned ? type_uchar() : has_signed ? type_schar() : type_char();
     if (has_double) return type_double();
+    if (has_void) return type_void();
 
     if (has_unsigned) return has_long ? type_ulong() : type_uint();
     return has_long ? type_long() : type_int();
@@ -1644,7 +1694,7 @@ ParamInfo *parse_param_list(int *count) {
     ParamInfo *params=NULL;
     *count=0;
 
-    if (peek().type == TOK_VOID) {
+    if (peek().type==TOK_VOID && token_list[token_pos+1].type==TOK_RPAREN) {
         take();
         return NULL;
     }
@@ -1690,6 +1740,8 @@ DeclInfo process_declarator(Declarator *d,Type *base){
                     fprintf(stderr,"Parse Error: function-typed parameter '%s' is not supported\n",param.name);
                     exit(1);
                 }
+                //validate before the decay hides an array of void behind a pointer
+                validate_type_specifier(param.type);
                 types[i]=param.type->kind==TYPE_ARRAY ? make_pointer_type(param.type->referenced) : param.type;
                 names[i]=param.name;
             }
@@ -1862,7 +1914,7 @@ Statement *parse_default_statement(){
 // arithmetic
 //   + - * / %
 Exp *parse_exp(int min_prec){
-   Exp *left=parse_factor();
+   Exp *left=parse_cast_exp();
    Token next=peek();
 
    while (get_precedence(next.type)>=min_prec){
@@ -1981,7 +2033,25 @@ Const parse_constant(Token t){
     return c;
 }
 
-Exp *parse_factor(){
+// <type-name> ::= { <type-specifier> }+ [ <abstract-declarator> ]
+Type *parse_type_name(void){
+    Type *base=parse_type_specifiers();
+    return process_declarator(parse_declarator(1),base).type;
+}
+
+// <cast-exp> ::= "(" <type-name> ")" <cast-exp> | <unary-exp>
+Exp *parse_cast_exp(void){
+    if (peek().type==TOK_LPAREN && is_type_specifier(token_list[token_pos+1].type)){
+        take();
+        Type *target_type=parse_type_name();
+        expect(TOK_RPAREN);
+        return make_cast_exp(target_type,parse_cast_exp());
+    }
+    return parse_unary_exp();
+}
+
+// <unary-exp> ::= <unop> <cast-exp> | "sizeof" <unary-exp> | "sizeof" "(" <type-name> ")" | <postfix-exp>
+Exp *parse_unary_exp(void){
     Token t=peek();
     Exp *inner = NULL;
 
@@ -2005,19 +2075,23 @@ Exp *parse_factor(){
         take();
         inner=make_constant_exp(parse_constant(t));
     }
-    // "(" { <type-specifier> }+ [ <abstract-declarator> ] ")" <factor>
-    else if (t.type==TOK_LPAREN && is_type_specifier(token_list[token_pos+1].type)){
+    else if (t.type==TOK_SIZEOF){
         take();
-        Type *base=parse_type_specifiers();
-        Type *target_type=process_declarator(parse_declarator(1),base).type;
-        expect(TOK_RPAREN);
-        return make_cast_exp(target_type,parse_factor());
+        Exp *e=calloc(1,sizeof(Exp));
+        if (peek().type==TOK_LPAREN && is_type_specifier(token_list[token_pos+1].type)){
+            take();
+            e->type=EXP_SIZEOF_TYPE; e->sizeof_type=parse_type_name();
+            expect(TOK_RPAREN);
+        }else{
+            e->type=EXP_SIZEOF; e->sizeof_exp=parse_unary_exp();
+        }
+        return e;
     }
     // prefix ++ / --
     else if (t.type==TOK_INCREMENT || t.type==TOK_DECREMENT){
         take();
         int is_inc=(t.type==TOK_INCREMENT);
-        Exp *operand=parse_factor(); //right-associative
+        Exp *operand=parse_cast_exp(); //right-associative
         return make_inc_dec_exp(EXP_PREFIX_OP,is_inc,operand);
     }
     else if (t.type==TOK_IDENTIFIER){
@@ -2051,16 +2125,16 @@ Exp *parse_factor(){
             op=UNARY_NOT;
         }
 
-        Exp *inner=parse_factor(); //unary after factor
+        Exp *inner=parse_cast_exp();
         return make_unary_exp(op,inner);
     }
     else if (t.type==TOK_MULT){
         take();
-        return make_dereference_exp(parse_factor());
+        return make_dereference_exp(parse_cast_exp());
     }
     else if (t.type==TOK_BITWISE_AND){
         take();
-        return make_addr_of_exp(parse_factor());
+        return make_addr_of_exp(parse_cast_exp());
     }
     else if (t.type==TOK_LPAREN){
         take();
@@ -2141,7 +2215,7 @@ Statement *parse_statement() {
     if (peek().type==TOK_RETURN){
         take();
         s->type=STMT_RETURN;
-        s->exp=parse_exp(0);
+        s->exp=parse_optional_exp(TOK_SEMICOLON);
         expect(TOK_SEMICOLON);
     }
     else if (peek().type==TOK_BREAK){
@@ -2631,6 +2705,22 @@ static int is_integer_type(Type *t) {
     return is_character_type(t) || t->kind==TYPE_INT || t->kind==TYPE_UINT || t->kind==TYPE_LONG || t->kind==TYPE_ULONG;
 }
 
+static int is_arithmetic(Type *t) {
+    return is_integer_type(t) || is_double(t);
+}
+
+static int is_void_pointer(Type *t) {
+    return is_pointer(t) && t->referenced->kind==TYPE_VOID;
+}
+
+static void typecheck_scalar(Exp **slot,Symbol **symbols,const char *context) {
+    typecheck_and_convert(slot,symbols);
+    if (!is_scalar((*slot)->exp_type)) {
+        fprintf(stderr,"Type Error: %s must be scalar\n",context);
+        exit(1);
+    }
+}
+
 int is_lvalue(Exp *e) {
     return e->type==EXP_STRING || e->type==EXP_VAR || e->type==EXP_DEREFERENCE || e->type==EXP_SUBSCRIPT;
 }
@@ -2657,6 +2747,10 @@ Type *get_common_pointer_type(Exp *a,Exp *b) {
     if (is_null_pointer_constant(b)) {
         return a->exp_type;
     }
+    if ((is_void_pointer(a->exp_type) && is_pointer(b->exp_type)) ||
+        (is_void_pointer(b->exp_type) && is_pointer(a->exp_type))) {
+        return make_pointer_type(type_void());
+    }
     fprintf(stderr,"Type Error: expressions have incompatible pointer types\n");
     exit(1);
 }
@@ -2671,9 +2765,10 @@ Type *common_operand_type(Exp *a,Exp *b) {
 //the implicit conversion of assignment, arguments, initializers and return
 void convert_by_assignment(Exp **slot,Type *t) {
     Type *from=(*slot)->exp_type;
-    int both_arithmetic=!is_pointer(from) && !is_pointer(t);
+    int both_arithmetic=is_arithmetic(from) && is_arithmetic(t);
+    int void_pointer=(is_void_pointer(t) && is_pointer(from)) || (is_pointer(t) && is_void_pointer(from));
 
-    if (type_equal(from,t) || both_arithmetic ||
+    if (type_equal(from,t) || both_arithmetic || void_pointer ||
         (is_pointer(t) && is_null_pointer_constant(*slot))) {
         convert_to(slot,t);
         return;
@@ -2684,14 +2779,23 @@ void convert_by_assignment(Exp **slot,Type *t) {
 }
 
 void check_binary_operands(BinaryOpType op,Type *left,Type *right) {
-    if (op==BINARY_LOGICAL_AND || op==BINARY_LOGICAL_OR || op==BINARY_EQ || op==BINARY_NEQ) {
+    if (op==BINARY_LOGICAL_AND || op==BINARY_LOGICAL_OR) {
+        if (!is_scalar(left) || !is_scalar(right)) {
+            fprintf(stderr,"Type Error: logical operators only apply to scalar expressions\n");
+            exit(1);
+        }
         return;
     }
 
     int has_pointer=is_pointer(left) || is_pointer(right);
 
+    //pointer equality is checked by get_common_pointer_type
+    if ((op==BINARY_EQ || op==BINARY_NEQ) && has_pointer) {
+        return;
+    }
+
     if (is_integer_only_op(op)) {
-        if (has_pointer || is_double(left) || is_double(right)) {
+        if (!is_integer_type(left) || !is_integer_type(right)) {
             fprintf(stderr,"Type Error: operator requires integer operands\n");
             exit(1);
         }
@@ -2700,10 +2804,16 @@ void check_binary_operands(BinaryOpType op,Type *left,Type *right) {
 
     if (has_pointer) {
         int valid=0;
-        if (op==BINARY_ADD) valid=(is_pointer(left) && is_integer_type(right)) || (is_integer_type(left) && is_pointer(right));
-        else if (op==BINARY_SUB) valid=(is_pointer(left) && is_integer_type(right)) || (is_pointer(left) && is_pointer(right) && type_equal(left,right));
+        if (op==BINARY_ADD) valid=(is_pointer_to_complete(left) && is_integer_type(right)) || (is_integer_type(left) && is_pointer_to_complete(right));
+        else if (op==BINARY_SUB) valid=(is_pointer_to_complete(left) && is_integer_type(right)) || (is_pointer_to_complete(left) && type_equal(left,right));
         else if (is_comparison_op(op)) valid=is_pointer(left) && is_pointer(right) && type_equal(left,right);
         if (!valid){ fprintf(stderr,"Type Error: incompatible pointer operands\n"); exit(1); }
+        return;
+    }
+
+    if (!is_arithmetic(left) || !is_arithmetic(right)) {
+        fprintf(stderr,"Type Error: operator requires arithmetic operands\n");
+        exit(1);
     }
 }
 
@@ -2722,14 +2832,19 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             return;
 
         case EXP_CAST:
-            if (exp->cast.target_type->kind==TYPE_ARRAY){ fprintf(stderr,"Type Error: cast to array\n"); exit(1); }
+            validate_type_specifier(exp->cast.target_type);
             typecheck_and_convert(&exp->cast.exp,symbols);
+            exp->exp_type=exp->cast.target_type;
+            if (exp->exp_type->kind==TYPE_VOID) return;
+            if (!is_scalar(exp->cast.target_type) || !is_scalar(exp->cast.exp->exp_type)) {
+                fprintf(stderr,"Type Error: can only cast scalar expressions to scalar type or void\n");
+                exit(1);
+            }
             if ((is_pointer(exp->cast.target_type) && is_double(exp->cast.exp->exp_type)) ||
                 (is_double(exp->cast.target_type) && is_pointer(exp->cast.exp->exp_type))) {
                 fprintf(stderr,"Type Error: can't cast between a pointer and a double\n");
                 exit(1);
             }
-            exp->exp_type=exp->cast.target_type;
             return;
 
         case EXP_VAR: {
@@ -2797,13 +2912,17 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
         }
 
         case EXP_UNARY:
-            typecheck_and_convert(&exp->unary.exp,symbols);
+            if (exp->unary.op==UNARY_NOT) {
+                typecheck_scalar(&exp->unary.exp,symbols,"operand of !");
+            }else{
+                typecheck_and_convert(&exp->unary.exp,symbols);
+                if (!is_arithmetic(exp->unary.exp->exp_type)) {
+                    fprintf(stderr,"Type Error: can only negate or complement arithmetic values\n");
+                    exit(1);
+                }
+            }
             if (exp->unary.op==UNARY_COMPLEMENT && is_double(exp->unary.exp->exp_type)) {
                 fprintf(stderr,"Type Error: can't take the bitwise complement of a double\n");
-                exit(1);
-            }
-            if (exp->unary.op!=UNARY_NOT && is_pointer(exp->unary.exp->exp_type)) {
-                fprintf(stderr,"Type Error: can't negate or complement a pointer\n");
                 exit(1);
             }
             if (exp->unary.op!=UNARY_NOT) convert_to(&exp->unary.exp,integer_promotion(exp->unary.exp->exp_type));
@@ -2896,14 +3015,19 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             return;
 
         case EXP_CONDITIONAL: {
-            typecheck_and_convert(&exp->conditional.condition,symbols);
+            typecheck_scalar(&exp->conditional.condition,symbols,"condition in conditional operator");
             typecheck_and_convert(&exp->conditional.true_expr,symbols);
             typecheck_and_convert(&exp->conditional.false_expr,symbols);
 
-            Type *common_type=common_operand_type(
-                exp->conditional.true_expr,
-                exp->conditional.false_expr
-            );
+            Type *t1=exp->conditional.true_expr->exp_type,*t2=exp->conditional.false_expr->exp_type;
+            Type *common_type;
+            if (t1->kind==TYPE_VOID && t2->kind==TYPE_VOID) common_type=type_void();
+            else if (is_arithmetic(t1) && is_arithmetic(t2)) common_type=get_common_type(t1,t2);
+            else if (is_pointer(t1) || is_pointer(t2)) common_type=get_common_pointer_type(exp->conditional.true_expr,exp->conditional.false_expr);
+            else {
+                fprintf(stderr,"Type Error: cannot convert branches of conditional to a common type\n");
+                exit(1);
+            }
             convert_to(&exp->conditional.true_expr,common_type);
             convert_to(&exp->conditional.false_expr,common_type);
             exp->exp_type=common_type;
@@ -2915,7 +3039,7 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             typecheck_and_convert(&exp->subscript.right,symbols);
             Exp **ptr=&exp->subscript.left,**idx=&exp->subscript.right;
             if (!is_pointer((*ptr)->exp_type)){ ptr=&exp->subscript.right; idx=&exp->subscript.left; }
-            if (!is_pointer((*ptr)->exp_type) || !is_integer_type((*idx)->exp_type)){
+            if (!is_pointer_to_complete((*ptr)->exp_type) || !is_integer_type((*idx)->exp_type)){
                 fprintf(stderr,"Type Error: invalid subscript operands\n"); exit(1);
             }
             convert_to(idx,type_long()); exp->exp_type=(*ptr)->exp_type->referenced; return;
@@ -2926,6 +3050,10 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
                 fprintf(stderr,"Type Error: can't dereference a non-pointer\n");
                 exit(1);
             }
+            if (is_void_pointer(exp->deref.exp->exp_type)) {
+                fprintf(stderr,"Type Error: can't dereference a pointer to void\n");
+                exit(1);
+            }
             exp->exp_type=exp->deref.exp->exp_type->referenced;
             return;
 
@@ -2933,6 +3061,24 @@ void typecheck_expression(Exp *exp,Symbol **symbols) {
             typecheck_expression(exp->addr_of.exp,symbols);
             check_lvalue(exp->addr_of.exp,"address-of");
             exp->exp_type=make_pointer_type(exp->addr_of.exp->exp_type);
+            return;
+
+        //the operand is not decayed: sizeof of an array is the whole array
+        case EXP_SIZEOF:
+            typecheck_expression(exp->sizeof_exp,symbols);
+            if (!is_complete(exp->sizeof_exp->exp_type)) {
+                fprintf(stderr,"Type Error: can't get the size of an incomplete type\n");
+                exit(1);
+            }
+            exp->exp_type=type_ulong();
+            return;
+        case EXP_SIZEOF_TYPE:
+            validate_type_specifier(exp->sizeof_type);
+            if (!is_complete(exp->sizeof_type)) {
+                fprintf(stderr,"Type Error: can't get the size of an incomplete type\n");
+                exit(1);
+            }
+            exp->exp_type=type_ulong();
             return;
     }
 }
@@ -3011,11 +3157,20 @@ static StaticInitList eval_static_initializer(Initializer *init,Type *target,Sym
     StaticInitList list={0}; flatten_static_initializer(init,&list); return list;
 }
 
+static void validate_variable_type(VariableDeclaration *decl) {
+    validate_type_specifier(decl->var_type);
+    if (decl->var_type->kind==TYPE_VOID) {
+        fprintf(stderr,"Type Error: variable '%s' declared void\n",decl->name);
+        exit(1);
+    }
+}
+
 void typecheck_file_scope_variable_declaration(
     VariableDeclaration *decl,
     Symbol **symbols
 ) {
     InitialValue initial_value;
+    validate_variable_type(decl);
     if (decl->init || decl->storage_class!=STORAGE_EXTERN) type_size(decl->var_type);
 
     if (decl->init) {
@@ -3094,6 +3249,7 @@ void typecheck_local_variable_declaration(
     VariableDeclaration *decl,
     Symbol **symbols
 ) {
+    validate_variable_type(decl);
     if (decl->storage_class!=STORAGE_EXTERN) type_size(decl->var_type);
     if (decl->storage_class==STORAGE_EXTERN) {
         if (decl->init) {
@@ -3183,6 +3339,17 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
 
     switch(stmt->type) {
         case STMT_RETURN:
+            if (current_return_type->kind==TYPE_VOID) {
+                if (stmt->exp) {
+                    fprintf(stderr,"Type Error: void function cannot return a value\n");
+                    exit(1);
+                }
+                return;
+            }
+            if (!stmt->exp) {
+                fprintf(stderr,"Type Error: non-void function must return a value\n");
+                exit(1);
+            }
             typecheck_and_convert(&stmt->exp,symbols);
             convert_by_assignment(&stmt->exp,current_return_type);
             return;
@@ -3194,7 +3361,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
             return;
 
         case STMT_IF:
-            typecheck_and_convert(&stmt->if_stmt.condition,symbols);
+            typecheck_scalar(&stmt->if_stmt.condition,symbols,"if condition");
             typecheck_statement(stmt->if_stmt.then_branch,symbols);
 
             if (stmt->if_stmt.else_branch) {
@@ -3218,7 +3385,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
             return;
 
         case STMT_WHILE:
-            typecheck_and_convert(&stmt->while_stmt.condition,symbols);
+            typecheck_scalar(&stmt->while_stmt.condition,symbols,"loop condition");
             typecheck_statement(
                 stmt->while_stmt.body,
                 symbols
@@ -3230,7 +3397,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
                 stmt->do_while_stmt.body,
                 symbols
             );
-            typecheck_and_convert(&stmt->do_while_stmt.condition,symbols);
+            typecheck_scalar(&stmt->do_while_stmt.condition,symbols,"loop condition");
             return;
 
         case STMT_FOR:
@@ -3240,7 +3407,7 @@ void typecheck_statement(Statement *stmt,Symbol **symbols) {
             );
 
             if (stmt->for_stmt.condition) {
-                typecheck_and_convert(&stmt->for_stmt.condition,symbols);
+                typecheck_scalar(&stmt->for_stmt.condition,symbols,"loop condition");
             }
 
             if (stmt->for_stmt.post) {
@@ -3329,6 +3496,13 @@ void typecheck_function_declaration(
     Symbol **symbols
 ) {
     if (fn->fun_type->ret->kind==TYPE_ARRAY){ fprintf(stderr,"Type Error: function returns array\n"); exit(1); }
+    validate_type_specifier(fn->fun_type);
+    for (int i=0;i<fn->fun_type->param_count;i++) {
+        if (fn->fun_type->params[i]->kind==TYPE_VOID) {
+            fprintf(stderr,"Type Error: parameter of function '%s' declared void\n",fn->name);
+            exit(1);
+        }
+    }
 
     int has_body=fn->has_body;
     int already_defined=0;
@@ -3688,6 +3862,12 @@ void resolve_expression(Exp *e,IdentifierMap *map){
 
         case EXP_ADDR_OF:
             resolve_expression(e->addr_of.exp,map);
+            break;
+
+        case EXP_SIZEOF:
+            resolve_expression(e->sizeof_exp,map);
+            break;
+        case EXP_SIZEOF_TYPE:
             break;
     }
 }
@@ -4056,6 +4236,13 @@ static int eval_const_value(Exp *e,Const *out){
 
         case EXP_CAST:
             return eval_const_expr(e->cast.exp,out);
+
+        case EXP_SIZEOF:
+            *out=make_const(type_ulong(),(long)type_bytes(e->sizeof_exp->exp_type));
+            return 1;
+        case EXP_SIZEOF_TYPE:
+            *out=make_const(type_ulong(),(long)type_bytes(e->sizeof_type));
+            return 1;
 
         case EXP_UNARY: {
             Const c;
@@ -4680,6 +4867,7 @@ static void convert_function_call(
     }
     free(args.stack_args);
 
+    if (!call->dst) return;
     AsmType dst_type=tacky_val_asm_type(call->dst,symbols);
     append_asm(
         head,
@@ -4808,8 +4996,10 @@ static void convert_tacky_instruction(
 ){
     switch (curr->type){
         case TACKY_INST_RETURN: {
-            AsmType t=tacky_val_asm_type(curr->src,symbols);
-            append_asm(head,AS_MOV,t,0,0,convert_tacky_val(curr->src),as_reg(t==ASM_DOUBLE ? REG_XMM0 : REG_AX),NULL);
+            if (curr->src){
+                AsmType t=tacky_val_asm_type(curr->src,symbols);
+                append_asm(head,AS_MOV,t,0,0,convert_tacky_val(curr->src),as_reg(t==ASM_DOUBLE ? REG_XMM0 : REG_AX),NULL);
+            }
             append_asm(head,AS_RET,0,0,0,NO_OPERAND,NO_OPERAND,NULL);
             break;
         }
@@ -5684,8 +5874,15 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     if (e->type==EXP_CONSTANT){
         return tacky_val_constant(e->constant);
     }
+    else if (e->type==EXP_SIZEOF){
+        return tacky_val_constant(make_const(type_ulong(),(long)type_bytes(e->sizeof_exp->exp_type)));
+    }
+    else if (e->type==EXP_SIZEOF_TYPE){
+        return tacky_val_constant(make_const(type_ulong(),(long)type_bytes(e->sizeof_type)));
+    }
     else if (e->type==EXP_CAST){
         TackyVal *inner=gen_tacky_exp(e->cast.exp,inst_list);
+        if (e->exp_type->kind==TYPE_VOID) return NULL;
         return emit_tacky_cast(inst_list,inner,e->cast.exp->exp_type,e->cast.target_type);
     }
     else if (e->type==EXP_FUNCTION_CALL) {
@@ -5707,7 +5904,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
             );
         }
 
-        TackyVal *dst = make_tacky_variable(e->exp_type);
+        TackyVal *dst = e->exp_type->kind==TYPE_VOID ? NULL : make_tacky_variable(e->exp_type);
 
         TackyInstruction *call = calloc(1,sizeof(TackyInstruction));
 
@@ -5724,7 +5921,8 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
     else if (e->type==EXP_CONDITIONAL){
         char *false_label=make_label("cond_false");  
         char *end_label=make_label("cond_end");
-        TackyVal *dst=make_tacky_variable(e->exp_type);
+        //a void conditional keeps its jumps but has no value to copy
+        TackyVal *dst=e->exp_type->kind==TYPE_VOID ? NULL : make_tacky_variable(e->exp_type);
 
         //1. calculate condition
         TackyVal *cond=gen_tacky_exp(e->conditional.condition,inst_list);
@@ -5738,11 +5936,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
 
         //3. calculate true_expr，and copy to dst
         TackyVal *v1=gen_tacky_exp(e->conditional.true_expr,inst_list);
-        TackyInstruction *cp1=calloc(1,sizeof(TackyInstruction));
-        cp1->type=TACKY_INST_COPY;
-        cp1->src=v1;
-        cp1->dst=dst;
-        append_tacky_inst(inst_list,cp1);
+        if (dst) emit_tacky_src_dst(inst_list,TACKY_INST_COPY,v1,dst);
 
         //4. jump(end_label) skip false_expr
         TackyInstruction *jmp=calloc(1,sizeof(TackyInstruction));
@@ -5759,11 +5953,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
 
         //6. calculate false_expr，and copy to dst
         TackyVal *v2=gen_tacky_exp(e->conditional.false_expr,inst_list);
-        TackyInstruction *cp2=calloc(1,sizeof(TackyInstruction));
-        cp2->type=TACKY_INST_COPY;
-        cp2->src=v2;
-        cp2->dst=dst;
-        append_tacky_inst(inst_list,cp2);
+        if (dst) emit_tacky_src_dst(inst_list,TACKY_INST_COPY,v2,dst);
 
         //7. label(end_label)
         TackyInstruction *l_end=calloc(1,sizeof(TackyInstruction));
@@ -6005,7 +6195,7 @@ TackyVal *gen_tacky_exp(Exp *e,TackyInstruction **inst_list){
 //   label
 void gen_tacky_statement(Statement *stmt,TackyInstruction **inst_list){
     if (stmt->type==STMT_RETURN){
-        TackyVal *val=gen_tacky_exp(stmt->exp,inst_list);
+        TackyVal *val=stmt->exp ? gen_tacky_exp(stmt->exp,inst_list) : NULL;
         TackyInstruction *ret=calloc(1,sizeof(TackyInstruction));
         ret->type=TACKY_INST_RETURN;
         ret->src=val;
